@@ -1,15 +1,24 @@
 import 'dotenv/config';
 import express from 'express';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { WebSocketServer, WebSocket } from 'ws';
+import {
+  FunctionDeclaration,
+  GoogleGenAI,
+  LiveServerMessage,
+  Modality,
+  ThinkingLevel,
+  Type,
+} from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 const FACE_CATALOG = [
   '0: Normal Blink',
@@ -39,6 +48,75 @@ const FACE_CATALOG = [
   '24: Looking Around',
 ].join(', ');
 
+function createAiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+}
+
+// =========================================================================
+// 1. CLOUD STATE BRIDGE (/api/bot-state) — Mirrors Vercel Serverless API
+// =========================================================================
+const deviceStore = new Map<string, Record<string, unknown>>();
+
+app.options('/api/bot-state', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(200).end();
+});
+
+app.get('/api/bot-state', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
+  const existing = deviceStore.get(deviceId) || {
+    deviceId,
+    mode: 'auto',
+    screen: 'face',
+    faceId: 0,
+    textLine1: '',
+    textLine2: '',
+    userName: 'Muhib',
+    city: 'Dhaka',
+    greenLed: 'auto',
+    buzzerSeq: 0,
+    buzzerMode: 'tone',
+    bitmapSeq: 0,
+    bitmapHex: '',
+    alarms: [],
+    alarmDismissSeq: 0,
+    otaTriggerSeq: 0,
+    updatedAt: 0,
+  };
+  res.json(existing);
+});
+
+app.post('/api/bot-state', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
+  const body = (req.body || {}) as Record<string, unknown>;
+  const prev = deviceStore.get(deviceId) || {};
+  const payload = {
+    ...prev,
+    ...body,
+    deviceId,
+    updatedAt: Date.now(),
+  };
+  deviceStore.set(deviceId, payload);
+  res.json({ ok: true, updatedAt: payload.updatedAt });
+});
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+// =========================================================================
+// 2. MULTI-TURN BANGLISH AI AGENT CHAT (gemini-4-hydrogen)
+// =========================================================================
 interface ChatHistoryItem {
   role: 'user' | 'model';
   text: string;
@@ -64,17 +142,11 @@ interface AgentRequestBody {
   };
 }
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
-});
-
 app.post('/api/agent/chat', async (req, res) => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      res.status(500).json({
-        error: 'GEMINI_API_KEY is not configured on the server.',
-      });
+    const ai = createAiClient();
+    if (!ai) {
+      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
       return;
     }
 
@@ -88,11 +160,6 @@ app.post('/api/agent/chat', async (req, res) => {
     const ctx = body.context || {};
     const userName = ctx.userName || 'Muhib';
     const history = Array.isArray(body.history) ? body.history.slice(-10) : [];
-
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-    });
 
     const systemInstruction = `You are FaceBot, ${userName}'s personal ESP32 voice AI agent (created by Muhib Creation) with a 0.96" SSD1306 OLED, a Piezo Buzzer (GPIO 14), and 1x Green LED (GPIO 26).
 
@@ -118,20 +185,12 @@ ${FACE_CATALOG}
 
 Hardware Control Rules:
 - Always pick a matching faceId (0-24).
-- screenKind:
-  - "face": show the expressive face on OLED
-  - "custom-text": ONLY when user asks to write/show text on OLED (ASCII <= 18 chars in oledLine1, <= 9 chars in oledLine2)
-  - "watch": when user asks for clock/time on OLED
-  - "weather": when user asks for weather on OLED
-  - "greeting": when user asks for greeting screen
-  - "sleep": when user says sleep / good night
-  - "wake": when user says wake up / utho
-  - "none": keep current screen
-- greenLed: "on", "off", "blink", "auto", or "unchanged"
-- buzzerSound: "none", "beep", "wake", "happy", or "alarm"
-- alarmTime: 24h "HH:MM" ONLY if user asks to set an alarm, else ""
-- alarmLabel: short ASCII label (<= 16 chars) if alarmTime is set, else ""
-- targetMode: "auto", "user", or "unchanged"
+- screenKind: "face", "custom-text" (ASCII <=18 chars oledLine1, <=9 chars oledLine2), "watch", "weather", "greeting", "sleep", "wake", or "none".
+- greenLed: "on", "off", "blink", "auto", or "unchanged".
+- buzzerSound: "none", "beep", "wake", "happy", or "alarm".
+- alarmTime: 24h "HH:MM" ONLY if user asks to set an alarm, else "".
+- alarmLabel: short ASCII label (<=16 chars) if alarmTime is set, else "".
+- targetMode: "auto", "user", or "unchanged".
 - actionSummary: short 2-5 word summary of action taken.`;
 
     const contents = [
@@ -152,26 +211,14 @@ Hardware Control Rules:
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            reply: {
-              type: Type.STRING,
-              description: 'Very short, basic Banglish reply (1 sentence, <= 15 words). Starts with "Sorry Muhib" if unable or unclear.',
-            },
+            reply: { type: Type.STRING },
             screenKind: {
               type: Type.STRING,
               enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
             },
-            faceId: {
-              type: Type.INTEGER,
-              description: 'Face ID between 0 and 24 matching the emotion.',
-            },
-            oledLine1: {
-              type: Type.STRING,
-              description: 'Short ASCII line 1 (max 18 chars) when screenKind is custom-text, else empty string.',
-            },
-            oledLine2: {
-              type: Type.STRING,
-              description: 'Short ASCII line 2 (max 9 chars) when screenKind is custom-text, else empty string.',
-            },
+            faceId: { type: Type.INTEGER },
+            oledLine1: { type: Type.STRING },
+            oledLine2: { type: Type.STRING },
             greenLed: {
               type: Type.STRING,
               enum: ['unchanged', 'on', 'off', 'blink', 'auto'],
@@ -180,22 +227,13 @@ Hardware Control Rules:
               type: Type.STRING,
               enum: ['none', 'beep', 'wake', 'happy', 'alarm'],
             },
-            alarmTime: {
-              type: Type.STRING,
-              description: '24h HH:MM alarm time if user asked to set an alarm, else empty string.',
-            },
-            alarmLabel: {
-              type: Type.STRING,
-              description: 'Short ASCII alarm label if alarmTime is set, else empty string.',
-            },
+            alarmTime: { type: Type.STRING },
+            alarmLabel: { type: Type.STRING },
             targetMode: {
               type: Type.STRING,
               enum: ['unchanged', 'auto', 'user'],
             },
-            actionSummary: {
-              type: Type.STRING,
-              description: 'Concise summary of hardware action applied.',
-            },
+            actionSummary: { type: Type.STRING },
           },
           required: [
             'reply',
@@ -220,8 +258,7 @@ Hardware Control Rules:
       return;
     }
 
-    const parsed = JSON.parse(rawText);
-    res.json(parsed);
+    res.json(JSON.parse(rawText));
   } catch (err) {
     console.error('AI Agent error:', err);
     const msg = err instanceof Error ? err.message : 'AI Agent request failed.';
@@ -229,7 +266,285 @@ Hardware Control Rules:
   }
 });
 
+// =========================================================================
+// 3. GOOGLE SEARCH GROUNDING (gemini-4-hydrogen + googleSearch tool)
+// =========================================================================
+app.post('/api/agent/search', async (req, res) => {
+  try {
+    const ai = createAiClient();
+    if (!ai) {
+      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+      return;
+    }
+
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    const userName = typeof req.body?.userName === 'string' ? req.body.userName : 'Muhib';
+    if (!query) {
+      res.status(400).json({ error: 'Query is required.' });
+      return;
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: query,
+      config: {
+        systemInstruction: `You are FaceBot, ${userName}'s desktop AI agent. Answer the user's real-time web query using Google Search results ONLY in very short, simple Banglish (1-2 crisp sentences, plain English letters, no Bengali script). If you cannot find the answer, say "Sorry ${userName}, eta Google e khuje pai ni."`,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        tools: [{ googleSearch: {} }],
+      },
+    });
+
+    const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    const sources = rawChunks
+      .filter((c) => Boolean(c?.web?.uri))
+      .slice(0, 4)
+      .map((c) => ({
+        title: c.web?.title || c.web?.uri || 'Source',
+        uri: c.web?.uri || '',
+      }));
+
+    res.json({
+      reply: (response.text || `Sorry ${userName}, kono info pai ni.`).trim(),
+      sources,
+    });
+  } catch (err) {
+    console.error('Search Grounding error:', err);
+    const msg = err instanceof Error ? err.message : 'Google Search grounding failed.';
+    res.status(500).json({ error: msg });
+  }
+});
+
+// =========================================================================
+// 4. AUDIO TRANSCRIPTION (gemini-3.5-transcribe)
+// =========================================================================
+app.post('/api/agent/transcribe', async (req, res) => {
+  try {
+    const ai = createAiClient();
+    if (!ai) {
+      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+      return;
+    }
+
+    const audioBase64 = typeof req.body?.audioBase64 === 'string' ? req.body.audioBase64 : '';
+    const mimeType = typeof req.body?.mimeType === 'string' ? req.body.mimeType : 'audio/webm';
+    if (!audioBase64) {
+      res.status(400).json({ error: 'audioBase64 is required.' });
+      return;
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-transcribe',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType,
+              data: audioBase64,
+            },
+          },
+          {
+            text: 'Transcribe this audio accurately. If spoken in Bengali/Banglish or English, return only the clean spoken text.',
+          },
+        ],
+      },
+    });
+
+    res.json({ text: (response.text || '').trim() });
+  } catch (err) {
+    console.error('Transcribe error:', err);
+    const msg = err instanceof Error ? err.message : 'Audio transcription failed.';
+    res.status(500).json({ error: msg });
+  }
+});
+
+// =========================================================================
+// 5. REAL-TIME LIVE VOICE CONVERSATION WEBSOCKET (gemini-3.8-live)
+// =========================================================================
+const controlFaceBotDeclaration: FunctionDeclaration = {
+  name: 'controlFaceBot',
+  description:
+    'Updates the ESP32 0.96-inch OLED face/screen, Green LED (GPIO 26), Piezo Buzzer (GPIO 14), or sets an alarm whenever Muhib gives a command or changes mood.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      screenKind: {
+        type: Type.STRING,
+        enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
+      },
+      faceId: {
+        type: Type.INTEGER,
+        description: 'Face ID 0..24 matching mood.',
+      },
+      oledLine1: { type: Type.STRING },
+      oledLine2: { type: Type.STRING },
+      greenLed: {
+        type: Type.STRING,
+        enum: ['unchanged', 'on', 'off', 'blink', 'auto'],
+      },
+      buzzerSound: {
+        type: Type.STRING,
+        enum: ['none', 'beep', 'wake', 'happy', 'alarm'],
+      },
+      alarmTime: { type: Type.STRING },
+      alarmLabel: { type: Type.STRING },
+    },
+    required: ['screenKind', 'faceId'],
+  },
+};
+
+function attachLiveVoiceWebSocket(server: http.Server) {
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request, socket, head) => {
+    const reqUrl = request.url || '';
+    if (reqUrl.startsWith('/ws/live')) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  });
+
+  wss.on('connection', async (clientWs: WebSocket, req) => {
+    const ai = createAiClient();
+    if (!ai) {
+      clientWs.send(JSON.stringify({ error: 'GEMINI_API_KEY is not configured on the server.' }));
+      clientWs.close();
+      return;
+    }
+
+    const urlObj = new URL(req.url || '/ws/live', `http://${req.headers.host || 'localhost'}`);
+    const userName = (urlObj.searchParams.get('user') || 'Muhib').slice(0, 24);
+    const city = (urlObj.searchParams.get('city') || 'Dhaka').slice(0, 24);
+
+    let liveSession: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
+
+    try {
+      liveSession = await ai.live.connect({
+        model: 'gemini-3.8-live',
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          tools: [{ functionDeclarations: [controlFaceBotDeclaration] }],
+          systemInstruction: `You are FaceBot, ${userName}'s friendly ESP32 voice companion living in ${city} (by Muhib Creation).
+Speak ONLY in very short, natural Bengali/Banglish sentences (1 short sentence max!).
+Whenever ${userName} asks to change face, show clock/weather/text on OLED, control Green LED, ring buzzer, sleep, wake up, or set an alarm, ALWAYS call the controlFaceBot tool right away.
+If you don't understand or cannot do something, politely say "Sorry ${userName}, eta ami bujhte parini" or "Sorry ${userName}, eta ami korte parbo na."`,
+        },
+        callbacks: {
+          onopen: () => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ ready: true }));
+            }
+          },
+          onmessage: (message: LiveServerMessage) => {
+            if (clientWs.readyState !== WebSocket.OPEN) return;
+
+            const content = message.serverContent;
+            if (content?.inputTranscription?.text) {
+              clientWs.send(
+                JSON.stringify({ inputTranscript: content.inputTranscription.text })
+              );
+            }
+            if (content?.outputTranscription?.text) {
+              clientWs.send(
+                JSON.stringify({ outputTranscript: content.outputTranscription.text })
+              );
+            }
+            for (const part of content?.modelTurn?.parts ?? []) {
+              if (part.inlineData?.data) {
+                clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
+              }
+            }
+            if (content?.interrupted) {
+              clientWs.send(JSON.stringify({ interrupted: true }));
+            }
+            if (content?.turnComplete) {
+              clientWs.send(JSON.stringify({ turnComplete: true }));
+            }
+
+            const calls = message.toolCall?.functionCalls;
+            if (calls && calls.length > 0 && liveSession) {
+              for (const call of calls) {
+                if (call.name === 'controlFaceBot') {
+                  clientWs.send(JSON.stringify({ toolAction: call.args || {} }));
+                  liveSession.sendToolResponse({
+                    functionResponses: [
+                      {
+                        id: call.id,
+                        name: call.name,
+                        response: { result: 'ESP32 hardware updated successfully.' },
+                      },
+                    ],
+                  });
+                }
+              }
+            }
+          },
+          onerror: (err) => {
+            console.error('Gemini Live error:', err);
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(
+                JSON.stringify({ error: 'Gemini Live connection error occurred.' })
+              );
+            }
+          },
+          onclose: () => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.close();
+            }
+          },
+        },
+      });
+    } catch (err) {
+      console.error('Failed to connect Gemini Live:', err);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            error: err instanceof Error ? err.message : 'Failed to start Gemini Live session.',
+          })
+        );
+        clientWs.close();
+      }
+      return;
+    }
+
+    clientWs.on('message', (raw) => {
+      if (!liveSession) return;
+      try {
+        const parsed = JSON.parse(raw.toString());
+        if (parsed.audio) {
+          liveSession.sendRealtimeInput({
+            audio: { data: parsed.audio, mimeType: 'audio/pcm;rate=16000' },
+          });
+        } else if (parsed.text) {
+          liveSession.sendRealtimeInput({ text: String(parsed.text) });
+        }
+      } catch {
+        // Ignore malformed messages
+      }
+    });
+
+    clientWs.on('close', () => {
+      if (liveSession) {
+        try {
+          liveSession.close();
+        } catch {
+          // ignore
+        }
+        liveSession = null;
+      }
+    });
+  });
+}
+
 async function startServer() {
+  const httpServer = http.createServer(app);
+  attachLiveVoiceWebSocket(httpServer);
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -245,8 +560,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`FaceBot Portal + AI Agent running on http://0.0.0.0:${PORT}`);
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`FaceBot AI Portal + Live Voice + Cloud Sync running on http://0.0.0.0:${PORT}`);
   });
 }
 

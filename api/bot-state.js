@@ -1,7 +1,7 @@
 // Vercel Serverless Function: /api/bot-state
-// Bridges the published Vercel Web Portal (HTTPS) with your ESP32 over WiFi.
-// Portal POSTs live state (face, mode, alarms, servo, text, OTA trigger);
-// ESP32 GETs the latest JSON every 2-3 seconds over HTTPS.
+// Bridges the published Vercel Web Portal (HTTPS) with your ESP32 over Home WiFi from anywhere.
+// Portal POSTs live state (face, screen, text, greenLed, buzzerSeq, bitmapHex, alarms, OTA trigger);
+// ESP32 Core-0 background task polls GET every 1.2s over HTTPS with zero OLED stutter.
 
 const deviceStore = new Map();
 
@@ -9,6 +9,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -18,7 +19,9 @@ export default async function handler(req, res) {
 
   if (req.method === 'POST') {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    const prev = deviceStore.get(deviceId) || {};
     const payload = {
+      ...prev,
       ...body,
       deviceId,
       updatedAt: Date.now(),
@@ -32,13 +35,16 @@ export default async function handler(req, res) {
     mode: 'auto',
     screen: 'face',
     faceId: 0,
+    textLine1: '',
+    textLine2: '',
     userName: 'Muhib',
     city: 'Dhaka',
-    manualServo: false,
-    servoAngle: 90,
-    ultrasonicOn: true,
-    trackingOn: true,
-    servoIdleOff: true,
+    greenLed: 'auto',
+    buzzerSeq: 0,
+    buzzerMode: 'tone',
+    bitmapSeq: 0,
+    bitmapHex: '',
+    alarms: [],
     alarmDismissSeq: 0,
     otaTriggerSeq: 0,
     updatedAt: 0,

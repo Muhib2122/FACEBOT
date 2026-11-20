@@ -1,11 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AudioLines,
+  ExternalLink,
+  Globe,
   Headphones,
   Loader2,
   Mic,
-  MicOff,
-  Radio,
+  PhoneCall,
+  PhoneOff,
   Send,
+  Square,
   Trash2,
   Volume2,
   VolumeX,
@@ -48,35 +52,59 @@ interface AiAgentPanelProps {
   onTestBuzzer: () => void;
 }
 
-interface SpeechRecognitionEventLike {
-  results: {
-    [index: number]: {
-      [index: number]: {
-        transcript: string;
-      };
-    };
-  };
-}
-
-interface SpeechRecognitionLike {
-  lang: string;
-  interimResults: boolean;
-  maxAlternatives: number;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: { error?: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-}
-
 const QUICK_PROMPTS = [
-  { label: 'Kemon acho?', prompt: 'Hi FaceBot, kemon acho? Happy face dekhao!' },
-  { label: 'Ajker Weather', prompt: 'Ajker weather kemon? OLED te weather dekhao.' },
-  { label: 'LED Blink', prompt: 'Green LED blink koro r beep dao.' },
-  { label: 'Show Clock', prompt: 'Ekhon koyta baje? OLED te clock dekhao.' },
-  { label: 'Set 07:00 Alarm', prompt: 'Sokal 7 tay Wake Up alarm set koro.' },
-  { label: 'Good Night', prompt: 'Good night FaceBot, ghumiye poro r LED off koro.' },
+  { label: 'Kemon acho?', prompt: 'Hi FaceBot, kemon acho? Happy face dekhao!', search: false },
+  { label: 'Ajker Weather', prompt: 'Ajker weather kemon? OLED te weather dekhao.', search: false },
+  { label: 'LED Blink', prompt: 'Green LED blink koro r beep dao.', search: false },
+  { label: 'Show Clock', prompt: 'Ekhon koyta baje? OLED te clock dekhao.', search: false },
+  { label: 'Set 07:00 Alarm', prompt: 'Sokal 7 tay Wake Up alarm set koro.', search: false },
+  { label: 'BD News (Web)', prompt: 'Ajker Bangladesh er top news ki?', search: true },
+  { label: 'Good Night', prompt: 'Good night FaceBot, ghumiye poro r LED off koro.', search: false },
 ];
+
+// Convert Float32 PCM [-1, 1] -> Int16Array -> Base64 (16kHz Live API input)
+function float32ToBase64Pcm16(input: Float32Array): string {
+  const int16 = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// Convert Base64 Int16 PCM (24kHz Live API output) -> Float32Array
+function base64Pcm16ToFloat32(base64: string): Float32Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768;
+  }
+  return float32;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const commaIdx = result.indexOf(',');
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = () => reject(new Error('Failed to read recorded audio.'));
+    reader.readAsDataURL(blob);
+  });
+}
 
 export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   settings,
@@ -101,47 +129,59 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     {
       id: 'welcome-1',
       role: 'model',
-      text: `Assalamu Alaikum ${settings.userName || 'Muhib'}! Device er mic r speaker enable kore kotha bolo, ami ready.`,
+      text: `Assalamu Alaikum ${settings.userName || 'Muhib'}! Live Voice call, Voice Transcribe, ba Google Search use kore kotha bolo — ami ready.`,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      executedBadges: ['Banglish Voice Ready', 'OLED + Buzzer + Green LED'],
+      executedBadges: ['Live Voice', 'Google Search', 'Audio Transcribe', 'OLED + Buzzer + LED'],
     },
   ]);
 
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [searchMode, setSearchMode] = useState(false);
 
-  // Device Mic & Speaker Access States
-  const [micPermission, setMicPermission] = useState<'idle' | 'granted' | 'denied'>('idle');
-  const [micError, setMicError] = useState<string | null>(null);
-  const [micLevel, setMicLevel] = useState(0);
+  // Speaker & Mic States
   const [speakerEnabled, setSpeakerEnabled] = useState(true);
-  const [handsFreeMode, setHandsFreeMode] = useState(false);
-  const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
-  const [voiceLang, setVoiceLang] = useState<'en-IN' | 'bn-BD' | 'en-US'>('bn-BD');
+  const [micLevel, setMicLevel] = useState(0);
+  const [statusNotice, setStatusNotice] = useState<string | null>(null);
+
+  // 1. Gemini 3.8 Live Real-Time Bidirectional Voice Call States
+  const [liveStatus, setLiveStatus] = useState<'idle' | 'connecting' | 'connected'>('idle');
+  const [liveInputDraft, setLiveInputDraft] = useState('');
+  const [liveOutputDraft, setLiveOutputDraft] = useState('');
+
+  // 2. Gemini 3.5 Audio Transcribe Recording States
+  const [isRecordingClip, setIsRecordingClip] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bufferRef = useRef<SSD1306Buffer>(new SSD1306Buffer());
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const handsFreeRef = useRef(false);
-  const loadingRef = useRef(false);
 
-  handsFreeRef.current = handsFreeMode;
+  // Refs for Live WebSocket + Audio Pipelines (avoid stale closures in audio/ws callbacks)
+  const liveWsRef = useRef<WebSocket | null>(null);
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveInputCtxRef = useRef<AudioContext | null>(null);
+  const liveProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveOutputCtxRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const liveInputBufRef = useRef<string>('');
+  const liveOutputBufRef = useRef<string>('');
+  const speakerEnabledRef = useRef(speakerEnabled);
+  const loadingRef = useRef(loading);
+  const executeActionRef = useRef(onExecuteAgentAction);
+
+  // Refs for MediaRecorder (Gemini 3.5 Transcribe)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordStreamRef = useRef<MediaStream | null>(null);
+  const recordChunksRef = useRef<Blob[]>([]);
+
+  speakerEnabledRef.current = speakerEnabled;
   loadingRef.current = loading;
+  executeActionRef.current = onExecuteAgentAction;
 
-  const hasSpeechRecognition =
-    typeof window !== 'undefined' &&
-    Boolean(
-      (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown })
-        .SpeechRecognition ||
-        (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition
-    );
-
-  // Render live compact 0.96" OLED monitor inside AI Agent page
+  // Render live compact 0.96" OLED monitor inside AI Agent page (smooth 24-FPS)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -176,137 +216,115 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, loading]);
+  }, [messages, loading, liveInputDraft, liveOutputDraft]);
 
-  // Cleanup mic stream & recognition on unmount
+  // Stop all queued 24kHz Live PCM audio nodes (used on interruption or disconnect)
+  const clearLiveAudioQueue = useCallback(() => {
+    for (const src of activeSourcesRef.current) {
+      try {
+        src.stop();
+      } catch {
+        // ignore
+      }
+    }
+    activeSourcesRef.current = [];
+    if (liveOutputCtxRef.current) {
+      nextPlayTimeRef.current = liveOutputCtxRef.current.currentTime;
+    }
+    setSpeaking(false);
+  }, []);
+
+  // Cleanly stop Gemini Live WebSocket & audio streams
+  const stopLiveVoice = useCallback(() => {
+    if (liveProcessorRef.current) {
+      try {
+        liveProcessorRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      liveProcessorRef.current = null;
+    }
+    if (liveStreamRef.current) {
+      liveStreamRef.current.getTracks().forEach((t) => t.stop());
+      liveStreamRef.current = null;
+    }
+    if (liveInputCtxRef.current) {
+      liveInputCtxRef.current.close().catch(() => {});
+      liveInputCtxRef.current = null;
+    }
+    clearLiveAudioQueue();
+    if (liveOutputCtxRef.current) {
+      liveOutputCtxRef.current.close().catch(() => {});
+      liveOutputCtxRef.current = null;
+    }
+    if (liveWsRef.current) {
+      try {
+        liveWsRef.current.close();
+      } catch {
+        // ignore
+      }
+      liveWsRef.current = null;
+    }
+    liveInputBufRef.current = '';
+    liveOutputBufRef.current = '';
+    setLiveInputDraft('');
+    setLiveOutputDraft('');
+    setMicLevel(0);
+    setLiveStatus('idle');
+  }, [clearLiveAudioQueue]);
+
+  // Cleanup everything on unmount
   useEffect(() => {
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (audioCtxRef.current) {
-        audioCtxRef.current.close().catch(() => {});
+      stopLiveVoice();
+      if (recordStreamRef.current) {
+        recordStreamRef.current.getTracks().forEach((t) => t.stop());
       }
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
     };
-  }, []);
+  }, [stopLiveVoice]);
 
-  // Request real device Microphone & unlock Device Speaker (works on Phone, Laptop, Tablet)
-  const enableDeviceMicAndSpeaker = useCallback(async (): Promise<boolean> => {
-    setMicError(null);
-    setSpeakerEnabled(true);
-
-    // Unlock speaker audio context on user gesture
-    try {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (AudioCtx) {
-        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-          audioCtxRef.current = new AudioCtx();
-        }
-        if (audioCtxRef.current.state === 'suspended') {
-          await audioCtxRef.current.resume();
-        }
-      }
-    } catch {
-      // ignore
+  // Speak short Banglish reply through the logged-in device's speaker (for text/search replies)
+  const speakReply = useCallback((text: string) => {
+    if (!speakerEnabledRef.current || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      return;
     }
-
-    // Request real device microphone access + live level meter
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setMicPermission('denied');
-      setMicError('This browser does not expose microphone mediaDevices API.');
-      return false;
-    }
-
     try {
-      if (!mediaStreamRef.current) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaStreamRef.current = stream;
-
-        if (audioCtxRef.current) {
-          const source = audioCtxRef.current.createMediaStreamSource(stream);
-          const analyser = audioCtxRef.current.createAnalyser();
-          analyser.fftSize = 256;
-          source.connect(analyser);
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-          const updateLevel = () => {
-            analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-            const avg = sum / dataArray.length;
-            setMicLevel(Math.min(100, Math.round((avg / 90) * 100)));
-            rafRef.current = requestAnimationFrame(updateLevel);
-          };
-          updateLevel();
-        }
-      }
-      setMicPermission('granted');
-      return true;
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      const voices = window.speechSynthesis.getVoices();
+      const preferred =
+        voices.find((v) => v.lang.toLowerCase().includes('en-in')) ||
+        voices.find((v) => v.lang.toLowerCase().includes('en-gb')) ||
+        voices.find((v) => v.lang.toLowerCase().startsWith('en'));
+      if (preferred) utter.voice = preferred;
+      utter.lang = preferred?.lang || 'en-IN';
+      utter.rate = 1.04;
+      utter.onstart = () => setSpeaking(true);
+      utter.onend = () => setSpeaking(false);
+      utter.onerror = () => setSpeaking(false);
+      window.speechSynthesis.speak(utter);
     } catch {
-      setMicPermission('denied');
-      setMicError('Mic permission blocked. Allow microphone in browser address bar settings.');
-      return false;
+      setSpeaking(false);
     }
   }, []);
 
-  const startListeningRef = useRef<() => void>(() => {});
-
-  // Speak Banglish reply through the logged-in device's speaker
-  const speakReply = useCallback(
-    (text: string) => {
-      if (!speakerEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) {
-        if (handsFreeRef.current) {
-          window.setTimeout(() => startListeningRef.current(), 400);
-        }
-        return;
-      }
-      try {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        // Use natural English/South Asian voice so Banglish reads crisply
-        const voices = window.speechSynthesis.getVoices();
-        const preferred =
-          voices.find((v) => v.lang.toLowerCase().includes('en-in')) ||
-          voices.find((v) => v.lang.toLowerCase().includes('en-gb')) ||
-          voices.find((v) => v.lang.toLowerCase().startsWith('en'));
-        if (preferred) utter.voice = preferred;
-        utter.lang = preferred?.lang || 'en-IN';
-        utter.rate = 1.03;
-        utter.onstart = () => setSpeaking(true);
-        utter.onend = () => {
-          setSpeaking(false);
-          if (handsFreeRef.current && !loadingRef.current) {
-            window.setTimeout(() => startListeningRef.current(), 350);
-          }
-        };
-        utter.onerror = () => {
-          setSpeaking(false);
-        };
-        window.speechSynthesis.speak(utter);
-      } catch {
-        setSpeaking(false);
-      }
-    },
-    [speakerEnabled]
-  );
-
+  // =========================================================================
+  // 1. MULTI-TURN BANGLISH CHAT & GOOGLE SEARCH GROUNDING (gemini-4-hydrogen)
+  // =========================================================================
   const sendMessage = useCallback(
-    async (textToSend: string, source: 'portal' | 'voice' = 'portal') => {
+    async (
+      textToSend: string,
+      source: 'portal' | 'voice' = 'portal',
+      forceSearch?: boolean
+    ) => {
       const trimmed = textToSend.trim();
       if (!trimmed || loadingRef.current) return;
+
+      const useSearch = forceSearch !== undefined ? forceSearch : searchMode;
+      setStatusNotice(null);
 
       const userMsg: AgentChatMessage = {
         id: `u-${Date.now()}`,
@@ -325,52 +343,103 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       setLoading(true);
 
       try {
-        const res = await fetch('/api/agent/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: trimmed,
-            history: historyPayload,
-            context: {
+        if (useSearch) {
+          const res = await fetch('/api/agent/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: trimmed,
               userName: settings.userName || 'Muhib',
-              city: location.city,
-              temperatureC: weather ? Number(weather.temperature.toFixed(1)) : null,
-              conditionLabel: weather?.conditionLabel ?? null,
-              localTime: now.toLocaleTimeString([], {
-                hour: '2-digit',
-                minute: '2-digit',
-                hour12: !settings.use24HourClock,
-              }),
-              mode,
-              isSleeping,
-              greenLedMode: hardware.greenLedMode,
-              activeScreenKind: activeScreen.kind,
-              activeFaceId: activeScreen.faceId,
-              alarmCount,
-              todayInteractions,
-              esp32Connected: Boolean(hardware.esp32Ip.trim()),
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data?.error || `Search error (${res.status})`);
+          }
+
+          const replyText = String(data.reply || `Sorry ${settings.userName || 'Muhib'}, info pai ni.`);
+          const sources = Array.isArray(data.sources) ? data.sources : [];
+
+          // Reflect search result on OLED with Thinking/Starry face + short chime
+          const badges = executeActionRef.current(
+            {
+              reply: replyText,
+              screenKind: 'custom-text',
+              faceId: 12,
+              oledLine1: 'WEB SEARCH OK',
+              oledLine2: sources.length > 0 ? `${sources.length} SRC` : 'DONE',
+              greenLed: 'unchanged',
+              buzzerSound: 'beep',
+              alarmTime: '',
+              alarmLabel: '',
+              targetMode: 'unchanged',
+              actionSummary: `Google Search: ${trimmed.slice(0, 24)}`,
             },
-          }),
-        });
+            source
+          );
 
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || `Server responded with ${res.status}`);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `m-${Date.now()}`,
+              role: 'model',
+              text: replyText,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              executedBadges: ['Google Search', ...badges],
+              sources,
+            },
+          ]);
+          speakReply(replyText);
+        } else {
+          const res = await fetch('/api/agent/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: trimmed,
+              history: historyPayload,
+              context: {
+                userName: settings.userName || 'Muhib',
+                city: location.city,
+                temperatureC: weather ? Number(weather.temperature.toFixed(1)) : null,
+                conditionLabel: weather?.conditionLabel ?? null,
+                localTime: now.toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: !settings.use24HourClock,
+                }),
+                mode,
+                isSleeping,
+                greenLedMode: hardware.greenLedMode,
+                activeScreenKind: activeScreen.kind,
+                activeFaceId: activeScreen.faceId,
+                alarmCount,
+                todayInteractions,
+                esp32Connected: Boolean(hardware.cloudSyncEnabled || hardware.esp32Ip.trim()),
+              },
+            }),
+          });
+
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data?.error || `Server responded with ${res.status}`);
+          }
+
+          const action = data as AgentActionResponse;
+          const badges = executeActionRef.current(action, source);
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `m-${Date.now()}`,
+              role: 'model',
+              text: action.reply,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              actionSummary: action.actionSummary,
+              executedBadges: badges,
+            },
+          ]);
+          speakReply(action.reply);
         }
-
-        const action = data as AgentActionResponse;
-        const badges = onExecuteAgentAction(action, source);
-
-        const botMsg: AgentChatMessage = {
-          id: `m-${Date.now()}`,
-          role: 'model',
-          text: action.reply,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          actionSummary: action.actionSummary,
-          executedBadges: badges,
-        };
-        setMessages((prev) => [...prev, botMsg]);
-        speakReply(action.reply);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : 'Failed to reach FaceBot AI Agent.';
         setMessages((prev) => [
@@ -378,7 +447,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           {
             id: `e-${Date.now()}`,
             role: 'model',
-            text: `Sorry Muhib, server e connect korte parini. (${errMsg})`,
+            text: `Sorry ${settings.userName || 'Muhib'}, server e connect korte parini. (${errMsg})`,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             error: true,
           },
@@ -388,6 +457,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       }
     },
     [
+      searchMode,
       messages,
       settings.userName,
       settings.use24HourClock,
@@ -397,111 +467,315 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       mode,
       isSleeping,
       hardware.greenLedMode,
+      hardware.cloudSyncEnabled,
       hardware.esp32Ip,
       activeScreen.kind,
       activeScreen.faceId,
       alarmCount,
       todayInteractions,
-      onExecuteAgentAction,
       speakReply,
     ]
   );
 
-  const startListening = useCallback(async () => {
-    if (!hasSpeechRecognition) {
-      setMicError('Voice recognition requires Chrome, Edge, or Safari.');
+  // =========================================================================
+  // 2. REAL-TIME LIVE VOICE CONVERSATION (gemini-3.8-live over /ws/live)
+  // =========================================================================
+  const startLiveVoice = useCallback(async () => {
+    if (liveStatus !== 'idle') {
+      stopLiveVoice();
       return;
     }
-    if (micPermission !== 'granted') {
-      const ok = await enableDeviceMicAndSpeaker();
-      if (!ok) return;
+
+    setStatusNotice(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatusNotice('Browser microphone API unavailable. Allow mic permissions in HTTPS.');
+      return;
     }
 
-    const SpeechRecognitionCtor =
-      (
-        window as unknown as {
-          SpeechRecognition?: new () => SpeechRecognitionLike;
-          webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-        }
-      ).SpeechRecognition ||
-      (
-        window as unknown as {
-          webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-        }
-      ).webkitSpeechRecognition;
+    setLiveStatus('connecting');
 
-    if (!SpeechRecognitionCtor) return;
-
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-
-    const rec = new SpeechRecognitionCtor();
-    rec.lang = voiceLang;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-    rec.onresult = (event) => {
-      const transcript = event.results?.[0]?.[0]?.transcript || '';
-      if (transcript.trim()) {
-        setInput(transcript.trim());
-        sendMessage(transcript.trim(), 'voice');
-      }
-    };
-    rec.onerror = (ev) => {
-      setListening(false);
-      if (ev?.error === 'not-allowed') {
-        setMicPermission('denied');
-        setHandsFreeMode(false);
-        setMicError('Microphone access was denied by the browser.');
-      }
-    };
-    rec.onend = () => {
-      setListening(false);
-    };
-
-    recognitionRef.current = rec;
-    setListening(true);
     try {
-      rec.start();
-    } catch {
-      setListening(false);
+      // 1. Capture device microphone at 16kHz mono
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      liveStreamRef.current = stream;
+
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+
+      const inputCtx = new AudioCtx({ sampleRate: 16000 });
+      liveInputCtxRef.current = inputCtx;
+
+      const outputCtx = new AudioCtx({ sampleRate: 24000 });
+      liveOutputCtxRef.current = outputCtx;
+      nextPlayTimeRef.current = outputCtx.currentTime;
+
+      if (inputCtx.state === 'suspended') await inputCtx.resume();
+      if (outputCtx.state === 'suspended') await outputCtx.resume();
+
+      // 2. Open WebSocket to /ws/live
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${proto}//${window.location.host}/ws/live?user=${encodeURIComponent(
+        settings.userName || 'Muhib'
+      )}&city=${encodeURIComponent(location.city || 'Dhaka')}`;
+
+      const ws = new WebSocket(wsUrl);
+      liveWsRef.current = ws;
+
+      ws.onopen = () => {
+        // Stream 16kHz PCM chunks to server
+        const source = inputCtx.createMediaStreamSource(stream);
+        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        liveProcessorRef.current = processor;
+
+        processor.onaudioprocess = (event) => {
+          const channelData = event.inputBuffer.getChannelData(0);
+
+          // Live mic amplitude level for visual meter
+          let sumSq = 0;
+          for (let i = 0; i < channelData.length; i += 8) {
+            sumSq += channelData[i] * channelData[i];
+          }
+          const rms = Math.sqrt(sumSq / (channelData.length / 8));
+          setMicLevel(Math.min(100, Math.round(rms * 320)));
+
+          if (ws.readyState === WebSocket.OPEN) {
+            const b64 = float32ToBase64Pcm16(channelData);
+            ws.send(JSON.stringify({ audio: b64 }));
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(inputCtx.destination);
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data));
+
+          if (msg.ready) {
+            setLiveStatus('connected');
+            setStatusNotice('Live Voice active (Gemini 3.8 Live) — directly talk in Banglish!');
+            return;
+          }
+
+          if (msg.error) {
+            setStatusNotice(`Live Voice notice: ${msg.error}`);
+            stopLiveVoice();
+            return;
+          }
+
+          if (msg.interrupted) {
+            clearLiveAudioQueue();
+            return;
+          }
+
+          if (typeof msg.audio === 'string' && speakerEnabledRef.current && liveOutputCtxRef.current) {
+            const outCtx = liveOutputCtxRef.current;
+            const float32 = base64Pcm16ToFloat32(msg.audio);
+            if (float32.length > 0) {
+              const audioBuffer = outCtx.createBuffer(1, float32.length, 24000);
+              audioBuffer.getChannelData(0).set(float32);
+
+              const src = outCtx.createBufferSource();
+              src.buffer = audioBuffer;
+              src.connect(outCtx.destination);
+
+              const nowTime = outCtx.currentTime;
+              const startAt = Math.max(nowTime + 0.015, nextPlayTimeRef.current);
+              src.start(startAt);
+              nextPlayTimeRef.current = startAt + audioBuffer.duration;
+              setSpeaking(true);
+
+              activeSourcesRef.current.push(src);
+              src.onended = () => {
+                activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== src);
+                if (activeSourcesRef.current.length === 0) {
+                  setSpeaking(false);
+                }
+              };
+            }
+          }
+
+          if (typeof msg.inputTranscript === 'string') {
+            liveInputBufRef.current += msg.inputTranscript;
+            setLiveInputDraft(liveInputBufRef.current.trim());
+          }
+
+          if (typeof msg.outputTranscript === 'string') {
+            liveOutputBufRef.current += msg.outputTranscript;
+            setLiveOutputDraft(liveOutputBufRef.current.trim());
+          }
+
+          if (msg.toolAction && typeof msg.toolAction === 'object') {
+            const a = msg.toolAction as Record<string, unknown>;
+            const mappedAction: AgentActionResponse = {
+              reply: liveOutputBufRef.current.trim() || 'Done!',
+              screenKind: (a.screenKind as AgentActionResponse['screenKind']) || 'face',
+              faceId: typeof a.faceId === 'number' ? a.faceId : 1,
+              oledLine1: typeof a.oledLine1 === 'string' ? a.oledLine1 : '',
+              oledLine2: typeof a.oledLine2 === 'string' ? a.oledLine2 : '',
+              greenLed: (a.greenLed as AgentActionResponse['greenLed']) || 'unchanged',
+              buzzerSound: (a.buzzerSound as AgentActionResponse['buzzerSound']) || 'none',
+              alarmTime: typeof a.alarmTime === 'string' ? a.alarmTime : '',
+              alarmLabel: typeof a.alarmLabel === 'string' ? a.alarmLabel : '',
+              targetMode: 'unchanged',
+              actionSummary: 'Live Voice Hardware Control',
+            };
+            const badges = executeActionRef.current(mappedAction, 'voice');
+            if (badges.length > 0) {
+              setStatusNotice(`Live Voice executed: ${badges.join(' · ')}`);
+            }
+          }
+
+          if (msg.turnComplete) {
+            const uText = liveInputBufRef.current.trim();
+            const mText = liveOutputBufRef.current.trim();
+            const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const appended: AgentChatMessage[] = [];
+            if (uText) {
+              appended.push({ id: `lu-${Date.now()}`, role: 'user', text: uText, timestamp: ts });
+            }
+            if (mText) {
+              appended.push({
+                id: `lm-${Date.now() + 1}`,
+                role: 'model',
+                text: mText,
+                timestamp: ts,
+                executedBadges: ['Gemini 3.8 Live'],
+              });
+            }
+            if (appended.length > 0) {
+              setMessages((prev) => [...prev, ...appended]);
+            }
+            liveInputBufRef.current = '';
+            liveOutputBufRef.current = '';
+            setLiveInputDraft('');
+            setLiveOutputDraft('');
+          }
+        } catch {
+          // ignore malformed frames
+        }
+      };
+
+      ws.onerror = () => {
+        setStatusNotice(
+          'Live Voice WebSocket unavailable on this host — use "Record & Transcribe" (Gemini 3.5) right next to the input box!'
+        );
+        stopLiveVoice();
+      };
+
+      ws.onclose = () => {
+        stopLiveVoice();
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Microphone access blocked.';
+      setStatusNotice(`Could not start Live Voice: ${msg}`);
+      stopLiveVoice();
     }
-  }, [hasSpeechRecognition, micPermission, enableDeviceMicAndSpeaker, voiceLang, sendMessage]);
+  }, [liveStatus, stopLiveVoice, clearLiveAudioQueue, settings.userName, location.city]);
 
-  startListeningRef.current = () => {
-    void startListening();
-  };
+  // =========================================================================
+  // 3. AUDIO TRANSCRIPTION (gemini-3.5-transcribe via POST /api/agent/transcribe)
+  // =========================================================================
+  const handleToggleRecordTranscribe = useCallback(async () => {
+    setStatusNotice(null);
 
-  const stopListening = () => {
-    setHandsFreeMode(false);
-    setListening(false);
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
+    if (isRecordingClip) {
+      // Stop recording -> triggers onstop -> sends to /api/agent/transcribe
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
       }
-    }
-  };
-
-  const handleToggleHandsFree = async () => {
-    if (handsFreeMode) {
-      stopListening();
+      setIsRecordingClip(false);
       return;
     }
-    const ok = await enableDeviceMicAndSpeaker();
-    if (!ok) return;
-    setHandsFreeMode(true);
-    handsFreeRef.current = true;
-    startListening();
-  };
+
+    if (liveStatus !== 'idle') {
+      stopLiveVoice();
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatusNotice('Microphone recording is not supported in this browser.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordStreamRef.current = stream;
+      recordChunksRef.current = [];
+
+      const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : 'audio/mp4';
+
+      const recorder = new MediaRecorder(stream, { mimeType: preferredMime });
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordChunksRef.current.push(ev.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        recordStreamRef.current = null;
+
+        const blob = new Blob(recordChunksRef.current, { type: preferredMime.split(';')[0] });
+        if (blob.size < 200) return;
+
+        setTranscribing(true);
+        try {
+          const audioBase64 = await blobToBase64(blob);
+          const res = await fetch('/api/agent/transcribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audioBase64,
+              mimeType: preferredMime.split(';')[0],
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data?.error || `Transcribe failed (${res.status})`);
+          }
+          const transcript = String(data.text || '').trim();
+          if (transcript) {
+            setInput(transcript);
+            await sendMessage(transcript, 'voice');
+          } else {
+            setStatusNotice('Sorry Muhib, kono voice shona jay ni. Abr try koro.');
+          }
+        } catch (err) {
+          setStatusNotice(
+            err instanceof Error ? err.message : 'Audio transcription request failed.'
+          );
+        } finally {
+          setTranscribing(false);
+        }
+      };
+
+      recorder.start();
+      setIsRecordingClip(true);
+      setStatusNotice('Recording audio clip... Click Stop to transcribe with Gemini 3.5!');
+    } catch {
+      setStatusNotice('Microphone permission blocked. Allow mic in browser settings.');
+    }
+  }, [isRecordingClip, liveStatus, stopLiveVoice, sendMessage]);
 
   const handleTestSpeaker = () => {
     setSpeakerEnabled(true);
+    speakerEnabledRef.current = true;
     speakReply(`Assalamu Alaikum ${settings.userName || 'Muhib'}! Speaker thik thak kaj korteche.`);
   };
 
@@ -523,55 +797,76 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-      {/* Left Column: Full Banglish Voice & Chat Console */}
+      {/* Left Column: Full Free Gemini Voice, Transcribe, Search & Banglish Console */}
       <section className="xl:col-span-8 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col">
-        {/* Device Mic & Speaker Access Header */}
+        {/* Top Agent Control Header */}
         <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
-              Full Voice &amp; Banglish AI Agent
+              FaceBot Free AI Agent · Live Voice + Search + Transcribe
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Mic: {micPermission === 'granted' ? 'Connected' : micPermission === 'denied' ? 'Blocked' : 'Off'}
+              Voice:{' '}
+              {liveStatus === 'connected'
+                ? 'Live Connected'
+                : liveStatus === 'connecting'
+                  ? 'Connecting...'
+                  : isRecordingClip
+                    ? 'Recording Clip'
+                    : 'Ready'}
               <span className="mx-1.5" aria-hidden="true">·</span>
-              Speaker: {speakerEnabled ? (speaking ? 'Speaking' : 'Ready') : 'Muted'}
+              Speaker: {speakerEnabled ? (speaking ? 'Speaking' : 'ON') : 'Muted'}
               <span className="mx-1.5" aria-hidden="true">·</span>
-              Short Banglish replies
+              {searchMode ? 'Google Search ON' : 'Banglish Hardware Mode'}
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <select
-              value={voiceLang}
-              onChange={(e) => setVoiceLang(e.target.value as 'en-IN' | 'bn-BD' | 'en-US')}
-              aria-label="Mic recognition language"
-              className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-lg"
-            >
-              <option value="bn-BD">Mic: Bangla / Banglish</option>
-              <option value="en-IN">Mic: English (South Asia)</option>
-              <option value="en-US">Mic: English (US)</option>
-            </select>
-
+            {/* 1. Gemini 3.8 Live Real-Time Bidirectional Voice Call */}
             <button
               type="button"
-              onClick={handleToggleHandsFree}
+              onClick={startLiveVoice}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
-                handsFreeMode
+                liveStatus !== 'idle'
                   ? 'bg-red-600 hover:bg-red-700 text-white'
                   : 'bg-blue-600 hover:bg-blue-700 text-white'
               }`}
             >
-              <Radio className="w-3.5 h-3.5" />
-              {handsFreeMode ? 'Stop Full Agent' : 'Start Mic & Speaker'}
+              {liveStatus !== 'idle' ? (
+                <>
+                  <PhoneOff className="w-3.5 h-3.5" />
+                  End Live Voice
+                </>
+              ) : (
+                <>
+                  <PhoneCall className="w-3.5 h-3.5" />
+                  Start Live Voice
+                </>
+              )}
             </button>
 
+            {/* 2. Google Search Grounding Toggle (Gemini 4 Hydrogen + googleSearch) */}
+            <button
+              type="button"
+              onClick={() => setSearchMode((s) => !s)}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                searchMode
+                  ? 'border-blue-600 bg-blue-50 text-blue-700'
+                  : 'border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              {searchMode ? 'Web Search: ON' : 'Web Search'}
+            </button>
+
+            {/* Speaker Toggle */}
             <button
               type="button"
               onClick={() => setSpeakerEnabled((s) => !s)}
               className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
               {speakerEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
-              {speakerEnabled ? 'Speaker ON' : 'Speaker OFF'}
+              {speakerEnabled ? 'Speaker ON' : 'Muted'}
             </button>
 
             <button
@@ -585,45 +880,52 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           </div>
         </div>
 
-        {/* Live Device Mic Audio Level Strip (when mic is granted) */}
-        {(micPermission === 'granted' || micError) && (
+        {/* Live Voice Meter / Notice Strip */}
+        {(liveStatus !== 'idle' || isRecordingClip || transcribing || statusNotice) && (
           <div className="px-5 py-2.5 bg-slate-50 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs">
-            {micError ? (
-              <span className="text-red-600">{micError}</span>
-            ) : (
-              <>
-                <div className="flex items-center gap-2.5 flex-1 min-w-[200px]">
-                  <span className="font-medium text-slate-700 whitespace-nowrap">
-                    {listening ? 'Listening...' : speaking ? 'Speaking reply...' : 'Device Mic Live'}
+            <div className="flex items-center gap-2.5 flex-1 min-w-[200px]">
+              {liveStatus === 'connected' ? (
+                <>
+                  <AudioLines className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span className="font-medium text-slate-800 whitespace-nowrap">
+                    {speaking ? 'FaceBot Speaking...' : 'Listening Live (16kHz PCM)'}
                   </span>
-                  <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden max-w-[220px]">
+                  <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden max-w-[180px]">
                     <div
                       className="h-full bg-blue-600 transition-all duration-75"
-                      style={{ width: `${Math.max(4, micLevel)}%` }}
+                      style={{ width: `${Math.max(5, micLevel)}%` }}
                     />
                   </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleTestSpeaker}
-                  className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium whitespace-nowrap"
-                >
-                  <Headphones className="w-3.5 h-3.5" />
-                  Test Speaker
-                </button>
-              </>
-            )}
+                </>
+              ) : transcribing ? (
+                <span className="inline-flex items-center gap-1.5 text-blue-700 font-medium">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Transcribing your audio clip with Gemini 3.5...
+                </span>
+              ) : (
+                <span className="text-slate-700">{statusNotice}</span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleTestSpeaker}
+              className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium whitespace-nowrap"
+            >
+              <Headphones className="w-3.5 h-3.5" />
+              Test Speaker
+            </button>
           </div>
         )}
 
-        {/* Quick Banglish Prompts */}
+        {/* Quick Banglish & Web Search Prompts */}
         <div className="px-5 py-3 bg-white border-b border-slate-100 flex flex-wrap gap-2">
           {QUICK_PROMPTS.map((item) => (
             <button
               key={item.label}
               type="button"
-              disabled={loading}
-              onClick={() => sendMessage(item.prompt, 'portal')}
+              disabled={loading || transcribing}
+              onClick={() => sendMessage(item.prompt, 'portal', item.search)}
               className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 hover:border-slate-400 hover:text-slate-900 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               {item.label}
@@ -631,7 +933,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           ))}
         </div>
 
-        {/* Chat Transcript */}
+        {/* Chat & Live Voice Transcript */}
         <div
           ref={scrollRef}
           className="p-5 space-y-4 h-[370px] overflow-y-auto bg-slate-50/40"
@@ -654,7 +956,30 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                 >
                   <p className="whitespace-pre-wrap">{msg.text}</p>
 
-                  {/* Clean Zero-Pill Metadata Line */}
+                  {/* Clickable Google Search Grounding Sources */}
+                  {!isUser && msg.sources && msg.sources.length > 0 && (
+                    <div className="mt-2.5 pt-2 border-t border-slate-100 space-y-1">
+                      <div className="text-[11px] font-semibold text-slate-500">
+                        Google Search Sources
+                      </div>
+                      <div className="flex flex-wrap gap-x-3 gap-y-1">
+                        {msg.sources.map((src) => (
+                          <a
+                            key={src.uri}
+                            href={src.uri}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 text-[11px] text-blue-600 hover:text-blue-800 underline underline-offset-2"
+                          >
+                            <span className="truncate max-w-[200px]">{src.title}</span>
+                            <ExternalLink className="w-2.5 h-2.5 shrink-0" />
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Clean Metadata Line */}
                   <div
                     className={`mt-2 text-[11px] tabular-nums ${
                       isUser ? 'text-slate-400 text-right' : 'text-slate-500'
@@ -675,61 +1000,98 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             );
           })}
 
+          {/* Streaming Live Voice Draft Bubbles */}
+          {liveInputDraft && (
+            <div className="flex flex-col items-end">
+              <div className="max-w-[85%] rounded-xl px-4 py-2.5 text-sm bg-slate-800 text-slate-100">
+                {liveInputDraft}
+              </div>
+            </div>
+          )}
+
+          {liveOutputDraft && (
+            <div className="flex flex-col items-start">
+              <div className="max-w-[85%] rounded-xl px-4 py-2.5 text-sm bg-white border border-blue-200 text-slate-800">
+                {liveOutputDraft}
+              </div>
+            </div>
+          )}
+
           {loading && (
             <div className="flex items-start">
               <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 inline-flex items-center gap-2">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
-                <span>FaceBot bhabche...</span>
+                <span>{searchMode ? 'Google e khujche...' : 'FaceBot bhabche...'}</span>
               </div>
             </div>
           )}
         </div>
 
-        {/* Composer Row */}
+        {/* Composer Row: Audio Transcribe Mic + Text Input + Send */}
         <form
           onSubmit={handleFormSubmit}
           className="p-4 bg-white border-t border-slate-200 flex items-center gap-2.5"
         >
           <button
             type="button"
-            onClick={listening ? stopListening : startListening}
-            disabled={loading}
-            title={listening ? 'Stop listening' : 'Speak via device microphone'}
-            className={`p-2.5 rounded-lg border transition-colors shrink-0 ${
-              listening
+            onClick={handleToggleRecordTranscribe}
+            disabled={loading || transcribing}
+            title={
+              isRecordingClip
+                ? 'Stop recording & transcribe with Gemini 3.5'
+                : 'Record voice clip & transcribe (Gemini 3.5)'
+            }
+            className={`inline-flex items-center gap-1.5 px-3 py-2.5 rounded-lg border text-xs font-semibold transition-colors shrink-0 ${
+              isRecordingClip
                 ? 'border-red-600 bg-red-600 text-white'
                 : 'border-slate-200 text-slate-700 hover:bg-slate-50'
             }`}
           >
-            {listening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+            {isRecordingClip ? (
+              <>
+                <Square className="w-3.5 h-3.5 fill-current" />
+                Stop
+              </>
+            ) : transcribing ? (
+              <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+            ) : (
+              <>
+                <Mic className="w-4 h-4" />
+                <span className="hidden sm:inline">Transcribe</span>
+              </>
+            )}
           </button>
 
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={loading}
-            placeholder='Banglish e likho ba mic e bolo... e.g. "Happy face dekhao"'
+            disabled={loading || transcribing}
+            placeholder={
+              searchMode
+                ? 'Google Search mode ON — ask live news, cricket, weather, facts...'
+                : 'Banglish e likho ba Voice use koro... e.g. "Happy face dekhao"'
+            }
             className="flex-1 px-3.5 py-2.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:bg-slate-50"
           />
 
           <button
             type="submit"
-            disabled={loading || !input.trim()}
+            disabled={loading || transcribing || !input.trim()}
             className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 rounded-lg transition-colors whitespace-nowrap shrink-0"
           >
             <Send className="w-3.5 h-3.5" />
-            Send
+            {searchMode ? 'Search' : 'Send'}
           </button>
         </form>
       </section>
 
-      {/* Right Column: Compact Live OLED Reaction Monitor */}
+      {/* Right Column: Compact Live 24-FPS OLED Reaction Monitor */}
       <aside className="xl:col-span-4 bg-white border border-slate-200 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div>
             <h3 className="text-sm font-semibold text-slate-900">Live OLED Monitor</h3>
-            <p className="text-xs text-slate-500">Reacts immediately to AI Agent commands</p>
+            <p className="text-xs text-slate-500">24-FPS smooth sync to Vercel Cloud</p>
           </div>
           <span className="text-xs font-mono text-slate-500">0.96&quot; I2C</span>
         </div>
@@ -804,13 +1166,13 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
           <div className="pt-2 border-t border-slate-100 text-xs text-slate-500 space-y-1">
             <div>
-              ESP32 Link:{' '}
+              Cloud Bridge:{' '}
               <span className="font-mono text-slate-800">
-                {hardware.esp32Ip.trim() || 'Local Simulator'}
+                {hardware.cloudSyncEnabled ? 'Vercel Anywhere Sync ON' : hardware.esp32Ip.trim() || 'Local Only'}
               </span>
             </div>
             <div>
-              Tip: Enable <span className="font-medium text-slate-700">Start Mic &amp; Speaker</span> on your phone or laptop for full hands-free Banglish conversation.
+              Free Gemini Suite: Live Voice (3.8), Banglish Chat &amp; Google Search (4 Hydrogen), Audio Transcribe (3.5).
             </div>
           </div>
         </div>

@@ -415,46 +415,64 @@ export function drawStar(display: SSD1306Buffer, x: number, y: number, r: number
   display.drawLine(x - r + 2, y + r - 2, x + r - 2, y - r + 2, WHITE);
 }
 
-// Exact 1:1 port of all 25 expressions from user's drawFace(int type, int frame)
+// Smooth 24-FPS interpolated expressions (sine-wave breathing, eased blinking, fluid pupil glides)
 export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
   display.clearDisplay();
-  const bob = frame % 2 === 0 ? 0 : -2;
+  const t = frame * 0.22; // smooth continuous phase
+  const bob = Math.round(Math.sin(t) * 2.2);
+  const gentleDrift = Math.round(Math.sin(t * 0.55) * 3.5);
+
+  // Smooth multi-step blink height (28 -> 18 -> 8 -> 4 -> 8 -> 18 -> 28)
+  const blinkPhase = frame % 72;
+  let eyeH = 28;
+  if (blinkPhase === 0 || blinkPhase === 4) eyeH = 16;
+  else if (blinkPhase === 1 || blinkPhase === 3) eyeH = 8;
+  else if (blinkPhase === 2) eyeH = 3;
 
   switch (type) {
-    case 0: // 1. Normal Blink
-      if (frame % 12 === 0) {
-        display.fillRect(26, 28, 28, 4, WHITE);
-        display.fillRect(74, 28, 28, 4, WHITE);
-      } else {
-        display.fillRoundRect(26, 16 + bob, 28, 28, 8, WHITE);
-        display.fillRoundRect(74, 16 + bob, 28, 28, 8, WHITE);
-        display.fillCircle(34, 23 + bob, 3, BLACK);
-        display.fillCircle(82, 23 + bob, 3, BLACK);
+    case 0: // 1. Normal Blink (smooth eyelid blink + subtle breathing & gaze)
+      {
+        const yOff = Math.round((28 - eyeH) / 2);
+        const gx = Math.round(Math.sin(t * 0.35) * 2.5);
+        if (eyeH <= 4) {
+          display.fillRect(26, 28, 28, 3, WHITE);
+          display.fillRect(74, 28, 28, 3, WHITE);
+        } else {
+          display.fillRoundRect(26, 16 + bob + yOff, 28, eyeH, Math.min(8, Math.floor(eyeH / 2)), WHITE);
+          display.fillRoundRect(74, 16 + bob + yOff, 28, eyeH, Math.min(8, Math.floor(eyeH / 2)), WHITE);
+          if (eyeH >= 14) {
+            display.fillCircle(35 + gx, 23 + bob + Math.round(yOff / 2), 3, BLACK);
+            display.fillCircle(83 + gx, 23 + bob + Math.round(yOff / 2), 3, BLACK);
+          }
+        }
+        display.drawRoundRect(56, 50 + Math.round(bob * 0.3), 16, 4, 2, WHITE);
       }
-      display.drawRoundRect(56, 50, 16, 4, 2, WHITE);
       break;
 
-    case 1: // 2. Super Happy
-      display.fillCircle(40, 30 + bob, 14, WHITE);
-      display.fillCircle(40, 36 + bob, 14, BLACK);
-      display.fillCircle(88, 30 + bob, 14, WHITE);
-      display.fillCircle(88, 36 + bob, 14, BLACK);
-      display.fillCircle(64, 44, 10, WHITE);
-      display.fillRect(50, 32, 28, 12, BLACK);
+    case 1: // 2. Super Happy (smooth joyful bounce)
+      {
+        const bounce = Math.round(Math.sin(t * 1.4) * 2.5);
+        display.fillCircle(40, 30 + bounce, 14, WHITE);
+        display.fillCircle(40, 36 + bounce, 14, BLACK);
+        display.fillCircle(88, 30 + bounce, 14, WHITE);
+        display.fillCircle(88, 36 + bounce, 14, BLACK);
+        display.fillCircle(64, 44 + Math.round(bounce * 0.4), 10, WHITE);
+        display.fillRect(50, 32 + Math.round(bounce * 0.4), 28, 12, BLACK);
+      }
       break;
 
-    case 2: // 3. Cute Wink
-      display.fillRoundRect(26, 16, 28, 28, 8, WHITE);
-      display.fillCircle(34, 23, 3, BLACK);
-      display.drawLine(74, 28, 88, 22, WHITE);
-      display.drawLine(74, 28, 88, 34, WHITE);
+    case 2: // 3. Cute Wink (smooth wink cycle)
+      display.fillRoundRect(26, 16 + bob, 28, 28, 8, WHITE);
+      display.fillCircle(34, 23 + bob, 3, BLACK);
+      display.drawLine(74, 28 + bob, 88, 22 + bob, WHITE);
+      display.drawLine(74, 28 + bob, 88, 34 + bob, WHITE);
       display.drawCircle(64, 46, 7, WHITE);
       display.fillRect(54, 38, 20, 8, BLACK);
       break;
 
-    case 3: // 4. Freezing Cold
+    case 3: // 4. Freezing Cold (rapid smooth shiver)
       {
-        const shiver = frame % 2 === 0 ? -2 : 2;
+        const shiver = Math.round(Math.sin(frame * 1.9) * 2.2);
         display.drawRoundRect(26 + shiver, 18, 28, 24, 5, WHITE);
         display.drawRoundRect(74 + shiver, 18, 28, 24, 5, WHITE);
         display.fillCircle(40 + shiver, 30, 4, WHITE);
@@ -466,102 +484,122 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       }
       break;
 
-    case 4: // 5. In Love
+    case 4: // 5. In Love (smooth heartbeat pulse)
       {
-        const pulse = frame % 2 === 0 ? 10 : 12;
-        drawHeart(display, 40, 22, pulse);
-        drawHeart(display, 88, 22, pulse);
+        const pulse = Math.round(10 + Math.sin(t * 1.8) * 2.2);
+        drawHeart(display, 40, 22 + Math.round(bob * 0.4), pulse);
+        drawHeart(display, 88, 22 + Math.round(bob * 0.4), pulse);
         display.drawCircle(64, 48, 8, WHITE);
         display.fillRect(54, 39, 20, 9, BLACK);
       }
       break;
 
-    case 5: // 6. Angry
-      display.fillRoundRect(26, 20, 28, 22, 4, WHITE);
-      display.fillRoundRect(74, 20, 28, 22, 4, WHITE);
-      display.fillTriangle(24, 14, 56, 26, 56, 14, BLACK);
-      display.fillTriangle(104, 14, 72, 26, 72, 14, BLACK);
-      display.drawLine(50, 52, 78, 52, WHITE);
+    case 5: // 6. Angry (subtle intense pulse)
+      {
+        const throb = Math.round(Math.sin(t * 2.2) * 1.2);
+        display.fillRoundRect(26, 20 + throb, 28, 22, 4, WHITE);
+        display.fillRoundRect(74, 20 + throb, 28, 22, 4, WHITE);
+        display.fillTriangle(24, 14 + throb, 56, 26 + throb, 56, 14 + throb, BLACK);
+        display.fillTriangle(104, 14 + throb, 72, 26 + throb, 72, 14 + throb, BLACK);
+        display.drawLine(50, 52, 78, 52, WHITE);
+      }
       break;
 
     case 6: // 7. Surprised / Shocked
-      display.drawCircle(40, 26, 14, WHITE);
-      display.fillCircle(40, 26, 5 + (frame % 2), WHITE);
-      display.drawCircle(88, 26, 14, WHITE);
-      display.fillCircle(88, 26, 5 + (frame % 2), WHITE);
-      display.drawCircle(64, 50, 7, WHITE);
+      {
+        const pr = Math.round(5 + Math.sin(t * 2) * 1.4);
+        display.drawCircle(40, 26, 14, WHITE);
+        display.fillCircle(40, 26, pr, WHITE);
+        display.drawCircle(88, 26, 14, WHITE);
+        display.fillCircle(88, 26, pr, WHITE);
+        display.drawCircle(64, 50, 7 + Math.round(Math.sin(t * 1.5)), WHITE);
+      }
       break;
 
-    case 7: // 8. Sleepy
-      display.drawLine(26, 30, 54, 30, WHITE);
-      display.drawLine(74, 30, 102, 30, WHITE);
-      display.drawCircle(64, 48, 4, WHITE);
-      display.setTextSize(1);
-      display.setTextColor(WHITE);
-      display.setCursor(96, 14 - (frame % 6));
-      display.print('Zzz');
+    case 7: // 8. Sleepy (smooth floating Zzz + slow breathing mouth)
+      {
+        const zOff = (frame * 0.35) % 10;
+        const mR = 4 + Math.round(Math.sin(t * 0.6));
+        display.drawLine(26, 30, 54, 30, WHITE);
+        display.drawLine(74, 30, 102, 30, WHITE);
+        display.drawCircle(64, 48, Math.max(3, mR), WHITE);
+        display.setTextSize(1);
+        display.setTextColor(WHITE);
+        display.setCursor(96 + Math.round(Math.sin(t * 0.5) * 2), Math.round(16 - zOff));
+        display.print('Zzz');
+      }
       break;
 
-    case 8: // 9. Cool / Thug Life
+    case 8: // 9. Cool Shades (smooth swagger glide)
       display.fillRect(20, 18 + bob, 38, 16, WHITE);
       display.fillRect(70, 18 + bob, 38, 16, WHITE);
       display.drawLine(58, 22 + bob, 70, 22 + bob, WHITE);
       display.drawLine(26, 22 + bob, 34, 30 + bob, BLACK);
       display.drawLine(76, 22 + bob, 84, 30 + bob, BLACK);
-      display.drawLine(54, 50, 74, 46, WHITE);
+      display.drawLine(54, 50, 74, 46 + Math.round(bob * 0.4), WHITE);
       break;
 
-    case 9: // 10. Sad / Puppy Eyes
-      display.fillRoundRect(26, 22, 28, 22, 6, WHITE);
-      display.fillRoundRect(74, 22, 28, 22, 6, WHITE);
+    case 9: // 10. Sad Puppy
+      display.fillRoundRect(26, 22 + Math.round(bob * 0.5), 28, 22, 6, WHITE);
+      display.fillRoundRect(74, 22 + Math.round(bob * 0.5), 28, 22, 6, WHITE);
       display.fillTriangle(24, 18, 44, 18, 24, 28, BLACK);
       display.fillTriangle(104, 18, 84, 18, 104, 28, BLACK);
       display.drawCircle(64, 56, 10, WHITE);
       display.fillRect(50, 56, 28, 12, BLACK);
       break;
 
-    case 10: // 11. Crying
-      display.drawLine(26, 26, 54, 26, WHITE);
-      display.drawLine(74, 26, 102, 26, WHITE);
-      display.fillCircle(32, 32 + (frame % 4) * 5, 2, WHITE);
-      display.fillCircle(96, 32 + ((frame + 2) % 4) * 5, 2, WHITE);
-      display.drawRoundRect(52, 46, 24, 10, 4, WHITE);
+    case 10: // 11. Crying (continuous falling teardrops)
+      {
+        const tearL = Math.round((frame * 1.4) % 24);
+        const tearR = Math.round((frame * 1.4 + 12) % 24);
+        display.drawLine(26, 26, 54, 26, WHITE);
+        display.drawLine(74, 26, 102, 26, WHITE);
+        display.fillCircle(32, 30 + tearL, 2, WHITE);
+        display.fillCircle(96, 30 + tearR, 2, WHITE);
+        display.drawRoundRect(52, 46, 24, 10, 4, WHITE);
+      }
       break;
 
-    case 11: // 12. Dizzy / Confused
+    case 11: // 12. Dizzy (smooth concentric pulse)
       {
-        const r = frame % 2 === 0 ? 10 : 7;
+        const r = Math.round(7.5 + Math.sin(t * 2.2) * 3.5);
         display.drawCircle(40, 26, 12, WHITE);
-        display.drawCircle(40, 26, r, WHITE);
+        display.drawCircle(40, 26, Math.max(2, r), WHITE);
         display.drawCircle(88, 26, 12, WHITE);
-        display.drawCircle(88, 26, r, WHITE);
-        display.drawLine(52, 50, 60, 46, WHITE);
-        display.drawLine(60, 46, 68, 52, WHITE);
+        display.drawCircle(88, 26, Math.max(2, r), WHITE);
+        display.drawLine(52, 50, 60, 46 + Math.round(bob * 0.5), WHITE);
+        display.drawLine(60, 46 + Math.round(bob * 0.5), 68, 52, WHITE);
         display.drawLine(68, 52, 76, 48, WHITE);
       }
       break;
 
-    case 12: // 13. Starry Eyed / Excited
-      drawStar(display, 40, 26, 10 + (frame % 3));
-      drawStar(display, 88, 26, 10 + (frame % 3));
-      display.fillCircle(64, 48, 8, WHITE);
-      display.fillRect(54, 39, 20, 9, BLACK);
+    case 12: // 13. Starry Eyed (smooth twinkling stars)
+      {
+        const sr = Math.round(10.5 + Math.sin(t * 2.1) * 2.2);
+        drawStar(display, 40, 26 + Math.round(bob * 0.5), sr);
+        drawStar(display, 88, 26 + Math.round(bob * 0.5), sr);
+        display.fillCircle(64, 48, 8, WHITE);
+        display.fillRect(54, 39, 20, 9, BLACK);
+      }
       break;
 
-    case 13: // 14. Skeptical / Suspicious
+    case 13: // 14. Skeptical
       display.fillRect(26, 24, 28, 10, WHITE);
-      display.fillRoundRect(74, 16, 28, 26, 6, WHITE);
+      display.fillRoundRect(74, 16 + Math.round(bob * 0.5), 28, 26, 6, WHITE);
       display.drawLine(52, 50, 76, 48, WHITE);
       break;
 
-    case 14: // 15. Cheeky / Tongue Out
-      display.fillRoundRect(26, 16, 28, 26, 8, WHITE);
-      display.fillRoundRect(74, 16, 28, 26, 8, WHITE);
-      display.drawLine(48, 46, 80, 46, WHITE);
-      display.fillRoundRect(60, 46, 12, 10 + (frame % 2) * 2, 4, WHITE);
+    case 14: // 15. Cheeky Tongue
+      {
+        const tongueH = Math.round(10 + Math.sin(t * 1.8) * 2.5);
+        display.fillRoundRect(26, 16 + Math.round(bob * 0.5), 28, 26, 8, WHITE);
+        display.fillRoundRect(74, 16 + Math.round(bob * 0.5), 28, 26, 8, WHITE);
+        display.drawLine(48, 46, 80, 46, WHITE);
+        display.fillRoundRect(60, 46, 12, tongueH, 4, WHITE);
+      }
       break;
 
-    case 15: // 16. Kawaii Cat Face
+    case 15: // 16. Kawaii Cat
       display.fillCircle(40, 26 + bob, 11, WHITE);
       display.fillCircle(36, 22 + bob, 3, BLACK);
       display.fillCircle(88, 26 + bob, 11, WHITE);
@@ -571,7 +609,7 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       display.fillRect(50, 40, 28, 8, BLACK);
       break;
 
-    case 16: // 17. Dead / Knocked Out
+    case 16: // 17. Knocked Out
       display.drawLine(30, 18, 50, 36, WHITE);
       display.drawLine(50, 18, 30, 36, WHITE);
       display.drawLine(78, 18, 98, 36, WHITE);
@@ -579,17 +617,17 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       display.drawLine(52, 50, 76, 50, WHITE);
       break;
 
-    case 17: // 18. Thinking
+    case 17: // 18. Thinking (smooth upward pondering gaze)
       display.drawRoundRect(26, 18, 28, 24, 6, WHITE);
-      display.fillCircle(46, 24, 5, WHITE);
+      display.fillCircle(44 + gentleDrift, 24, 5, WHITE);
       display.drawRoundRect(74, 18, 28, 24, 6, WHITE);
-      display.fillCircle(94, 24, 5, WHITE);
+      display.fillCircle(92 + gentleDrift, 24, 5, WHITE);
       display.drawCircle(68, 50, 4, WHITE);
       break;
 
-    case 18: // 19. Shy / Blushing
-      display.fillCircle(40, 26, 10, WHITE);
-      display.fillCircle(88, 26, 10, WHITE);
+    case 18: // 19. Shy Blushing
+      display.fillCircle(40, 26 + Math.round(bob * 0.5), 10, WHITE);
+      display.fillCircle(88, 26 + Math.round(bob * 0.5), 10, WHITE);
       display.drawLine(22, 40, 26, 44, WHITE);
       display.drawLine(28, 40, 32, 44, WHITE);
       display.drawLine(96, 40, 100, 44, WHITE);
@@ -599,18 +637,24 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       break;
 
     case 19: // 20. Angry Shout
-      display.fillTriangle(26, 18, 54, 30, 26, 34, WHITE);
-      display.fillTriangle(102, 18, 74, 30, 102, 34, WHITE);
-      display.fillRoundRect(48, 42, 32, 16, 6, WHITE);
+      {
+        const shoutH = Math.round(15 + Math.sin(t * 2.5) * 3);
+        display.fillTriangle(26, 18, 54, 30, 26, 34, WHITE);
+        display.fillTriangle(102, 18, 74, 30, 102, 34, WHITE);
+        display.fillRoundRect(48, 41, 32, shoutH, 6, WHITE);
+      }
       break;
 
-    case 20: // 21. Cyclops / Alien
-      display.drawCircle(64, 26, 18, WHITE);
-      display.fillCircle(64 + ((frame % 3) - 1) * 4, 26, 7, WHITE);
-      display.drawLine(50, 52, 78, 52, WHITE);
+    case 20: // 21. Cyclops Alien (smooth eye glide)
+      {
+        const cx = Math.round(Math.sin(t * 0.9) * 8);
+        display.drawCircle(64, 26, 18, WHITE);
+        display.fillCircle(64 + cx, 26, 7, WHITE);
+        display.drawLine(50, 52, 78, 52, WHITE);
+      }
       break;
 
-    case 21: // 22. Money / Rich Eyes
+    case 21: // 22. Money Eyes
       display.setTextSize(3);
       display.setTextColor(WHITE);
       display.setCursor(32, 16 + bob);
@@ -621,9 +665,9 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       display.fillRect(54, 39, 20, 9, BLACK);
       break;
 
-    case 22: // 23. Robot Scanning
+    case 22: // 23. Robot Scanning (smooth back-and-forth KITT sweep)
       {
-        const scanX = (frame * 6) % 20;
+        const scanX = Math.round((Math.sin(t * 1.4) + 1) * 11);
         display.drawRect(24, 18, 32, 20, WHITE);
         display.fillRect(26 + scanX, 20, 6, 16, WHITE);
         display.drawRect(72, 18, 32, 20, WHITE);
@@ -632,17 +676,17 @@ export function drawFace(display: SSD1306Buffer, type: number, frame: number) {
       }
       break;
 
-    case 23: // 24. Smug / Proud
-      display.fillRoundRect(26, 22, 28, 16, 4, WHITE);
-      display.fillRoundRect(74, 22, 28, 16, 4, WHITE);
+    case 23: // 24. Smug Proud
+      display.fillRoundRect(26, 22 + Math.round(bob * 0.4), 28, 16, 4, WHITE);
+      display.fillRoundRect(74, 22 + Math.round(bob * 0.4), 28, 16, 4, WHITE);
       display.drawLine(52, 48, 66, 50, WHITE);
       display.drawLine(66, 50, 78, 44, WHITE);
       break;
 
-    case 24: // 25. Looking Around
+    case 24: // 25. Looking Around (silky smooth sinusoidal eye sweep)
     default:
       {
-        const dir = (Math.floor(frame / 3) % 3 - 1) * 7;
+        const dir = Math.round(Math.sin(t * 0.8) * 7.5);
         display.drawRoundRect(24, 14, 30, 28, 8, WHITE);
         display.fillCircle(39 + dir, 28, 7, WHITE);
         display.drawRoundRect(74, 14, 30, 28, 8, WHITE);

@@ -91,8 +91,6 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  const safeApName = `FaceBot-${(settings.userName || 'Muhib').replace(/[^a-zA-Z0-9]/g, '') || 'Muhib'}`;
-
   return (
     <div className="space-y-6">
       {/* Ultra-Clean Zero-Resistor ESP32 Wiring Table */}
@@ -105,7 +103,7 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
                 Single-Board ESP32 Minimal Wiring (8 Wires Total · Zero Resistors)
               </h3>
               <p className="text-xs text-slate-500">
-                ESP32 + 0.96" SSD1306 OLED + Piezo Buzzer + 1× Green LED — No Arduino, No Servo, No HC-SR04, No Resistors
+                ESP32 + 0.96&quot; SSD1306 OLED (400kHz I2C) + Piezo Buzzer + 1× Green LED — No Arduino, No Servo, No HC-SR04, No Resistors
               </p>
             </div>
           </div>
@@ -142,17 +140,17 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
         </div>
       </div>
 
-      {/* Live Generated ESP32 .ino Sketch */}
+      {/* Live Generated Dual-Core ESP32 .ino Sketch */}
       <div className="bg-white border border-slate-200 rounded-xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Code2 className="w-4 h-4 text-slate-600" />
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                ESP32 Arduino Sketch (.ino) — OLED + Buzzer + Green LED + Dual-Mode WiFi
+                Dual-Core ESP32 Cloud Firmware (.ino · v{hardware.firmwareVersion || '3.0.0'})
               </h3>
               <p className="text-xs text-slate-500">
-                Home WiFi (<span className="font-mono">{hardware.wifiSsid || 'muhib'}</span>) + Built-in Hotspot <span className="font-mono">{safeApName}</span> (pass: <span className="font-mono">12345678</span>) → <span className="font-mono">http://192.168.4.1</span>
+                Core 1: Smooth 24-FPS OLED · Core 0: 1.2s Vercel Cloud Sync &amp; Auto-OTA over Home WiFi (<span className="font-mono">{hardware.wifiSsid || 'muhib'}</span>) — control from anywhere without switching WiFi!
               </p>
             </div>
           </div>

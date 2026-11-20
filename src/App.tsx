@@ -83,7 +83,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
   esp32Connected: false,
   wifiSsid: 'muhib',
   wifiPassword: '12345678',
-  cloudSyncEnabled: false,
+  cloudSyncEnabled: true,
   cloudBackendType: 'vercel-api',
   cloudPortalUrl:
     typeof window !== 'undefined' && window.location.origin.startsWith('http')
@@ -91,8 +91,8 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '2.1.0',
-  otaAutoCheck: false,
+  firmwareVersion: '3.0.0',
+  otaAutoCheck: true,
 };
 
 const DEFAULT_PLAYLIST: PlaylistItem[] = [
@@ -298,6 +298,8 @@ export default function App() {
   const [pingStatus, setPingStatus] = useState<string | null>(null);
   const [alarmSyncMessage, setAlarmSyncMessage] = useState<string | null>(null);
   const [wifiSaveStatus, setWifiSaveStatus] = useState<string | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<string | null>(null);
+  const [cloudEventSeq, setCloudEventSeq] = useState(0);
 
   const [activeScreen, setActiveScreen] = useState<ActiveScreenState>({
     kind: 'face',
@@ -309,6 +311,14 @@ export default function App() {
   const lastAlarmMinuteRef = useRef<string>('');
   const autoStepRef = useRef(0);
   const userStepRef = useRef(0);
+
+  // Cloud event counters so ESP32 Core-0 1.2s poller deduplicates one-shot actions
+  const buzzerSeqRef = useRef(0);
+  const lastBuzzerModeRef = useRef('tone');
+  const bitmapSeqRef = useRef(0);
+  const lastBitmapHexRef = useRef('');
+  const alarmDismissSeqRef = useRef(0);
+  const otaTriggerSeqRef = useRef(0);
 
   // Persist settings to localStorage
   useEffect(() => {
@@ -374,17 +384,163 @@ export default function App() {
 
   const postBitmapToEsp32 = useCallback(
     (pixels: number[]) => {
+      const hex = pixelsToHex(pixels);
+      lastBitmapHexRef.current = hex;
+      bitmapSeqRef.current += 1;
+      setCloudEventSeq((s) => s + 1);
+
       const ip = hardware.esp32Ip.trim();
       if (!ip) return;
       const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
       fetch(`${base}/api/bitmap`, {
         method: 'POST',
         mode: 'no-cors',
-        body: pixelsToHex(pixels),
+        body: hex,
       }).catch(() => {});
     },
     [hardware.esp32Ip]
   );
+
+  // Build Cloud State Payload synced to Vercel /api/bot-state or Firebase RTDB
+  const buildCloudPayload = useCallback(() => {
+    let screenName = 'auto';
+    if (activeScreen.locked) {
+      if (activeScreen.kind === 'custom-text') screenName = 'text';
+      else if (activeScreen.kind === 'custom-bitmap') screenName = 'bitmap';
+      else screenName = activeScreen.kind;
+    }
+
+    const mappedAlarms = alarms.slice(0, 8).map((a) => {
+      const [hh, mm] = a.time.split(':').map(Number);
+      const melody = a.melody === 'gentle' ? 1 : a.melody === 'urgent' ? 2 : 0;
+      return {
+        hour: hh || 7,
+        min: mm || 0,
+        on: a.enabled,
+        face: a.faceId,
+        melody,
+        label: a.label.slice(0, 18),
+      };
+    });
+
+    return {
+      deviceId: (hardware.deviceId || 'muhib-bot-1').trim(),
+      mode,
+      screen: screenName,
+      faceId: activeScreen.faceId,
+      textLine1: activeScreen.textLine1 || '',
+      textLine2: activeScreen.textLine2 || '',
+      userName: settings.userName || 'Muhib',
+      city: location.city || 'Dhaka',
+      greenLed: hardware.greenLedMode,
+      buzzerSeq: buzzerSeqRef.current,
+      buzzerMode: lastBuzzerModeRef.current,
+      bitmapSeq: bitmapSeqRef.current,
+      bitmapHex: lastBitmapHexRef.current,
+      alarms: mappedAlarms,
+      alarmDismissSeq: alarmDismissSeqRef.current,
+      otaTriggerSeq: otaTriggerSeqRef.current,
+      updatedAt: Date.now(),
+    };
+  }, [
+    hardware.deviceId,
+    hardware.greenLedMode,
+    mode,
+    activeScreen,
+    settings.userName,
+    location.city,
+    alarms,
+  ]);
+
+  const pushStateToCloud = useCallback(
+    async (silent = false) => {
+      if (!hardware.cloudSyncEnabled && silent) return;
+
+      const payload = buildCloudPayload();
+      const deviceId = encodeURIComponent(payload.deviceId || 'muhib-bot-1');
+
+      try {
+        if (hardware.cloudBackendType === 'firebase-rtdb') {
+          const fbUrl = hardware.firebaseDbUrl.trim();
+          if (!fbUrl) {
+            if (!silent) setCloudSyncStatus('Enter your Firebase Realtime Database .json URL first.');
+            return;
+          }
+          const res = await fetch(fbUrl, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) throw new Error(`Firebase responded ${res.status}`);
+          if (!silent) {
+            setCloudSyncStatus(
+              `Synced live state to Firebase RTDB at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}.`
+            );
+          }
+        } else {
+          const base = hardware.cloudPortalUrl.trim().replace(/\/$/, '');
+          const endpoint =
+            base && typeof window !== 'undefined' && base !== window.location.origin
+              ? `${base}/api/bot-state?device=${deviceId}`
+              : `/api/bot-state?device=${deviceId}`;
+
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) throw new Error(`Cloud bridge responded ${res.status}`);
+          if (!silent) {
+            setCloudSyncStatus(
+              `Synced live state to Vercel Cloud (${payload.deviceId}) at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. ESP32 updates within ~1.2s.`
+            );
+          }
+        }
+      } catch (err) {
+        if (!silent) {
+          setCloudSyncStatus(
+            `Cloud sync error: ${err instanceof Error ? err.message : 'Unable to reach endpoint'}`
+          );
+        }
+      }
+    },
+    [
+      hardware.cloudSyncEnabled,
+      hardware.cloudBackendType,
+      hardware.firebaseDbUrl,
+      hardware.cloudPortalUrl,
+      buildCloudPayload,
+    ]
+  );
+
+  // Fast 220ms debounced Vercel Cloud Auto-Sync on any state/hardware change
+  useEffect(() => {
+    if (!hardware.cloudSyncEnabled) return;
+    const timer = window.setTimeout(() => {
+      void pushStateToCloud(true);
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [
+    hardware.cloudSyncEnabled,
+    hardware.greenLedMode,
+    mode,
+    activeScreen,
+    alarms,
+    settings.userName,
+    location.city,
+    cloudEventSeq,
+    pushStateToCloud,
+  ]);
+
+  const handleTriggerOtaUpdate = useCallback(async () => {
+    otaTriggerSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
+    await pushStateToCloud(false);
+    setCloudSyncStatus(
+      `OTA Update signal queued for ${hardware.deviceId || 'muhib-bot-1'} — ESP32 will check /ota/version.json on next 1.2s sync and update automatically!`
+    );
+    logInteraction('hardware', 'Triggered Vercel Auto-OTA Update', 'portal');
+  }, [pushStateToCloud, hardware.deviceId, logInteraction]);
 
   // Pull real hourly interaction spikes from ESP32 /api/stats
   const handleSyncEsp32Stats = useCallback(async () => {
@@ -430,16 +586,16 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
 
-  // Animation Frame Tick
+  // Smooth 24-FPS OLED Animation Frame Tick (Matches ESP32 Core-1 42ms frame loop)
   useEffect(() => {
     const ms =
       hardware.animationSpeed === 'fast'
-        ? 130
+        ? 28
         : hardware.animationSpeed === 'slow'
-          ? 360
-          : 220;
+          ? 75
+          : 42;
     const id = window.setInterval(() => {
-      setFrame((f) => (f + 1) % 10000);
+      setFrame((f) => (f + 1) % 100000);
     }, ms);
     return () => window.clearInterval(id);
   }, [hardware.animationSpeed]);
@@ -587,12 +743,12 @@ export default function App() {
     settings.coldThresholdC,
   ]);
 
-  // Compute Single Green LED (GPIO 26) State
+  // Compute Single Green LED (GPIO 26) State (smoothly timed at 24-FPS)
   const greenLedOn = useMemo(() => {
     if (hardware.greenLedMode === 'on') return true;
     if (hardware.greenLedMode === 'off') return false;
-    if (hardware.greenLedMode === 'blink') return frame % 2 === 0;
-    if (activeAlarm) return frame % 2 === 0;
+    if (hardware.greenLedMode === 'blink') return Math.floor(frame / 7) % 2 === 0;
+    if (activeAlarm) return Math.floor(frame / 4) % 2 === 0;
     return !isSleeping;
   }, [hardware.greenLedMode, frame, activeAlarm, isSleeping]);
 
@@ -613,6 +769,9 @@ export default function App() {
       } else {
         playBuzzerTest(hardware.buzzerMuted);
       }
+      lastBuzzerModeRef.current = sound;
+      buzzerSeqRef.current += 1;
+      setCloudEventSeq((s) => s + 1);
       sendToEsp32(`/api/buzzer?mode=${sound}`);
       logInteraction('hardware', `Piezo Buzzer (${sound})`, 'portal');
     },
@@ -791,6 +950,8 @@ export default function App() {
   const handleDismissAlarm = () => {
     setActiveAlarm(null);
     setActiveScreen({ kind: 'face', faceId: 0, locked: false });
+    alarmDismissSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
     sendToEsp32('/api/alarm/dismiss');
     logInteraction('alarm', 'Dismissed Ringing Alarm', 'portal');
   };
@@ -927,14 +1088,19 @@ export default function App() {
       if (action.buzzerSound && action.buzzerSound !== 'none') {
         if (action.buzzerSound === 'wake' || action.buzzerSound === 'happy') {
           playWakeChime(hardware.buzzerMuted);
+          lastBuzzerModeRef.current = 'happy';
           sendToEsp32('/api/buzzer?mode=happy');
         } else if (action.buzzerSound === 'alarm') {
           playAlarmMelody('classic', hardware.buzzerMuted);
+          lastBuzzerModeRef.current = 'alarm';
           sendToEsp32('/api/buzzer?mode=alarm');
         } else {
           playBuzzerTest(hardware.buzzerMuted);
+          lastBuzzerModeRef.current = 'tone';
           sendToEsp32('/api/buzzer?mode=tone');
         }
+        buzzerSeqRef.current += 1;
+        setCloudEventSeq((s) => s + 1);
         badges.push(`Buzzer: ${action.buzzerSound}`);
       }
 
@@ -1356,7 +1522,7 @@ export default function App() {
             />
           )}
 
-          {/* 7. Dedicated WiFi & Hardware */}
+          {/* 7. Dedicated WiFi & Hardware (with Vercel Cloud Anywhere Sync & OTA) */}
           {navSection === 'hardware' && (
             <HardwarePanel
               hardware={hardware}
@@ -1367,6 +1533,9 @@ export default function App() {
               wifiSaveStatus={wifiSaveStatus}
               onPingEsp32={handlePingEsp32}
               pingStatus={pingStatus}
+              onPushCloudState={() => pushStateToCloud(false)}
+              onTriggerOtaUpdate={handleTriggerOtaUpdate}
+              cloudSyncStatus={cloudSyncStatus}
             />
           )}
 

@@ -162,6 +162,7 @@ export interface AgentChatMessage {
   timestamp: string;
   actionSummary?: string;
   executedBadges?: string[];
+  sources?: { title: string; uri: string }[];
   error?: boolean;
 }
 
