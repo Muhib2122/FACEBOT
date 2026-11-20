@@ -68,6 +68,16 @@ const DEFAULT_HARDWARE: HardwareConfig = {
   esp32Connected: false,
   wifiSsid: 'muhib',
   wifiPassword: '12345678',
+  cloudSyncEnabled: true,
+  cloudBackendType: 'vercel-api',
+  cloudPortalUrl:
+    typeof window !== 'undefined' && window.location.origin.startsWith('http')
+      ? window.location.origin
+      : 'https://muhib-facebot.vercel.app',
+  firebaseDbUrl: '',
+  deviceId: 'muhib-bot-1',
+  firmwareVersion: '1.0.0',
+  otaAutoCheck: true,
 };
 
 const DEFAULT_PLAYLIST: PlaylistItem[] = [
@@ -148,6 +158,9 @@ export default function App() {
   const [pingStatus, setPingStatus] = useState<string | null>(null);
   const [alarmSyncMessage, setAlarmSyncMessage] = useState<string | null>(null);
   const [wifiSaveStatus, setWifiSaveStatus] = useState<string | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<string | null>(null);
+  const alarmDismissSeqRef = useRef(0);
+  const otaTriggerSeqRef = useRef(0);
 
   const [activeScreen, setActiveScreen] = useState<ActiveScreenState>({
     kind: 'face',
@@ -660,6 +673,7 @@ export default function App() {
   };
 
   const handleDismissAlarm = () => {
+    alarmDismissSeqRef.current += 1;
     setActiveAlarm(null);
     setActiveScreen({ kind: 'face', faceId: 0, locked: false });
     sendToEsp32('/api/alarm/dismiss');
@@ -714,6 +728,109 @@ export default function App() {
       }
       return next;
     });
+  };
+
+  const buildCloudPayload = useCallback(() => {
+    return {
+      deviceId: hardware.deviceId || 'muhib-bot-1',
+      mode,
+      screen: activeScreen.kind === 'custom-text' ? 'text' : activeScreen.kind,
+      faceId: activeScreen.faceId,
+      textLine1: activeScreen.textLine1 || '',
+      textLine2: activeScreen.textLine2 || '',
+      userName: settings.userName || 'Muhib',
+      city: location.city,
+      manualServo: hardware.servoManualOverride,
+      servoAngle: hardware.servoAngle,
+      ultrasonicOn: hardware.ultrasonicEnabled,
+      trackingOn: hardware.trackingEnabled,
+      servoIdleOff: hardware.servoPowerOffWhenIdle,
+      alarms: alarms.slice(0, 8).map((a) => {
+        const [hh, mm] = a.time.split(':').map(Number);
+        return {
+          hour: hh || 7,
+          min: mm || 0,
+          on: a.enabled,
+          face: a.faceId,
+          melody: a.melody === 'gentle' ? 1 : a.melody === 'urgent' ? 2 : 0,
+          label: a.label,
+        };
+      }),
+      alarmDismissSeq: alarmDismissSeqRef.current,
+      otaTriggerSeq: otaTriggerSeqRef.current,
+      updatedAt: Date.now(),
+    };
+  }, [hardware, mode, activeScreen, settings.userName, location.city, alarms]);
+
+  const pushStateToCloud = useCallback(
+    async (silent = false) => {
+      if (!hardware.cloudSyncEnabled && silent) return;
+      const payload = buildCloudPayload();
+      const isFirebase =
+        hardware.cloudBackendType === 'firebase-rtdb' &&
+        hardware.firebaseDbUrl.trim().length > 8;
+      const base = (hardware.cloudPortalUrl || window.location.origin).replace(/\/$/, '');
+      const targetUrl = isFirebase
+        ? hardware.firebaseDbUrl.trim()
+        : `${base}/api/bot-state?device=${encodeURIComponent(hardware.deviceId || 'muhib-bot-1')}`;
+
+      try {
+        const res = await fetch(targetUrl, {
+          method: isFirebase ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!silent) {
+          if (res.ok) {
+            setCloudSyncStatus(
+              `Synced live state to ${isFirebase ? 'Firebase RTDB' : 'Vercel Cloud API'} (${new Date().toLocaleTimeString()}). ESP32 pulls it within 2.5s.`
+            );
+          } else {
+            setCloudSyncStatus(
+              'Cloud API responded with an error. Deploy this repo to Vercel (or paste a Firebase RTDB URL) for live cloud sync.'
+            );
+          }
+        }
+      } catch {
+        if (!silent) {
+          setCloudSyncStatus(
+            'Cloud endpoint is ready once deployed to Vercel (or paste a Firebase RTDB .json URL above).'
+          );
+        }
+      }
+    },
+    [hardware.cloudSyncEnabled, hardware.cloudBackendType, hardware.firebaseDbUrl, hardware.cloudPortalUrl, hardware.deviceId, buildCloudPayload]
+  );
+
+  // Auto-sync live state changes to Cloud Portal when Cloud Sync is enabled
+  useEffect(() => {
+    if (!hardware.cloudSyncEnabled) return;
+    const t = window.setTimeout(() => {
+      pushStateToCloud(true);
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [
+    hardware.cloudSyncEnabled,
+    mode,
+    activeScreen.kind,
+    activeScreen.faceId,
+    activeScreen.textLine1,
+    activeScreen.textLine2,
+    hardware.servoManualOverride,
+    hardware.servoAngle,
+    hardware.ultrasonicEnabled,
+    hardware.trackingEnabled,
+    hardware.servoPowerOffWhenIdle,
+    alarms,
+    pushStateToCloud,
+  ]);
+
+  const handleTriggerOtaUpdate = async () => {
+    otaTriggerSeqRef.current += 1;
+    await pushStateToCloud(false);
+    setCloudSyncStatus(
+      `OTA update signal (#${otaTriggerSeqRef.current}) queued. Your ESP32 will check ${hardware.cloudPortalUrl.replace(/\/$/, '')}/ota/version.json and self-flash if a newer version exists.`
+    );
   };
 
   const handleSaveWifiCredentials = (ssid: string, password: string) => {
@@ -1020,6 +1137,9 @@ export default function App() {
               wifiSaveStatus={wifiSaveStatus}
               onPingEsp32={handlePingEsp32}
               pingStatus={pingStatus}
+              onPushCloudState={() => pushStateToCloud(false)}
+              onTriggerOtaUpdate={handleTriggerOtaUpdate}
+              cloudSyncStatus={cloudSyncStatus}
             />
           )}
 

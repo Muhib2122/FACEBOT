@@ -1,0 +1,5 @@
+{
+  "version": "1.0.0",
+  "binUrl": "/ota/firmware.bin",
+  "notes": "Initial release with 25 dynamic faces, HC-SR04 user tracking, idle servo detach, alarms, and cloud sync."
+}

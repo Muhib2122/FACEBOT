@@ -94,6 +94,8 @@ export interface WeatherData {
 
 export type AnimationSpeed = 'slow' | 'normal' | 'fast';
 
+export type CloudBackendType = 'vercel-api' | 'firebase-rtdb';
+
 export interface HardwareConfig {
   servoManualOverride: boolean;
   servoAngle: number; // 0..180, center 90
@@ -114,6 +116,13 @@ export interface HardwareConfig {
   esp32Connected: boolean;
   wifiSsid: string;
   wifiPassword: string;
+  cloudSyncEnabled: boolean;
+  cloudBackendType: CloudBackendType;
+  cloudPortalUrl: string;
+  firebaseDbUrl: string;
+  deviceId: string;
+  firmwareVersion: string;
+  otaAutoCheck: boolean;
 }
 
 export interface BotSettings {

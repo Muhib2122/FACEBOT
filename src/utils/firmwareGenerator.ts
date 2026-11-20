@@ -45,6 +45,13 @@ export function generateEsp32Firmware(
 
   const safeSsid = (hardware.wifiSsid || 'muhib').replace(/"/g, '');
   const safePass = (hardware.wifiPassword || '12345678').replace(/"/g, '');
+  const safePortalUrl = (hardware.cloudPortalUrl || 'https://your-facebot.vercel.app').replace(/\/$/, '').replace(/"/g, '');
+  const safeDeviceId = (hardware.deviceId || 'muhib-bot-1').replace(/"/g, '');
+  const safeFwVersion = (hardware.firmwareVersion || '1.0.0').replace(/"/g, '');
+  const cloudStateUrl =
+    hardware.cloudBackendType === 'firebase-rtdb' && hardware.firebaseDbUrl.trim()
+      ? hardware.firebaseDbUrl.trim().replace(/"/g, '')
+      : `${safePortalUrl}/api/bot-state?device=${safeDeviceId}`;
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -55,8 +62,9 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * ESP32 Mini Face Bot — Complete Firmware (WiFi NVS + User Tracking + Alarms)
+ * ESP32 Mini Face Bot — Complete Firmware (Vercel Cloud Sync + GitHub OTA)
  * Generated for: ${settings.userName || 'Muhib'} (${location.city}, ${location.country})
+ * Firmware Version: ${safeFwVersion}
  * =========================================================================
  * Mechanical Design:
  *   - SG90 Servo Motor forms the rotating neck base (0..180 deg, 90 deg = straight).
@@ -66,11 +74,17 @@ export function generateEsp32Firmware(
  *   - When NO object is detected in range, the servo smoothly centers to 90 deg
  *     and calls headServo.detach() (powered OFF, zero jitter).
  *
+ * Cloud Sync & Over-The-Air (OTA) Updates via GitHub -> Vercel:
+ *   - Live Portal Controls: ESP32 polls your Vercel portal JSON every 2.5s over HTTPS.
+ *   - C++ Display/Function Updates: Push compiled /public/ota/firmware.bin + version.json
+ *     to GitHub -> Vercel deploys -> ESP32 downloads & flashes itself over WiFi!
+ *
  * Required Arduino Libraries:
  *   1. Adafruit SSD1306
  *   2. Adafruit GFX Library
  *   3. ESP32Servo (by Kevin Harrington)
  *   4. ArduinoJson (v7+)
+ *   (WiFiClientSecure & HTTPUpdate are built into the ESP32 Board package!)
  *
  * Pinout Wiring:
  *   - 0.96" SSD1306 OLED (I2C): SDA -> GPIO 21, SCL -> GPIO 22, VCC -> 3.3V, GND -> GND
@@ -82,8 +96,10 @@ export function generateEsp32Firmware(
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
@@ -96,6 +112,17 @@ export function generateEsp32Firmware(
 String wifiSsid     = "${safeSsid}";
 String wifiPassword = "${safePass}";
 Preferences prefs;
+
+// -------- Vercel Cloud Sync & GitHub OTA Firmware Configuration --------
+const char* FIRMWARE_VERSION = "${safeFwVersion}";
+String portalBaseUrl   = "${safePortalUrl}";
+String cloudStateUrl   = "${cloudStateUrl}";
+bool   cloudSyncOn     = ${hardware.cloudSyncEnabled ? 'true' : 'false'};
+bool   otaAutoCheck    = ${hardware.otaAutoCheck ? 'true' : 'false'};
+unsigned long lastCloudSyncMs = 0;
+unsigned long lastOtaCheckMs  = 0;
+int    lastDismissSeq  = 0;
+int    lastOtaSeq      = 0;
 
 // -------- User, Location & Timezone Configuration --------
 String userName       = "${settings.userName || 'Muhib'}";
@@ -673,6 +700,110 @@ void fetchWeatherFromOpenMeteo() {
   http.end();
 }
 
+// -------- GitHub -> Vercel Over-The-Air (OTA) Firmware Auto-Updater --------
+void checkOtaFirmwareUpdate() {
+  if (WiFi.status() != WL_CONNECTED || portalBaseUrl.length() < 8) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String manifestUrl = portalBaseUrl + "/ota/version.json";
+  http.begin(client, manifestUrl);
+  int code = http.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getString())) {
+      String remoteVer = doc["version"] | "";
+      String binPath   = doc["binUrl"]  | "/ota/firmware.bin";
+      if (remoteVer.length() > 0 && remoteVer != String(FIRMWARE_VERSION)) {
+        String fullBinUrl = binPath.startsWith("http") ? binPath : (portalBaseUrl + binPath);
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(10, 18);
+        display.print("OTA UPDATE FOUND!");
+        display.setCursor(10, 34);
+        display.print("v" + String(FIRMWARE_VERSION) + " -> v" + remoteVer);
+        display.setCursor(10, 48);
+        display.print("Downloading...");
+        display.display();
+
+        t_httpUpdate_return ret = httpUpdate.update(client, fullBinUrl);
+        if (ret == HTTP_UPDATE_FAILED) {
+          Serial.printf("OTA Error (%d): %s\\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        }
+      }
+    }
+  }
+  http.end();
+}
+
+// -------- Real-Time Cloud State Sync from Published Vercel Portal --------
+void syncStateFromCloudPortal() {
+  if (!cloudSyncOn || WiFi.status() != WL_CONNECTED || cloudStateUrl.length() < 8) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(2500);
+  http.begin(client, cloudStateUrl);
+  int code = http.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getString())) {
+      if (doc["mode"].is<const char*>())         botMode         = String(doc["mode"].as<const char*>());
+      if (doc["screen"].is<const char*>())       activeScreen    = String(doc["screen"].as<const char*>());
+      if (doc["faceId"].is<int>())               currentFace     = constrain(doc["faceId"].as<int>(), 0, 24);
+      if (doc["userName"].is<const char*>())     userName        = String(doc["userName"].as<const char*>());
+      if (doc["city"].is<const char*>())         cityName        = String(doc["city"].as<const char*>());
+      if (doc["textLine1"].is<const char*>())    customLine1     = String(doc["textLine1"].as<const char*>());
+      if (doc["textLine2"].is<const char*>())    customLine2     = String(doc["textLine2"].as<const char*>());
+      if (doc["manualServo"].is<bool>())         manualServo     = doc["manualServo"].as<bool>();
+      if (doc["servoAngle"].is<int>() && manualServo) moveServoSmooth(doc["servoAngle"].as<int>());
+      if (doc["ultrasonicOn"].is<bool>())        ultrasonicOn    = doc["ultrasonicOn"].as<bool>();
+      if (doc["trackingOn"].is<bool>())          trackingEnabled = doc["trackingOn"].as<bool>();
+      if (doc["servoIdleOff"].is<bool>())        servoOffWhenIdle = doc["servoIdleOff"].as<bool>();
+
+      // Sync Alarms array from Vercel Portal
+      if (doc["alarms"].is<JsonArray>()) {
+        JsonArray arr = doc["alarms"].as<JsonArray>();
+        int idx = 0;
+        for (JsonObject al : arr) {
+          if (idx >= MAX_ALARMS) break;
+          alarms[idx].hour    = al["hour"] | 7;
+          alarms[idx].minute  = al["min"] | 0;
+          alarms[idx].enabled = al["on"] | false;
+          alarms[idx].faceId  = al["face"] | 1;
+          alarms[idx].melody  = al["melody"] | 0;
+          alarms[idx].label   = String(al["label"] | "Alarm");
+          idx++;
+        }
+        alarmCount = idx;
+      }
+
+      // Remote Alarm Dismiss from Portal
+      int dismissSeq = doc["alarmDismissSeq"] | 0;
+      if (dismissSeq > lastDismissSeq) {
+        lastDismissSeq = dismissSeq;
+        alarmRinging = false;
+        ringingAlarmIdx = -1;
+        noTone(PIN_BUZZER);
+        digitalWrite(PIN_LED_RED, LOW);
+      }
+
+      // Remote OTA Update Trigger from Admin Panel
+      int otaSeq = doc["otaTriggerSeq"] | 0;
+      if (otaSeq > lastOtaSeq) {
+        lastOtaSeq = otaSeq;
+        http.end();
+        checkOtaFirmwareUpdate();
+        return;
+      }
+    }
+  }
+  http.end();
+}
+
 void showWakeGreeting() {
   digitalWrite(PIN_LED_GREEN, HIGH);
   digitalWrite(PIN_LED_RED, LOW);
@@ -859,6 +990,9 @@ ${alarmInitLines.join('\n')}
     configTime(utcOffsetSec, 0, "pool.ntp.org");
     fetchWeatherFromOpenMeteo();
     setupWebPortalRoutes();
+    if (otaAutoCheck) {
+      checkOtaFirmwareUpdate(); // Auto-check GitHub/Vercel OTA on boot
+    }
     Serial.print("Portal IP: ");
     Serial.println(WiFi.localIP());
   } else {
@@ -869,6 +1003,18 @@ ${alarmInitLines.join('\n')}
 void loop() {
   server.handleClient();
   checkScheduledAlarms();
+
+  // Poll published Vercel Cloud Portal every 2.5 seconds for live updates
+  if (cloudSyncOn && (millis() - lastCloudSyncMs > 2500)) {
+    syncStateFromCloudPortal();
+    lastCloudSyncMs = millis();
+  }
+
+  // Periodically check GitHub/Vercel OTA manifest every 30 minutes
+  if (otaAutoCheck && (millis() - lastOtaCheckMs > 1800000)) {
+    checkOtaFirmwareUpdate();
+    lastOtaCheckMs = millis();
+  }
 
   // Active Alarm Ringing State (Buzzer + Red LED + OLED Alert)
   if (alarmRinging && ringingAlarmIdx >= 0) {
