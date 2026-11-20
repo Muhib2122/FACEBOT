@@ -24,6 +24,345 @@ export function pixelsToCppProgmem(pixels: number[], varName = 'customBitmap'): 
   return `unsigned char ${varName}[1024] = {\n${lines.join(',\n')}\n};`;
 }
 
+// =========================================================================
+// 1. ARDUINO UNO / NANO SKETCH (Dedicated 5V SG90 Servo + HC-SR04 Controller)
+// =========================================================================
+export function generateArduinoMotionFirmware(hardware: HardwareConfig): string {
+  return `/*
+ * =========================================================================
+ * FaceBot — ARDUINO UNO / NANO Motion & Proximity Co-Processor
+ * Handles: SG90 Servo Head (5V PWM) + HC-SR04 Ultrasonic Tracking (5V Native)
+ * Syncs live with ESP32 over UART (9600 baud)
+ * =========================================================================
+ * ZERO external libraries needed! (Uses built-in Servo.h & SoftwareSerial.h)
+ *
+ * Arduino Pinout Wiring (5V Native — Rock Solid!):
+ *   - SG90 Servo Motor  : Signal (Orange) -> Pin D9, VCC (Red) -> 5V, GND (Brown) -> GND
+ *   - HC-SR04 Sensor    : TRIG -> Pin D6, ECHO -> Pin D7, VCC -> 5V, GND -> GND
+ *   - ESP32 UART Sync   : Arduino D10 (RX) <- ESP32 GPIO 17 (TX2) [Direct Wire]
+ *                         Arduino D11 (TX) -> ESP32 GPIO 16 (RX2) [Via 1k/2k Voltage Divider]
+ *                         Arduino GND      <-> ESP32 GND          [MUST connect Common GND!]
+ */
+
+#include <Servo.h>
+#include <SoftwareSerial.h>
+
+// -------- Pin Definitions --------
+#define PIN_SERVO   9
+#define PIN_TRIG    6
+#define PIN_ECHO    7
+#define PIN_ESP_RX  10   // Connects to ESP32 TX2 (GPIO 17)
+#define PIN_ESP_TX  11   // Connects to ESP32 RX2 (GPIO 16 via 1k/2k divider)
+
+Servo headServo;
+SoftwareSerial espLink(PIN_ESP_RX, PIN_ESP_TX);
+
+// -------- Tuning Parameters --------
+const int WAKE_DIST_CM   = ${hardware.wakeDistanceCm};
+const int TRACK_RANGE_CM = ${hardware.trackingRangeCm};
+
+// -------- Runtime State --------
+bool ultrasonicOn     = ${hardware.ultrasonicEnabled ? 'true' : 'false'};
+bool trackingEnabled  = ${hardware.trackingEnabled ? 'true' : 'false'};
+bool servoOffWhenIdle = ${hardware.servoPowerOffWhenIdle ? 'true' : 'false'};
+bool manualServo      = false;
+bool servoAttached    = false;
+bool objectLocked     = false;
+
+int  currentAngle     = 90;
+int  targetAngle      = 90;
+int  trackedUserAngle = 90;
+int  activeFaceId     = 0;
+int  animTick         = 0;
+float lastDistCm      = 999.0;
+
+unsigned long lastServoStepMs  = 0;
+unsigned long lastServoMoveMs  = 0;
+unsigned long lastSensorMs     = 0;
+unsigned long lastObjectSeenMs = 0;
+unsigned long lastWakeSentMs   = 0;
+unsigned long lastAnimMs       = 0;
+unsigned long lastTelemetryMs  = 0;
+unsigned long lastSweepMs      = 0;
+
+String rxBuf = "";
+
+// -------- Smooth Non-Blocking Servo Engine --------
+void attachServoIfNeeded() {
+  if (!servoAttached) {
+    headServo.attach(PIN_SERVO, 500, 2400);
+    headServo.write(currentAngle);
+    servoAttached = true;
+  }
+}
+
+void setTargetAngle(int deg) {
+  deg = constrain(deg, 20, 160);
+  if (deg != targetAngle || !servoAttached) {
+    targetAngle = deg;
+    attachServoIfNeeded();
+    lastServoMoveMs = millis();
+  }
+}
+
+void stepServoSmooth() {
+  if (!servoAttached) return;
+  if (millis() - lastServoStepMs < 15) return;
+  lastServoStepMs = millis();
+
+  if (currentAngle < targetAngle) {
+    currentAngle = min(currentAngle + 2, targetAngle);
+    headServo.write(currentAngle);
+    lastServoMoveMs = millis();
+  } else if (currentAngle > targetAngle) {
+    currentAngle = max(currentAngle - 2, targetAngle);
+    headServo.write(currentAngle);
+    lastServoMoveMs = millis();
+  }
+}
+
+void parkAndDetachIfIdle() {
+  if (manualServo) return;
+  if (targetAngle != 90 || currentAngle != 90) {
+    setTargetAngle(90);
+    return;
+  }
+  if (servoOffWhenIdle && servoAttached && (millis() - lastServoMoveMs > 450)) {
+    headServo.detach();
+    servoAttached = false;
+  }
+}
+
+bool isExpressiveFace(int f) {
+  return (f == 1 || f == 4 || f == 5 || f == 6 || f == 7 || f == 9 || f == 12 || f == 19 || f == 24);
+}
+
+// -------- Native 5V HC-SR04 Ultrasonic Reader (Median-of-3 Filter) --------
+float pingOnceCm() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(3);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 26000UL);
+  if (dur == 0) return 999.0;
+  float cm = (dur * 0.0343f) / 2.0f;
+  if (cm < 2.0f || cm > 400.0f) return 999.0;
+  return cm;
+}
+
+float readFilteredDistCm() {
+  float a = pingOnceCm(); delay(10);
+  float b = pingOnceCm(); delay(10);
+  float c = pingOnceCm();
+  // Return median of 3 readings (eliminates single-ping noise spikes)
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
+
+// -------- Smart User Tracking + Proximity Wake-Up --------
+void updateUltrasonicAndTracking() {
+  if (millis() - lastSensorMs < 130) return;
+  lastSensorMs = millis();
+
+  lastDistCm = readFilteredDistCm();
+
+  if (!ultrasonicOn) {
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
+  // User detected within tracking range!
+  if (lastDistCm > 2.0f && lastDistCm <= (float)TRACK_RANGE_CM) {
+    bool justArrived = !objectLocked;
+    objectLocked = true;
+    trackedUserAngle = currentAngle;
+    lastObjectSeenMs = millis();
+    digitalWrite(LED_BUILTIN, HIGH);
+
+    // Send instant WAKE / GREETING event to ESP32 when user enters wake range (25cm)
+    if (lastDistCm <= (float)WAKE_DIST_CM && (justArrived || (millis() - lastWakeSentMs > 10000UL))) {
+      lastWakeSentMs = millis();
+      espLink.print("W:");
+      espLink.println((int)lastDistCm);
+      Serial.print("WAKE sent to ESP32! Dist=");
+      Serial.println(lastDistCm);
+    }
+    return;
+  }
+
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // User moved slightly left/right while locked -> actively scan to keep OLED facing user!
+  if (trackingEnabled && !manualServo && objectLocked &&
+      (millis() - lastObjectSeenMs < 3500UL) && (millis() - lastSweepMs > 300UL)) {
+    lastSweepMs = millis();
+    int offsets[4] = { -20, 20, -40, 40 };
+    for (int i = 0; i < 4; i++) {
+      int cand = constrain(trackedUserAngle + offsets[i], 30, 150);
+      attachServoIfNeeded();
+      headServo.write(cand);
+      currentAngle = cand;
+      targetAngle = cand;
+      delay(150);
+      float d = pingOnceCm();
+      if (d > 2.0f && d <= (float)TRACK_RANGE_CM) {
+        trackedUserAngle = cand;
+        lastDistCm = d;
+        lastObjectSeenMs = millis();
+        digitalWrite(LED_BUILTIN, HIGH);
+        return;
+      }
+    }
+  }
+
+  // No object found for 4 seconds -> center straight (90 deg) and power Servo OFF
+  if (millis() - lastObjectSeenMs > 4000UL) {
+    objectLocked = false;
+    trackedUserAngle = 90;
+    if (!manualServo && !isExpressiveFace(activeFaceId)) {
+      parkAndDetachIfIdle();
+    }
+  }
+}
+
+// -------- Face-Synced Expressive Head Motion --------
+void updateFaceMotion() {
+  if (manualServo) return;
+  if (millis() - lastAnimMs < 280) return;
+  lastAnimMs = millis();
+  animTick++;
+
+  int base = objectLocked ? trackedUserAngle : 90;
+
+  if (activeFaceId == 1 || activeFaceId == 4 || activeFaceId == 12) {
+    // Happy / Love / Starry: joyful left-right wiggle
+    setTargetAngle((animTick % 2 == 0) ? base - 20 : base + 20);
+  } else if (activeFaceId == 5 || activeFaceId == 19) {
+    // Angry / Shout / Alarm: rapid "No" head shake
+    setTargetAngle((animTick % 2 == 0) ? base - 18 : base + 18);
+  } else if (activeFaceId == 6) {
+    // Surprised: sudden tilt
+    setTargetAngle(base + 24);
+  } else if (activeFaceId == 7 || activeFaceId == 9) {
+    // Sleepy / Sad: slight tilt (then parks if no user)
+    if (objectLocked) setTargetAngle(base + 14);
+    else parkAndDetachIfIdle();
+  } else if (activeFaceId == 24) {
+    // Look Around
+    int off[3] = { -26, 0, 26 };
+    setTargetAngle(base + off[(animTick / 2) % 3]);
+  } else if (objectLocked) {
+    setTargetAngle(trackedUserAngle);
+  } else {
+    parkAndDetachIfIdle();
+  }
+}
+
+// -------- Receive Commands from ESP32 Web Portal --------
+void handleEspCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() < 2) return;
+
+  Serial.println("ESP32 -> Arduino: " + cmd);
+
+  if (cmd.startsWith("A:")) {
+    manualServo = true;
+    setTargetAngle(cmd.substring(2).toInt());
+  } else if (cmd.startsWith("T:")) {
+    manualServo = true;
+    attachServoIfNeeded();
+    headServo.write(45);  delay(350);
+    headServo.write(135); delay(420);
+    headServo.write(90);  delay(300);
+    currentAngle = 90;
+    targetAngle = 90;
+    lastServoMoveMs = millis();
+  } else if (cmd.startsWith("F:")) {
+    activeFaceId = constrain(cmd.substring(2).toInt(), 0, 24);
+    manualServo = false;
+  } else if (cmd == "M:AUTO") {
+    manualServo = false;
+  } else if (cmd.startsWith("S:")) {
+    ultrasonicOn = (cmd.substring(2).toInt() == 1);
+    trackingEnabled = ultrasonicOn;
+  } else if (cmd.startsWith("I:")) {
+    servoOffWhenIdle = (cmd.substring(2).toInt() == 1);
+  }
+}
+
+void pollEspSerial() {
+  while (espLink.available()) {
+    char c = (char)espLink.read();
+    if (c == '\\n' || c == '\\r') {
+      if (rxBuf.length() > 0) {
+        handleEspCommand(rxBuf);
+        rxBuf = "";
+      }
+    } else if (rxBuf.length() < 32) {
+      rxBuf += c;
+    }
+  }
+}
+
+// -------- Send Live Telemetry to ESP32 (every 350ms) --------
+void sendTelemetryToEsp() {
+  if (millis() - lastTelemetryMs < 350) return;
+  lastTelemetryMs = millis();
+
+  // Format: D:<dist_cm>,<locked>,<angle>,<servoOn>
+  espLink.print("D:");
+  espLink.print((int)round(lastDistCm));
+  espLink.print(",");
+  espLink.print(objectLocked ? 1 : 0);
+  espLink.print(",");
+  espLink.print(currentAngle);
+  espLink.print(",");
+  espLink.println(servoAttached ? 1 : 0);
+
+  // Also print to Arduino Serial Monitor (115200 baud) for easy hardware verification
+  Serial.print("HC-SR04: ");
+  if (lastDistCm > 400) Serial.print("No Object");
+  else { Serial.print(lastDistCm, 1); Serial.print(" cm"); }
+  Serial.print(" | Locked: "); Serial.print(objectLocked ? "YES" : "NO");
+  Serial.print(" | Servo: "); Serial.print(currentAngle);
+  Serial.println(servoAttached ? " deg (ON)" : " deg (IDLE OFF)");
+}
+
+void setup() {
+  Serial.begin(115200);
+  espLink.begin(9600);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // Boot Self-Test: Smooth Servo Wave (65 -> 115 -> 90) proves Servo wiring immediately!
+  attachServoIfNeeded();
+  headServo.write(65);  delay(300);
+  headServo.write(115); delay(350);
+  headServo.write(90);  delay(300);
+  currentAngle = 90;
+  targetAngle = 90;
+  lastServoMoveMs = millis();
+
+  Serial.println("FaceBot Arduino Co-Processor Ready (Servo D9, HC-SR04 D6/D7, ESP32 D10/D11)");
+}
+
+void loop() {
+  pollEspSerial();
+  stepServoSmooth();
+  updateUltrasonicAndTracking();
+  updateFaceMotion();
+  sendTelemetryToEsp();
+}
+`;
+}
+
+// =========================================================================
+// 2. ESP32 SKETCH (OLED + Dual-Mode Hotspot Portal + LEDs + Buzzer + UART2)
+// =========================================================================
 export function generateEsp32Firmware(
   settings: BotSettings,
   location: LocationConfig,
@@ -57,32 +396,31 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * ESP32 Mini Face Bot — Dual Mode (Home WiFi + Built-In Hotspot Web Portal)
+ * FaceBot — ESP32 Main Brain (Dual-Mode Hotspot Portal + OLED + LEDs + Buzzer)
  * Generated for: ${safeUser} (${location.city}, ${location.country})
+ * Works with: Arduino Uno/Nano Co-Processor over Hardware Serial2 (GPIO 16/17)
  * =========================================================================
  * HOW TO CONNECT (Zero Hassle!):
  *   1. ESP32 connects to Home WiFi ("${safeSsid}" / "${safePass}") for live Weather & Time.
- *   2. AT THE SAME TIME, ESP32 creates its own WiFi Hotspot:
+ *   2. AT THE SAME TIME, ESP32 broadcasts its own WiFi Hotspot:
  *        Hotspot Name : ${safeApName}
  *        Password     : 12345678
  *   3. Connect your Phone/PC to "${safeApName}" and open:
  *        http://192.168.4.1
- *      (Full built-in Web Portal with 25 Faces, Touchpad, Servo, HC-SR04,
- *       Alarms, Weather, Watch UI, and Home WiFi Admin Settings!)
  *
- * Required Arduino Libraries:
+ * Required Arduino Libraries (ONLY 3 — No ESP32Servo needed!):
  *   1. Adafruit SSD1306
  *   2. Adafruit GFX Library
- *   3. ESP32Servo (by Kevin Harrington)
- *   4. ArduinoJson (v7+)
+ *   3. ArduinoJson (v7+)
  *
- * Pinout Wiring:
+ * ESP32 Pinout Wiring:
  *   - 0.96" SSD1306 OLED (I2C): SDA -> GPIO 21, SCL -> GPIO 22, VCC -> 3.3V, GND -> GND
- *   - SG90 Servo Motor (Head) : Signal -> GPIO 13, VCC -> 5V (VIN), GND -> GND
  *   - Piezo Buzzer            : (+) -> GPIO 14, (-) -> GND
- *   - HC-SR04 Ultrasonic      : TRIG -> GPIO 5, ECHO -> GPIO 18 (1k/2k divider), VCC -> 5V, GND -> GND
- *   - Green Status LED        : Anode -> GPIO 26 (220 ohm), Cathode -> GND
- *   - Red Alert LED           : Anode -> GPIO 27 (220 ohm), Cathode -> GND
+ *   - Green Status LED        : Long leg (+) -> GPIO 26 (220 ohm), Short leg (-) -> GND
+ *   - Red Alert LED           : Long leg (+) -> GPIO 27 (220 ohm), Short leg (-) -> GND
+ *   - Arduino UART2 Sync      : ESP32 GPIO 16 (RX2) <- Arduino D11 (TX) [via 1k/2k divider]
+ *                               ESP32 GPIO 17 (TX2) -> Arduino D10 (RX) [direct wire]
+ *                               ESP32 GND           <-> Arduino GND     [Common GND]
  */
 
 #include <WiFi.h>
@@ -93,7 +431,6 @@ export function generateEsp32Firmware(
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <ESP32Servo.h>
 #include <time.h>
 
 // -------- Hotspot (AP) + Home WiFi (STA) Credentials --------
@@ -113,19 +450,18 @@ long   utcOffsetSec   = ${utcOffsetSeconds};
 float  coldThresholdC = ${settings.coldThresholdC.toFixed(1)};
 float  hotThresholdC  = ${settings.hotThresholdC.toFixed(1)};
 
-// -------- Hardware Pin Definitions --------
-#define SCREEN_WIDTH   128
-#define SCREEN_HEIGHT   64
-#define OLED_RESET      -1
-#define PIN_SERVO       13
-#define PIN_BUZZER      14
-#define PIN_TRIG         5
-#define PIN_ECHO        18
-#define PIN_LED_GREEN   26
-#define PIN_LED_RED     27
+// -------- ESP32 Hardware Pins --------
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT    64
+#define OLED_RESET       -1
+#define PIN_BUZZER       14
+#define PIN_LED_GREEN    26
+#define PIN_LED_RED      27
+#define PIN_LED_BUILTIN   2   // ESP32 onboard blue LED mirrors Green LED for instant verification
+#define PIN_ARDUINO_RX   16   // ESP32 RX2 <- Arduino D11 (TX)
+#define PIN_ARDUINO_TX   17   // ESP32 TX2 -> Arduino D10 (RX)
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-Servo headServo;
 WebServer server(80);
 
 // -------- Multi-Alarm Schedule --------
@@ -145,34 +481,28 @@ bool      alarmRinging     = false;
 int       ringingAlarmIdx  = -1;
 int       lastTriggeredMin = -1;
 
-// -------- Bot State, Auto/User Mode, Servo Tracking & Idle Auto-Off --------
+// -------- Bot State & Arduino Telemetry Cache --------
 String botMode            = "auto"; // "auto" or "user"
 String activeScreen       = "face"; // "face", "watch", "weather", "greeting", "text", "bitmap"
 String customLine1        = "Hi ${safeUser}!";
 String customLine2        = "";
 int    currentFace        = 0;
+int    lastSentFaceToArd  = -1;
 int    frameCount         = 0;
 bool   screenLocked       = false;
 bool   isSleeping         = false;
-bool   ultrasonicOn       = ${hardware.ultrasonicEnabled ? 'true' : 'false'};
-bool   trackingEnabled    = ${hardware.trackingEnabled ? 'true' : 'false'};
-bool   servoOffWhenIdle   = ${hardware.servoPowerOffWhenIdle ? 'true' : 'false'};
-int    wakeDistCm         = ${hardware.wakeDistanceCm};
-int    trackRangeCm       = ${hardware.trackingRangeCm};
-int    servoAngle         = 90;
-int    trackedUserAngle   = 90;
-float  lastDistanceCm     = 999.0;
-bool   objectLocked       = false;
-bool   servoAttached      = false;
-bool   manualServo        = false;
 bool   manualLed          = false;
 bool   greenLedState      = false;
 bool   redLedState        = false;
-bool   buzzerActiveMode   = false; // false = Passive Buzzer (melody), true = Active Buzzer (DC HIGH)
-unsigned long lastObjectSeenMs  = 0;
-unsigned long lastSensorReadMs  = 0;
-unsigned long lastServoMoveMs   = 0;
-unsigned long lastGreetMs       = 0;
+bool   buzzerActiveMode   = false; // false = Passive melody, true = Active DC HIGH
+
+// Live Telemetry received from Arduino Uno/Nano over Serial2
+float  ardDistCm          = 999.0;
+bool   ardObjectLocked    = false;
+int    ardServoAngle      = 90;
+bool   ardServoOn         = false;
+unsigned long lastArdPacketMs = 0;
+String ardRxBuf           = "";
 
 // Screen durations (seconds) customizable via Built-in Web Portal
 int watchDurSec   = ${watchDur};
@@ -219,23 +549,23 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
   .grid button{padding:8px 6px;font-size:11px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;text-align:center}
   .grid button:active{background:#2563eb;border-color:#2563eb}
   .lbl{font-size:11px;color:#94a3b8;margin:6px 0 4px;display:block}
-  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:10px;color:#38bdf8;font-family:monospace}
+  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:10px;color:#38bdf8;font-family:monospace;line-height:1.5}
   canvas{width:100%;max-width:384px;aspect-ratio:2/1;background:#020617;border:2px solid #38bdf8;border-radius:8px;touch-action:none;display:block;margin:8px auto}
   .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:12px;display:none;z-index:99}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>FaceBot ESP32 Portal</h1>
+  <h1>FaceBot Dual-MCU Portal</h1>
   <div class="sub" id="statusLine">Connected to Hotspot (192.168.4.1)</div>
 
-  <!-- Live Hardware Controls: Servo, HC-SR04, LEDs, Buzzer -->
+  <!-- Live Hardware Controls: Arduino Servo + HC-SR04 & ESP32 LEDs + Buzzer -->
   <div class="card">
-    <h2>Hardware Control &amp; Live Sensor</h2>
-    <div class="stat" id="hwStat">HC-SR04: Reading... | Servo: 90&deg; | LEDs: G:OFF R:OFF</div>
+    <h2>Hardware Control &amp; Live Arduino Sensor</h2>
+    <div class="stat" id="hwStat">Arduino Link: Checking...</div>
 
-    <span class="lbl">SG90 Servo Head Angle (GPIO 13): <b id="angLbl">90</b>&deg;</span>
-    <input id="angSlider" type="range" min="15" max="165" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
+    <span class="lbl">Arduino SG90 Servo Head (Pin D9): <b id="angLbl">90</b>&deg;</span>
+    <input id="angSlider" type="range" min="20" max="160" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
     <div class="row" style="margin-top:8px">
       <button class="sec" onclick="setAng(45)">Left 45&deg;</button>
       <button class="sec" onclick="setAng(90)">Center 90&deg;</button>
@@ -246,13 +576,13 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
       <button class="sec" onclick="cmd('/api/servo?idleoff=0','Idle Servo OFF disabled')">Idle Off OFF</button>
     </div>
 
-    <span class="lbl" style="margin-top:10px">HC-SR04 Ultrasonic (TRIG 5 / ECHO 18)</span>
+    <span class="lbl" style="margin-top:10px">Arduino HC-SR04 Ultrasonic (D6 / D7)</span>
     <div class="row">
-      <button class="ok" onclick="cmd('/api/sensor?ultrasonic=1&tracking=1','HC-SR04 + Tracking ON')">Sensor + Track ON</button>
+      <button class="ok" onclick="cmd('/api/sensor?ultrasonic=1','HC-SR04 + Tracking ON')">Sensor + Track ON</button>
       <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
     </div>
 
-    <span class="lbl" style="margin-top:10px">Red &amp; Green LEDs (GPIO 26 / 27) &amp; Buzzer (GPIO 14)</span>
+    <span class="lbl" style="margin-top:10px">ESP32 LEDs (GPIO 26 / 27) &amp; Buzzer (GPIO 14)</span>
     <div class="row">
       <button class="ok" onclick="cmd('/api/led?green=1','Green LED ON')">Green ON</button>
       <button class="sec" onclick="cmd('/api/led?green=0','Green LED OFF')">Green OFF</button>
@@ -444,9 +774,10 @@ function pollStatus(fillInputs){
   fetch('/api/status').then(r=>r.json()).then(d=>{
     document.getElementById('statusLine').textContent=
       'Home WiFi: '+(d.wifi?'Connected ('+d.staIp+')':'Offline')+' · Temp: '+d.temp+'C · Mode: '+d.mode;
-    const distTxt = d.dist > 400 ? 'No Echo (>400cm)' : (d.dist.toFixed(1)+' cm'+(d.locked?' [LOCKED]':''));
+    const distTxt = d.dist > 400 ? 'No Object' : (d.dist.toFixed(0)+' cm'+(d.locked?' [LOCKED]':''));
     document.getElementById('hwStat').textContent=
-      'HC-SR04: '+distTxt+' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | G:'+(d.green?'ON':'OFF')+' R:'+(d.red?'ON':'OFF')+' | Buz:'+d.buz;
+      'Arduino: '+(d.ardOk?'ONLINE':'WAITING')+' | HC-SR04: '+distTxt+
+      ' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | G:'+(d.green?'ON':'OFF')+' R:'+(d.red?'ON':'OFF')+' | Buz:'+d.buz;
     if(fillInputs){
       document.getElementById('uName').value=d.user;
       document.getElementById('uCity').value=d.city;
@@ -455,13 +786,13 @@ function pollStatus(fillInputs){
   }).catch(()=>{});
 }
 pollStatus(true);
-setInterval(()=>pollStatus(false), 1200);
+setInterval(()=>pollStatus(false), 1000);
 </script>
 </body>
 </html>
 )rawliteral";
 
-// -------- Zero-Conflict Buzzer Driver (Works with Passive & Active Buzzers, NEVER conflicts with ESP32Servo LEDC!) --------
+// -------- High-Reliability Buzzer Driver (Supports Passive & Active Buzzers!) --------
 void playToneSafe(int freqHz, int durationMs, bool forceDc = false) {
   if (forceDc || buzzerActiveMode || freqHz <= 0) {
     digitalWrite(PIN_BUZZER, HIGH);
@@ -491,56 +822,41 @@ void stopBuzzer() {
   digitalWrite(PIN_BUZZER, LOW);
 }
 
-// -------- LED Control Helpers --------
+void playWakeSound() {
+  playToneSafe(523, 85); delay(25);
+  playToneSafe(659, 85); delay(25);
+  playToneSafe(784, 120);
+}
+
+// -------- LED Helpers (GPIO 26 Green + GPIO 27 Red + Onboard GPIO 2 Mirror) --------
 void setLeds(bool greenOn, bool redOn) {
   greenLedState = greenOn;
   redLedState = redOn;
   digitalWrite(PIN_LED_GREEN, greenOn ? HIGH : LOW);
+  digitalWrite(PIN_LED_BUILTIN, greenOn ? HIGH : LOW);
   digitalWrite(PIN_LED_RED, redOn ? HIGH : LOW);
 }
 
 void updateLedsForFace(int faceType) {
   if (manualLed || alarmRinging) return;
   if (faceType == 3 || faceType == 5 || faceType == 16 || faceType == 19) {
-    setLeds(false, true);  // Red LED for Cold / Angry / Alert
-  } else if (objectLocked || faceType == 1 || faceType == 4 || faceType == 12) {
-    setLeds(true, false);  // Green LED for Happy / Love / User Detected
+    setLeds(false, true);
+  } else if (ardObjectLocked || faceType == 1 || faceType == 4 || faceType == 12) {
+    setLeds(true, false);
   } else {
     setLeds(WiFi.status() == WL_CONNECTED, WiFi.status() != WL_CONNECTED);
   }
 }
 
-// -------- SG90 Servo Safe Power Management (Dedicated 50Hz PWM, Attach / Move / Idle Auto-Off) --------
-bool isExpressiveFace(int faceType) {
-  return (faceType == 1 || faceType == 4 || faceType == 5 || faceType == 6 ||
-          faceType == 7 || faceType == 9 || faceType == 12 || faceType == 19 ||
-          faceType == 24);
+// -------- Hardware Serial2 Bridge to Arduino Uno/Nano --------
+void sendToArduino(const String& cmd) {
+  Serial2.println(cmd);
 }
 
-void moveServoSmooth(int targetAngle) {
-  targetAngle = constrain(targetAngle, 15, 165);
-  if (!servoAttached) {
-    headServo.setPeriodHertz(50);
-    headServo.attach(PIN_SERVO, 500, 2400);
-    servoAttached = true;
-    delay(15);
-  }
-  headServo.write(targetAngle);
-  if (targetAngle != servoAngle) {
-    servoAngle = targetAngle;
-    lastServoMoveMs = millis();
-  }
-}
-
-void parkAndPowerOffServo() {
-  if (manualServo) return;
-  if (servoAngle != 90) {
-    moveServoSmooth(90);
-    return; // Let servo finish moving to 90 deg before detaching on next tick
-  }
-  if (servoOffWhenIdle && servoAttached && (millis() - lastServoMoveMs > 450)) {
-    headServo.detach();
-    servoAttached = false;
+void syncFaceToArduino(int faceId) {
+  if (faceId != lastSentFaceToArd) {
+    lastSentFaceToArd = faceId;
+    sendToArduino("F:" + String(faceId));
   }
 }
 
@@ -796,7 +1112,7 @@ void drawFace(int type, int frame) {
   display.display();
 }
 
-// -------- Watch, Weather, Greeting, Text & Bitmap OLED Screens --------
+// -------- Watch, Weather, Greeting, Text, Wake & Alarm Screens --------
 void drawWatchOled() {
   struct tm t;
   display.clearDisplay();
@@ -912,53 +1228,17 @@ void drawAlarmOled(int idx, int frame) {
   display.display();
 }
 
-// -------- HC-SR04 Ultrasonic Distance Reading (Filtered & Noise-Resistant) --------
-float readSingleDistanceCm() {
-  digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(4);
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(12);
-  digitalWrite(PIN_TRIG, LOW);
-  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);
-  if (duration == 0) return 999.0;
-  float cm = (duration * 0.0343f) / 2.0f;
-  if (cm < 2.0f || cm > 400.0f) return 999.0;
-  return cm;
-}
-
-float readDistanceCm() {
-  float sum = 0;
-  int valid = 0;
-  for (int i = 0; i < 3; i++) {
-    float d = readSingleDistanceCm();
-    if (d < 400.0f) {
-      sum += d;
-      valid++;
-    }
-    delay(12);
-  }
-  if (valid == 0) return 999.0;
-  return sum / valid;
-}
-
-void playWakeSound() {
-  playToneSafe(523, 85); delay(25);
-  playToneSafe(659, 85); delay(25);
-  playToneSafe(784, 120);
-}
-
-void updateServoForFace(int faceType, int frame);
-
 void showWakeGreeting() {
+  isSleeping = false;
+  screenLocked = false;
   if (!manualLed) setLeds(true, false);
+  syncFaceToArduino(1); // Tell Arduino to do Happy head wiggle!
   playWakeSound();
   for (int i = 0; i < 6; i++) {
     drawFace((i % 2 == 0) ? 1 : 4, i);
-    if (!manualServo) moveServoSmooth((i % 2 == 0) ? trackedUserAngle - 20 : trackedUserAngle + 20);
     server.handleClient();
     delay(200);
   }
-  if (!manualServo) moveServoSmooth(trackedUserAngle);
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
@@ -971,84 +1251,42 @@ void showWakeGreeting() {
   }
 }
 
-// -------- HC-SR04 + OLED Co-Mounted User Tracking & Idle Servo Power-Off --------
-void updateUltrasonicTracking() {
-  if (millis() - lastSensorReadMs < 180) return;
-  lastSensorReadMs = millis();
+// -------- Parse Live Telemetry & Wake Events from Arduino over Serial2 --------
+void handleArduinoLine(String line) {
+  line.trim();
+  if (line.length() < 2) return;
+  lastArdPacketMs = millis();
 
-  float dist = readDistanceCm();
-  lastDistanceCm = dist;
-
-  if (!ultrasonicOn) return;
-
-  // User / Object detected within tracking range!
-  if (dist > 2.0f && dist <= (float)trackRangeCm) {
-    bool newlyArrived = !objectLocked;
-    objectLocked = true;
-    lastObjectSeenMs = millis();
-    if (!manualLed) setLeds(true, false);
-
-    // Wake up from sleep OR greet user when they walk up within wakeDistCm (25cm)
-    if (dist <= (float)wakeDistCm && (isSleeping || (newlyArrived && millis() - lastGreetMs > 12000UL))) {
-      isSleeping = false;
-      screenLocked = false;
-      lastGreetMs = millis();
-      showWakeGreeting();
-    }
-    return;
-  }
-
-  // If user stepped slightly left/right while locked, sweep head to follow them!
-  if (trackingEnabled && !manualServo && objectLocked && (millis() - lastObjectSeenMs < 3500UL)) {
-    int offsets[4] = { -22, 22, -44, 44 };
-    for (int i = 0; i < 4; i++) {
-      int candidate = constrain(trackedUserAngle + offsets[i], 30, 150);
-      moveServoSmooth(candidate);
-      delay(160);
-      server.handleClient();
-      float d = readSingleDistanceCm();
-      lastDistanceCm = d;
-      if (d > 2.0f && d <= (float)trackRangeCm) {
-        trackedUserAngle = candidate;
-        lastObjectSeenMs = millis();
-        return;
-      }
-    }
-  }
-
-  // No object found for 4 seconds -> return to straight (90 deg) and power Servo OFF if not animating
-  if (millis() - lastObjectSeenMs > 4000UL) {
-    objectLocked = false;
-    trackedUserAngle = 90;
-    bool animatingFace = (!isSleeping && activeScreen == "face" && isExpressiveFace(currentFace));
-    if (!manualServo && !animatingFace) {
-      parkAndPowerOffServo();
+  if (line.startsWith("W:")) {
+    // Arduino HC-SR04 detected user within 25cm!
+    ardDistCm = line.substring(2).toFloat();
+    ardObjectLocked = true;
+    showWakeGreeting();
+  } else if (line.startsWith("D:")) {
+    // D:<dist>,<locked>,<angle>,<servoOn>
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    int c3 = line.indexOf(',', c2 + 1);
+    if (c1 > 0 && c2 > c1 && c3 > c2) {
+      ardDistCm       = line.substring(2, c1).toFloat();
+      ardObjectLocked = (line.substring(c1 + 1, c2).toInt() == 1);
+      ardServoAngle   = line.substring(c2 + 1, c3).toInt();
+      ardServoOn      = (line.substring(c3 + 1).toInt() == 1);
     }
   }
 }
 
-void updateServoForFace(int faceType, int frame) {
-  if (manualServo) {
-    moveServoSmooth(servoAngle);
-    return;
-  }
-
-  int base = objectLocked ? trackedUserAngle : 90;
-  if (faceType == 1 || faceType == 4 || faceType == 12) {
-    moveServoSmooth((frame % 4 < 2) ? base - 20 : base + 20);
-  } else if (faceType == 6) {
-    moveServoSmooth(base + 26);
-  } else if (faceType == 5 || faceType == 19) {
-    moveServoSmooth((frame % 2 == 0) ? base - 18 : base + 18);
-  } else if (faceType == 7 || faceType == 9) {
-    moveServoSmooth(base + 16);
-  } else if (faceType == 24) {
-    int offset[3] = {-25, 0, 25};
-    moveServoSmooth(base + offset[(frame / 3) % 3]);
-  } else if (objectLocked) {
-    moveServoSmooth(trackedUserAngle);
-  } else {
-    parkAndPowerOffServo();
+void pollArduinoSerial() {
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\\n' || c == '\\r') {
+      if (ardRxBuf.length() > 0) {
+        handleArduinoLine(ardRxBuf);
+        ardRxBuf = "";
+      }
+    } else if (ardRxBuf.length() < 48) {
+      ardRxBuf += c;
+    }
   }
 }
 
@@ -1076,6 +1314,7 @@ void checkScheduledAlarms() {
       alarmRinging = true;
       ringingAlarmIdx = i;
       isSleeping = false;
+      syncFaceToArduino(19);
       break;
     }
   }
@@ -1109,6 +1348,7 @@ void setupWebPortalRoutes() {
   });
 
   server.on("/api/status", HTTP_GET, []() {
+    bool ardOnline = (lastArdPacketMs > 0 && (millis() - lastArdPacketMs < 3000));
     String json = "{\\"wifi\\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
                   ",\\"staIp\\":\\"" + WiFi.localIP().toString() +
                   "\\",\\"temp\\":" + String(liveTempC, 1) +
@@ -1116,10 +1356,11 @@ void setupWebPortalRoutes() {
                   "\\",\\"user\\":\\"" + userName +
                   "\\",\\"city\\":\\"" + cityName +
                   "\\",\\"ssid\\":\\"" + wifiSsid +
-                  "\\",\\"dist\\":" + String(lastDistanceCm, 1) +
-                  ",\\"locked\\":" + String(objectLocked ? "true" : "false") +
-                  ",\\"servo\\":" + String(servoAngle) +
-                  ",\\"servoOn\\":" + String(servoAttached ? "true" : "false") +
+                  "\\",\\"ardOk\\":" + String(ardOnline ? "true" : "false") +
+                  ",\\"dist\\":" + String(ardDistCm, 1) +
+                  ",\\"locked\\":" + String(ardObjectLocked ? "true" : "false") +
+                  ",\\"servo\\":" + String(ardServoAngle) +
+                  ",\\"servoOn\\":" + String(ardServoOn ? "true" : "false") +
                   ",\\"green\\":" + String(greenLedState ? "true" : "false") +
                   ",\\"red\\":" + String(redLedState ? "true" : "false") +
                   ",\\"buz\\":\\"" + String(buzzerActiveMode ? "Active" : "Passive") + "\\"}";
@@ -1148,9 +1389,8 @@ void setupWebPortalRoutes() {
       activeScreen = "face";
       screenLocked = true;
       isSleeping = (currentFace == 7);
-      manualServo = false; // Allow face-synced head movement right away!
       drawFace(currentFace, frameCount);
-      updateServoForFace(currentFace, frameCount);
+      syncFaceToArduino(currentFace);
       updateLedsForFace(currentFace);
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
@@ -1161,6 +1401,7 @@ void setupWebPortalRoutes() {
       activeScreen = server.arg("kind");
       screenLocked = true;
       isSleeping = false;
+      syncFaceToArduino(0);
     }
     if (server.hasArg("l1")) customLine1 = server.arg("l1");
     if (server.hasArg("l2")) customLine2 = server.arg("l2");
@@ -1188,28 +1429,24 @@ void setupWebPortalRoutes() {
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
+  // Forward Servo Commands directly to Arduino Uno/Nano over Serial2
   server.on("/api/servo", HTTP_GET, []() {
-    if (server.hasArg("test")) {
-      manualServo = true;
-      moveServoSmooth(45);  delay(350);
-      moveServoSmooth(135); delay(420);
-      moveServoSmooth(90);  delay(320);
-    }
-    if (server.hasArg("angle")) {
-      manualServo = true;
-      moveServoSmooth(server.arg("angle").toInt());
-    }
-    if (server.hasArg("auto"))    manualServo = (server.arg("auto") == "0");
-    if (server.hasArg("idleoff")) servoOffWhenIdle = (server.arg("idleoff") == "1");
+    if (server.hasArg("test"))    sendToArduino("T:1");
+    if (server.hasArg("angle"))   sendToArduino("A:" + String(constrain(server.arg("angle").toInt(), 20, 160)));
+    if (server.hasArg("auto") && server.arg("auto") == "1") sendToArduino("M:AUTO");
+    if (server.hasArg("idleoff")) sendToArduino("I:" + String(server.arg("idleoff") == "1" ? 1 : 0));
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
+  // Forward HC-SR04 Sensor Toggle to Arduino Uno/Nano
   server.on("/api/sensor", HTTP_GET, []() {
-    if (server.hasArg("ultrasonic")) ultrasonicOn = (server.arg("ultrasonic") == "1");
-    if (server.hasArg("tracking"))   trackingEnabled = (server.arg("tracking") == "1");
+    if (server.hasArg("ultrasonic")) {
+      sendToArduino("S:" + String(server.arg("ultrasonic") == "1" ? 1 : 0));
+    }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
+  // ESP32 Direct LED Controls
   server.on("/api/led", HTTP_GET, []() {
     if (server.hasArg("auto") && server.arg("auto") == "1") {
       manualLed = false;
@@ -1230,16 +1467,14 @@ void setupWebPortalRoutes() {
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
+  // ESP32 Direct Buzzer Controls
   server.on("/api/buzzer", HTTP_GET, []() {
     if (server.hasArg("type")) {
       buzzerActiveMode = (server.arg("type") == "active");
     }
     if (server.hasArg("mode")) {
-      if (server.arg("mode") == "dc") {
-        playToneSafe(0, 220, true);
-      } else {
-        playWakeSound();
-      }
+      if (server.arg("mode") == "dc") playToneSafe(0, 220, true);
+      else playWakeSound();
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -1249,6 +1484,7 @@ void setupWebPortalRoutes() {
       botMode = server.arg("mode");
       screenLocked = false;
       isSleeping = false;
+      sendToArduino("M:AUTO");
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -1271,6 +1507,7 @@ void setupWebPortalRoutes() {
     stopBuzzer();
     manualLed = false;
     setLeds(true, false);
+    syncFaceToArduino(0);
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
@@ -1282,6 +1519,7 @@ void setupWebPortalRoutes() {
     alarmRinging = true;
     ringingAlarmIdx = 0;
     isSleeping = false;
+    syncFaceToArduino(19);
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
@@ -1299,30 +1537,21 @@ void setupWebPortalRoutes() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
+  Serial2.begin(9600, SERIAL_8N1, PIN_ARDUINO_RX, PIN_ARDUINO_TX);
+
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
   pinMode(PIN_LED_GREEN, OUTPUT);
   pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_BUILTIN, OUTPUT);
   setLeds(false, false);
 
-  // Allocate ESP32 PWM timers cleanly for SG90 Servo (50Hz)
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  headServo.setPeriodHertz(50);
-
-  // Boot Hardware Self-Test: LEDs + Buzzer + Servo Wave (proves all wiring on power-up!)
-  setLeds(true, false);  delay(200);
-  setLeds(false, true);  delay(200);
+  // Boot Self-Test on ESP32: Green LED -> Red LED -> Buzzer Beep!
+  setLeds(true, false);  delay(250);
+  setLeds(false, true);  delay(250);
   setLeds(true, true);
-  playToneSafe(1047, 90); delay(40);
-  playToneSafe(1568, 110);
-  moveServoSmooth(65);  delay(280);
-  moveServoSmooth(115); delay(320);
-  moveServoSmooth(90);  delay(280);
+  playToneSafe(1047, 100); delay(40);
+  playToneSafe(1568, 120);
   setLeds(false, false);
 
   // Load saved Home WiFi from NVS (default: muhib / 12345678)
@@ -1371,11 +1600,12 @@ ${alarmInitLines.join('\n')}
     setLeds(false, true);
     Serial.println("Home WiFi offline — Hotspot Portal active at 192.168.4.1");
   }
-  Serial.println("Hotspot Portal: http://192.168.4.1");
+  Serial.println("Hotspot Portal: http://192.168.4.1 | Arduino UART2: RX=16, TX=17");
 }
 
 void loop() {
   server.handleClient();
+  pollArduinoSerial();
   checkScheduledAlarms();
 
   // Active Alarm Ringing
@@ -1383,14 +1613,10 @@ void loop() {
     drawAlarmOled(ringingAlarmIdx, frameCount);
     playAlarmBeepTick(alarms[ringingAlarmIdx].melody, frameCount);
     setLeds(false, (frameCount % 2 == 0));
-    updateServoForFace(19, frameCount);
     frameCount++;
-    delay(160);
+    delay(150);
     return;
   }
-
-  // HC-SR04 Proximity Wake-Up + Co-Mounted User Tracking + Idle Servo Auto-Off
-  updateUltrasonicTracking();
 
   // Refresh live weather every 10 minutes
   if (millis() - lastWeatherFetch > 600000) {
@@ -1417,13 +1643,13 @@ void loop() {
     }
   }
 
-  // Render Active Screen on 0.96" OLED
+  // Render Active Screen on 0.96" OLED & Sync Emotion to Arduino
   if (isSleeping) {
     drawFace(7, frameCount);
-    if (!objectLocked) parkAndPowerOffServo();
+    syncFaceToArduino(7);
   } else if (activeScreen == "watch") {
     drawWatchOled();
-    if (!objectLocked) parkAndPowerOffServo();
+    syncFaceToArduino(0);
   } else if (activeScreen == "weather") {
     if (liveTempC <= coldThresholdC && frameCount % 8 >= 4) {
       drawFace(3, frameCount);
@@ -1437,19 +1663,20 @@ void loop() {
     } else {
       drawWeatherOled();
     }
-    if (!objectLocked) parkAndPowerOffServo();
+    syncFaceToArduino(0);
   } else if (activeScreen == "greeting") {
     drawGreetingOled();
-    if (!objectLocked) parkAndPowerOffServo();
+    syncFaceToArduino(0);
   } else if (activeScreen == "text") {
     drawCustomTextOled();
+    syncFaceToArduino(0);
   } else if (activeScreen == "bitmap") {
     display.clearDisplay();
     display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
     display.display();
   } else {
     drawFace(currentFace, frameCount);
-    updateServoForFace(currentFace, frameCount);
+    syncFaceToArduino(currentFace);
     updateLedsForFace(currentFace);
   }
 
