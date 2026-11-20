@@ -161,10 +161,18 @@ int    wakeDistCm         = ${hardware.wakeDistanceCm};
 int    trackRangeCm       = ${hardware.trackingRangeCm};
 int    servoAngle         = 90;
 int    trackedUserAngle   = 90;
+float  lastDistanceCm     = 999.0;
 bool   objectLocked       = false;
 bool   servoAttached      = false;
 bool   manualServo        = false;
-unsigned long lastObjectSeenMs = 0;
+bool   manualLed          = false;
+bool   greenLedState      = false;
+bool   redLedState        = false;
+bool   buzzerActiveMode   = false; // false = Passive Buzzer (melody), true = Active Buzzer (DC HIGH)
+unsigned long lastObjectSeenMs  = 0;
+unsigned long lastSensorReadMs  = 0;
+unsigned long lastServoMoveMs   = 0;
+unsigned long lastGreetMs       = 0;
 
 // Screen durations (seconds) customizable via Built-in Web Portal
 int watchDurSec   = ${watchDur};
@@ -211,6 +219,7 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
   .grid button{padding:8px 6px;font-size:11px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;text-align:center}
   .grid button:active{background:#2563eb;border-color:#2563eb}
   .lbl{font-size:11px;color:#94a3b8;margin:6px 0 4px;display:block}
+  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:10px;color:#38bdf8;font-family:monospace}
   canvas{width:100%;max-width:384px;aspect-ratio:2/1;background:#020617;border:2px solid #38bdf8;border-radius:8px;touch-action:none;display:block;margin:8px auto}
   .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:12px;display:none;z-index:99}
 </style>
@@ -219,6 +228,46 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
 <div class="wrap">
   <h1>FaceBot ESP32 Portal</h1>
   <div class="sub" id="statusLine">Connected to Hotspot (192.168.4.1)</div>
+
+  <!-- Live Hardware Controls: Servo, HC-SR04, LEDs, Buzzer -->
+  <div class="card">
+    <h2>Hardware Control &amp; Live Sensor</h2>
+    <div class="stat" id="hwStat">HC-SR04: Reading... | Servo: 90&deg; | LEDs: G:OFF R:OFF</div>
+
+    <span class="lbl">SG90 Servo Head Angle (GPIO 13): <b id="angLbl">90</b>&deg;</span>
+    <input id="angSlider" type="range" min="15" max="165" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
+    <div class="row" style="margin-top:8px">
+      <button class="sec" onclick="setAng(45)">Left 45&deg;</button>
+      <button class="sec" onclick="setAng(90)">Center 90&deg;</button>
+      <button class="sec" onclick="setAng(135)">Right 135&deg;</button>
+      <button class="ok" onclick="cmd('/api/servo?test=1','Servo Sweeping!')">Sweep Test</button>
+      <button class="sec" onclick="cmd('/api/servo?auto=1','Auto Head Sync ON')">Auto Sync</button>
+      <button class="sec" onclick="cmd('/api/servo?idleoff=1','Idle Servo OFF enabled')">Idle Off ON</button>
+      <button class="sec" onclick="cmd('/api/servo?idleoff=0','Idle Servo OFF disabled')">Idle Off OFF</button>
+    </div>
+
+    <span class="lbl" style="margin-top:10px">HC-SR04 Ultrasonic (TRIG 5 / ECHO 18)</span>
+    <div class="row">
+      <button class="ok" onclick="cmd('/api/sensor?ultrasonic=1&tracking=1','HC-SR04 + Tracking ON')">Sensor + Track ON</button>
+      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
+    </div>
+
+    <span class="lbl" style="margin-top:10px">Red &amp; Green LEDs (GPIO 26 / 27) &amp; Buzzer (GPIO 14)</span>
+    <div class="row">
+      <button class="ok" onclick="cmd('/api/led?green=1','Green LED ON')">Green ON</button>
+      <button class="sec" onclick="cmd('/api/led?green=0','Green LED OFF')">Green OFF</button>
+      <button class="red" onclick="cmd('/api/led?red=1','Red LED ON')">Red ON</button>
+      <button class="sec" onclick="cmd('/api/led?red=0','Red LED OFF')">Red OFF</button>
+      <button class="sec" onclick="cmd('/api/led?test=1','LED Blink Test')">Blink Test</button>
+      <button class="sec" onclick="cmd('/api/led?auto=1','LED Auto Sync ON')">LED Auto</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="cmd('/api/buzzer?mode=tone','Passive Melody Beep')">Beep Melody</button>
+      <button class="sec" onclick="cmd('/api/buzzer?mode=dc','Active DC Beep')">Beep DC (Active)</button>
+      <button class="sec" onclick="cmd('/api/buzzer?type=passive','Set Passive Buzzer')">Use Passive</button>
+      <button class="sec" onclick="cmd('/api/buzzer?type=active','Set Active Buzzer')">Use Active</button>
+    </div>
+  </div>
 
   <!-- Mode & Quick Screens -->
   <div class="card">
@@ -267,20 +316,6 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <!-- Servo & HC-SR04 Controls -->
-  <div class="card">
-    <h2>Servo Head &amp; HC-SR04 Sensor</h2>
-    <span class="lbl">Manual Servo Angle: <b id="angLbl">90</b>&deg;</span>
-    <input type="range" min="15" max="165" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
-    <div class="row" style="margin-top:10px">
-      <button class="sec" onclick="cmd('/api/servo?angle=90','Centered 90 deg')">Center 90&deg;</button>
-      <button class="sec" onclick="cmd('/api/servo?auto=1','Auto Head Sync ON')">Auto Sync</button>
-      <button class="sec" onclick="cmd('/api/servo?idleoff=1','Idle Servo OFF enabled')">Idle Off ON</button>
-      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=1&tracking=1','HC-SR04 + Tracking ON')">Sensor ON</button>
-      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
-    </div>
-  </div>
-
   <!-- Piezo Buzzer Alarm -->
   <div class="card">
     <h2>Piezo Buzzer Alarm</h2>
@@ -289,14 +324,14 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
       <input id="alLabel" placeholder="Alarm Label" value="Wake Up Muhib" style="flex:1;min-width:130px"/>
       <button onclick="setAlarm(1)">Set Alarm</button>
       <button class="sec" onclick="setAlarm(0)">Disable</button>
-      <button class="sec" onclick="cmd('/api/alarm/test?slot=0','Testing Buzzer!')">Test Ring</button>
+      <button class="sec" onclick="cmd('/api/alarm/test?slot=0','Testing Alarm!')">Test Ring</button>
       <button class="red" onclick="cmd('/api/alarm/dismiss','Alarm Dismissed')">Dismiss</button>
     </div>
   </div>
 
   <!-- Profile, City & Admin Home WiFi -->
   <div class="card">
-    <h2>Admin Panel · Home WiFi &amp; Profile</h2>
+    <h2>Admin Panel &middot; Home WiFi &amp; Profile</h2>
     <div class="row" style="margin-bottom:8px">
       <div style="flex:1;min-width:130px"><span class="lbl">Your Name</span><input id="uName" value="Muhib"/></div>
       <div style="flex:1;min-width:130px"><span class="lbl">City</span><input id="uCity" value="Dhaka"/></div>
@@ -334,7 +369,12 @@ function toast(m){
   window._tt=setTimeout(()=>t.style.display='none',1800);
 }
 function cmd(url,msg){
-  fetch(url).then(()=>toast(msg||'Done')).catch(()=>toast('Check WiFi connection'));
+  fetch(url).then(()=>{toast(msg||'Done');pollStatus(false);}).catch(()=>toast('Check WiFi connection'));
+}
+function setAng(a){
+  document.getElementById('angSlider').value=a;
+  document.getElementById('angLbl').textContent=a;
+  cmd('/api/servo?angle='+a,'Servo '+a+' deg');
 }
 function sendText(){
   const l1=encodeURIComponent(document.getElementById('txt1').value);
@@ -400,35 +440,105 @@ function sendBitmap(){
     .catch(()=>toast('Failed to send'));
 }
 
-fetch('/api/status').then(r=>r.json()).then(d=>{
-  document.getElementById('statusLine').textContent=
-    'Home WiFi: '+(d.wifi?'Connected ('+d.staIp+')':'Offline')+' · Temp: '+d.temp+'C · Mode: '+d.mode;
-  document.getElementById('uName').value=d.user;
-  document.getElementById('uCity').value=d.city;
-  document.getElementById('wSsid').value=d.ssid;
-}).catch(()=>{});
+function pollStatus(fillInputs){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    document.getElementById('statusLine').textContent=
+      'Home WiFi: '+(d.wifi?'Connected ('+d.staIp+')':'Offline')+' · Temp: '+d.temp+'C · Mode: '+d.mode;
+    const distTxt = d.dist > 400 ? 'No Echo (>400cm)' : (d.dist.toFixed(1)+' cm'+(d.locked?' [LOCKED]':''));
+    document.getElementById('hwStat').textContent=
+      'HC-SR04: '+distTxt+' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | G:'+(d.green?'ON':'OFF')+' R:'+(d.red?'ON':'OFF')+' | Buz:'+d.buz;
+    if(fillInputs){
+      document.getElementById('uName').value=d.user;
+      document.getElementById('uCity').value=d.city;
+      document.getElementById('wSsid').value=d.ssid;
+    }
+  }).catch(()=>{});
+}
+pollStatus(true);
+setInterval(()=>pollStatus(false), 1200);
 </script>
 </body>
 </html>
 )rawliteral";
 
-// -------- Servo Safe Power Management (Attach / Move / Auto-Off at 90 deg) --------
+// -------- Zero-Conflict Buzzer Driver (Works with Passive & Active Buzzers, NEVER conflicts with ESP32Servo LEDC!) --------
+void playToneSafe(int freqHz, int durationMs, bool forceDc = false) {
+  if (forceDc || buzzerActiveMode || freqHz <= 0) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    unsigned long start = millis();
+    while (millis() - start < (unsigned long)durationMs) {
+      delay(5);
+      yield();
+    }
+    digitalWrite(PIN_BUZZER, LOW);
+    return;
+  }
+  long halfPeriodUs = 500000L / freqHz;
+  if (halfPeriodUs < 50) halfPeriodUs = 50;
+  unsigned long endUs = micros() + (unsigned long)durationMs * 1000UL;
+  int cycles = 0;
+  while ((long)(endUs - micros()) > 0) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delayMicroseconds(halfPeriodUs);
+    digitalWrite(PIN_BUZZER, LOW);
+    delayMicroseconds(halfPeriodUs);
+    if ((++cycles & 31) == 0) yield();
+  }
+  digitalWrite(PIN_BUZZER, LOW);
+}
+
+void stopBuzzer() {
+  digitalWrite(PIN_BUZZER, LOW);
+}
+
+// -------- LED Control Helpers --------
+void setLeds(bool greenOn, bool redOn) {
+  greenLedState = greenOn;
+  redLedState = redOn;
+  digitalWrite(PIN_LED_GREEN, greenOn ? HIGH : LOW);
+  digitalWrite(PIN_LED_RED, redOn ? HIGH : LOW);
+}
+
+void updateLedsForFace(int faceType) {
+  if (manualLed || alarmRinging) return;
+  if (faceType == 3 || faceType == 5 || faceType == 16 || faceType == 19) {
+    setLeds(false, true);  // Red LED for Cold / Angry / Alert
+  } else if (objectLocked || faceType == 1 || faceType == 4 || faceType == 12) {
+    setLeds(true, false);  // Green LED for Happy / Love / User Detected
+  } else {
+    setLeds(WiFi.status() == WL_CONNECTED, WiFi.status() != WL_CONNECTED);
+  }
+}
+
+// -------- SG90 Servo Safe Power Management (Dedicated 50Hz PWM, Attach / Move / Idle Auto-Off) --------
+bool isExpressiveFace(int faceType) {
+  return (faceType == 1 || faceType == 4 || faceType == 5 || faceType == 6 ||
+          faceType == 7 || faceType == 9 || faceType == 12 || faceType == 19 ||
+          faceType == 24);
+}
+
 void moveServoSmooth(int targetAngle) {
   targetAngle = constrain(targetAngle, 15, 165);
   if (!servoAttached) {
-    headServo.attach(PIN_SERVO);
+    headServo.setPeriodHertz(50);
+    headServo.attach(PIN_SERVO, 500, 2400);
     servoAttached = true;
+    delay(15);
   }
   headServo.write(targetAngle);
-  servoAngle = targetAngle;
+  if (targetAngle != servoAngle) {
+    servoAngle = targetAngle;
+    lastServoMoveMs = millis();
+  }
 }
 
 void parkAndPowerOffServo() {
+  if (manualServo) return;
   if (servoAngle != 90) {
     moveServoSmooth(90);
-    delay(260);
+    return; // Let servo finish moving to 90 deg before detaching on next tick
   }
-  if (servoOffWhenIdle && servoAttached) {
+  if (servoOffWhenIdle && servoAttached && (millis() - lastServoMoveMs > 450)) {
     headServo.detach();
     servoAttached = false;
   }
@@ -802,97 +912,124 @@ void drawAlarmOled(int idx, int frame) {
   display.display();
 }
 
-// -------- HC-SR04 Ultrasonic Distance Reading --------
-float readDistanceCm() {
+// -------- HC-SR04 Ultrasonic Distance Reading (Filtered & Noise-Resistant) --------
+float readSingleDistanceCm() {
   digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(4);
   digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
+  delayMicroseconds(12);
   digitalWrite(PIN_TRIG, LOW);
-  long duration = pulseIn(PIN_ECHO, HIGH, 25000);
+  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);
   if (duration == 0) return 999.0;
-  return (duration * 0.0343) / 2.0;
+  float cm = (duration * 0.0343f) / 2.0f;
+  if (cm < 2.0f || cm > 400.0f) return 999.0;
+  return cm;
+}
+
+float readDistanceCm() {
+  float sum = 0;
+  int valid = 0;
+  for (int i = 0; i < 3; i++) {
+    float d = readSingleDistanceCm();
+    if (d < 400.0f) {
+      sum += d;
+      valid++;
+    }
+    delay(12);
+  }
+  if (valid == 0) return 999.0;
+  return sum / valid;
 }
 
 void playWakeSound() {
-  tone(PIN_BUZZER, 523, 90); delay(100);
-  tone(PIN_BUZZER, 659, 90); delay(100);
-  tone(PIN_BUZZER, 784, 120); delay(130);
-  noTone(PIN_BUZZER);
+  playToneSafe(523, 85); delay(25);
+  playToneSafe(659, 85); delay(25);
+  playToneSafe(784, 120);
 }
 
 void updateServoForFace(int faceType, int frame);
 
 void showWakeGreeting() {
-  digitalWrite(PIN_LED_GREEN, HIGH);
-  digitalWrite(PIN_LED_RED, LOW);
+  if (!manualLed) setLeds(true, false);
   playWakeSound();
   for (int i = 0; i < 6; i++) {
     drawFace((i % 2 == 0) ? 1 : 4, i);
-    updateServoForFace(1, i);
-    delay(220);
+    if (!manualServo) moveServoSmooth((i % 2 == 0) ? trackedUserAngle - 20 : trackedUserAngle + 20);
+    server.handleClient();
+    delay(200);
   }
+  if (!manualServo) moveServoSmooth(trackedUserAngle);
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(14, 24);
   display.print("Hi " + userName + "!");
   display.display();
-  delay(1800);
+  for (int k = 0; k < 15; k++) {
+    server.handleClient();
+    delay(100);
+  }
 }
 
 // -------- HC-SR04 + OLED Co-Mounted User Tracking & Idle Servo Power-Off --------
 void updateUltrasonicTracking() {
-  if (!ultrasonicOn || manualServo) return;
+  if (millis() - lastSensorReadMs < 180) return;
+  lastSensorReadMs = millis();
 
   float dist = readDistanceCm();
-  if (dist > 2.0 && dist <= trackRangeCm) {
-    objectLocked = true;
-    trackedUserAngle = servoAngle;
-    lastObjectSeenMs = millis();
+  lastDistanceCm = dist;
 
-    if (isSleeping && dist <= wakeDistCm) {
+  if (!ultrasonicOn) return;
+
+  // User / Object detected within tracking range!
+  if (dist > 2.0f && dist <= (float)trackRangeCm) {
+    bool newlyArrived = !objectLocked;
+    objectLocked = true;
+    lastObjectSeenMs = millis();
+    if (!manualLed) setLeds(true, false);
+
+    // Wake up from sleep OR greet user when they walk up within wakeDistCm (25cm)
+    if (dist <= (float)wakeDistCm && (isSleeping || (newlyArrived && millis() - lastGreetMs > 12000UL))) {
       isSleeping = false;
       screenLocked = false;
+      lastGreetMs = millis();
       showWakeGreeting();
     }
     return;
   }
 
-  // Follow user slightly left/right when previously locked
-  if (trackingEnabled && objectLocked && (millis() - lastObjectSeenMs < 2500)) {
-    int checkAngles[2] = {
-      constrain(trackedUserAngle - 20, 35, 145),
-      constrain(trackedUserAngle + 20, 35, 145)
-    };
-    for (int i = 0; i < 2; i++) {
-      moveServoSmooth(checkAngles[i]);
-      delay(130);
-      float d = readDistanceCm();
-      if (d > 2.0 && d <= trackRangeCm) {
-        trackedUserAngle = checkAngles[i];
+  // If user stepped slightly left/right while locked, sweep head to follow them!
+  if (trackingEnabled && !manualServo && objectLocked && (millis() - lastObjectSeenMs < 3500UL)) {
+    int offsets[4] = { -22, 22, -44, 44 };
+    for (int i = 0; i < 4; i++) {
+      int candidate = constrain(trackedUserAngle + offsets[i], 30, 150);
+      moveServoSmooth(candidate);
+      delay(160);
+      server.handleClient();
+      float d = readSingleDistanceCm();
+      lastDistanceCm = d;
+      if (d > 2.0f && d <= (float)trackRangeCm) {
+        trackedUserAngle = candidate;
         lastObjectSeenMs = millis();
         return;
       }
     }
   }
 
-  // No object found -> look straight (90 deg) and turn Servo OFF
-  if (millis() - lastObjectSeenMs > 3000) {
+  // No object found for 4 seconds -> return to straight (90 deg) and power Servo OFF if not animating
+  if (millis() - lastObjectSeenMs > 4000UL) {
     objectLocked = false;
     trackedUserAngle = 90;
-    parkAndPowerOffServo();
+    bool animatingFace = (!isSleeping && activeScreen == "face" && isExpressiveFace(currentFace));
+    if (!manualServo && !animatingFace) {
+      parkAndPowerOffServo();
+    }
   }
 }
 
 void updateServoForFace(int faceType, int frame) {
   if (manualServo) {
     moveServoSmooth(servoAngle);
-    return;
-  }
-
-  if (!objectLocked && !alarmRinging && faceType == 0) {
-    parkAndPowerOffServo();
     return;
   }
 
@@ -917,12 +1054,12 @@ void updateServoForFace(int faceType, int frame) {
 
 void playAlarmBeepTick(int melody, int frame) {
   if (melody == 1) {
-    int notes[3] = {440, 554, 659};
-    tone(PIN_BUZZER, notes[frame % 3], 140);
+    int notes[3] = {523, 659, 784};
+    playToneSafe(notes[frame % 3], 110);
   } else if (melody == 2) {
-    tone(PIN_BUZZER, (frame % 2 == 0) ? 2200 : 1400, 120);
+    playToneSafe((frame % 2 == 0) ? 2200 : 1400, 100);
   } else {
-    tone(PIN_BUZZER, (frame % 4 == 3) ? 2093 : 1760, 130);
+    playToneSafe((frame % 4 == 3) ? 2093 : 1760, 110);
   }
 }
 
@@ -967,7 +1104,6 @@ void fetchWeatherFromOpenMeteo() {
 void setupWebPortalRoutes() {
   server.enableCORS(true);
 
-  // Serve full interactive Web Portal directly at http://192.168.4.1
   server.on("/", HTTP_GET, []() {
     server.send_P(200, "text/html", PORTAL_HTML);
   });
@@ -979,7 +1115,14 @@ void setupWebPortalRoutes() {
                   ",\\"mode\\":\\"" + botMode +
                   "\\",\\"user\\":\\"" + userName +
                   "\\",\\"city\\":\\"" + cityName +
-                  "\\",\\"ssid\\":\\"" + wifiSsid + "\\"}";
+                  "\\",\\"ssid\\":\\"" + wifiSsid +
+                  "\\",\\"dist\\":" + String(lastDistanceCm, 1) +
+                  ",\\"locked\\":" + String(objectLocked ? "true" : "false") +
+                  ",\\"servo\\":" + String(servoAngle) +
+                  ",\\"servoOn\\":" + String(servoAttached ? "true" : "false") +
+                  ",\\"green\\":" + String(greenLedState ? "true" : "false") +
+                  ",\\"red\\":" + String(redLedState ? "true" : "false") +
+                  ",\\"buz\\":\\"" + String(buzzerActiveMode ? "Active" : "Passive") + "\\"}";
     server.send(200, "application/json", json);
   });
 
@@ -1005,7 +1148,10 @@ void setupWebPortalRoutes() {
       activeScreen = "face";
       screenLocked = true;
       isSleeping = (currentFace == 7);
+      manualServo = false; // Allow face-synced head movement right away!
       drawFace(currentFace, frameCount);
+      updateServoForFace(currentFace, frameCount);
+      updateLedsForFace(currentFace);
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -1021,7 +1167,6 @@ void setupWebPortalRoutes() {
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
-  // Receive 128x64 Touchpad Bitmap (2048 hex chars = 1024 bytes) directly from phone!
   server.on("/api/bitmap", HTTP_POST, []() {
     String hex = server.arg("plain");
     if (hex.length() >= 2048) {
@@ -1044,6 +1189,12 @@ void setupWebPortalRoutes() {
   });
 
   server.on("/api/servo", HTTP_GET, []() {
+    if (server.hasArg("test")) {
+      manualServo = true;
+      moveServoSmooth(45);  delay(350);
+      moveServoSmooth(135); delay(420);
+      moveServoSmooth(90);  delay(320);
+    }
     if (server.hasArg("angle")) {
       manualServo = true;
       moveServoSmooth(server.arg("angle").toInt());
@@ -1056,6 +1207,40 @@ void setupWebPortalRoutes() {
   server.on("/api/sensor", HTTP_GET, []() {
     if (server.hasArg("ultrasonic")) ultrasonicOn = (server.arg("ultrasonic") == "1");
     if (server.hasArg("tracking"))   trackingEnabled = (server.arg("tracking") == "1");
+    server.send(200, "application/json", "{\\"ok\\":true}");
+  });
+
+  server.on("/api/led", HTTP_GET, []() {
+    if (server.hasArg("auto") && server.arg("auto") == "1") {
+      manualLed = false;
+      updateLedsForFace(currentFace);
+    } else if (server.hasArg("test")) {
+      manualLed = true;
+      for (int i = 0; i < 3; i++) {
+        setLeds(true, false);  delay(160);
+        setLeds(false, true);  delay(160);
+      }
+      setLeds(true, false);
+    } else {
+      manualLed = true;
+      bool g = server.hasArg("green") ? (server.arg("green") == "1") : greenLedState;
+      bool r = server.hasArg("red")   ? (server.arg("red") == "1")   : redLedState;
+      setLeds(g, r);
+    }
+    server.send(200, "application/json", "{\\"ok\\":true}");
+  });
+
+  server.on("/api/buzzer", HTTP_GET, []() {
+    if (server.hasArg("type")) {
+      buzzerActiveMode = (server.arg("type") == "active");
+    }
+    if (server.hasArg("mode")) {
+      if (server.arg("mode") == "dc") {
+        playToneSafe(0, 220, true);
+      } else {
+        playWakeSound();
+      }
+    }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
@@ -1083,9 +1268,9 @@ void setupWebPortalRoutes() {
   server.on("/api/alarm/dismiss", HTTP_GET, []() {
     alarmRinging = false;
     ringingAlarmIdx = -1;
-    noTone(PIN_BUZZER);
-    digitalWrite(PIN_LED_RED, LOW);
-    digitalWrite(PIN_LED_GREEN, HIGH);
+    stopBuzzer();
+    manualLed = false;
+    setLeds(true, false);
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
@@ -1117,22 +1302,34 @@ void setup() {
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
   pinMode(PIN_LED_GREEN, OUTPUT);
   pinMode(PIN_LED_RED, OUTPUT);
+  setLeds(false, false);
+
+  // Allocate ESP32 PWM timers cleanly for SG90 Servo (50Hz)
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  headServo.setPeriodHertz(50);
+
+  // Boot Hardware Self-Test: LEDs + Buzzer + Servo Wave (proves all wiring on power-up!)
+  setLeds(true, false);  delay(200);
+  setLeds(false, true);  delay(200);
+  setLeds(true, true);
+  playToneSafe(1047, 90); delay(40);
+  playToneSafe(1568, 110);
+  moveServoSmooth(65);  delay(280);
+  moveServoSmooth(115); delay(320);
+  moveServoSmooth(90);  delay(280);
+  setLeds(false, false);
 
   // Load saved Home WiFi from NVS (default: muhib / 12345678)
   prefs.begin("facebot", true);
   wifiSsid     = prefs.getString("ssid", wifiSsid);
   wifiPassword = prefs.getString("pass", wifiPassword);
   prefs.end();
-
-  // Center head straight ahead (90 deg), then detach if idle
-  moveServoSmooth(90);
-  delay(300);
-  if (servoOffWhenIdle) {
-    headServo.detach();
-    servoAttached = false;
-  }
 
 ${alarmInitLines.join('\n')}
 
@@ -1166,12 +1363,12 @@ ${alarmInitLines.join('\n')}
   setupWebPortalRoutes();
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(PIN_LED_GREEN, HIGH);
+    setLeds(true, false);
     configTime(utcOffsetSec, 0, "pool.ntp.org");
     fetchWeatherFromOpenMeteo();
     Serial.println("Home WiFi Connected! IP: " + WiFi.localIP().toString());
   } else {
-    digitalWrite(PIN_LED_RED, HIGH);
+    setLeds(false, true);
     Serial.println("Home WiFi offline — Hotspot Portal active at 192.168.4.1");
   }
   Serial.println("Hotspot Portal: http://192.168.4.1");
@@ -1185,11 +1382,10 @@ void loop() {
   if (alarmRinging && ringingAlarmIdx >= 0) {
     drawAlarmOled(ringingAlarmIdx, frameCount);
     playAlarmBeepTick(alarms[ringingAlarmIdx].melody, frameCount);
-    digitalWrite(PIN_LED_RED, (frameCount % 2 == 0) ? HIGH : LOW);
-    digitalWrite(PIN_LED_GREEN, LOW);
+    setLeds(false, (frameCount % 2 == 0));
     updateServoForFace(19, frameCount);
     frameCount++;
-    delay(220);
+    delay(160);
     return;
   }
 
@@ -1227,6 +1423,7 @@ void loop() {
     if (!objectLocked) parkAndPowerOffServo();
   } else if (activeScreen == "watch") {
     drawWatchOled();
+    if (!objectLocked) parkAndPowerOffServo();
   } else if (activeScreen == "weather") {
     if (liveTempC <= coldThresholdC && frameCount % 8 >= 4) {
       drawFace(3, frameCount);
@@ -1236,12 +1433,14 @@ void loop() {
       display.setCursor(10, 2);
       display.print("Today is too cold!");
       display.display();
-      digitalWrite(PIN_LED_RED, HIGH);
+      if (!manualLed) setLeds(false, true);
     } else {
       drawWeatherOled();
     }
+    if (!objectLocked) parkAndPowerOffServo();
   } else if (activeScreen == "greeting") {
     drawGreetingOled();
+    if (!objectLocked) parkAndPowerOffServo();
   } else if (activeScreen == "text") {
     drawCustomTextOled();
   } else if (activeScreen == "bitmap") {
@@ -1251,10 +1450,11 @@ void loop() {
   } else {
     drawFace(currentFace, frameCount);
     updateServoForFace(currentFace, frameCount);
+    updateLedsForFace(currentFace);
   }
 
   frameCount++;
-  delay(220);
+  delay(180);
 }
 `;
 }
