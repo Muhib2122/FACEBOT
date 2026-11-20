@@ -3,16 +3,34 @@ import {
   Activity,
   Bell,
   BellOff,
+  CloudCheck,
   CloudSun,
   Code2,
   Cpu,
   Download,
+  LogIn,
+  LogOut,
   Menu,
   Mic,
   PenTool,
   SlidersHorizontal,
   X,
 } from 'lucide-react';
+import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import { collection, doc, getDoc, onSnapshot, query, where } from 'firebase/firestore';
+import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
+import {
+  clearTodayInteractionsInFirestore,
+  deleteAlarmFromFirestore,
+  deleteReactionFromFirestore,
+  hex2048ToPixels,
+  saveAlarmToFirestore,
+  saveInteractionToFirestore,
+  savePlaylistToFirestore,
+  saveReactionToFirestore,
+  saveWorkspaceToFirestore,
+  toggleAlarmInFirestore,
+} from './utils/firestoreSync';
 import {
   ActiveScreenState,
   AgentActionResponse,
@@ -301,6 +319,13 @@ export default function App() {
   const [cloudSyncStatus, setCloudSyncStatus] = useState<string | null>(null);
   const [cloudEventSeq, setCloudEventSeq] = useState(0);
 
+  // Firebase Auth & Real-Time Firestore Persistence States
+  const [fbUser, setFbUser] = useState<User | null>(null);
+  const [fbAuthReady, setFbAuthReady] = useState(false);
+  const [fbWorkspaceReady, setFbWorkspaceReady] = useState(false);
+  const [fbAuthError, setFbAuthError] = useState<string | null>(null);
+  const [fbFatalError, setFbFatalError] = useState<Error | null>(null);
+
   const [activeScreen, setActiveScreen] = useState<ActiveScreenState>({
     kind: 'face',
     faceId: 0,
@@ -311,6 +336,7 @@ export default function App() {
   const lastAlarmMinuteRef = useRef<string>('');
   const autoStepRef = useRef(0);
   const userStepRef = useRef(0);
+  const skipNextWorkspaceSyncRef = useRef(false);
 
   // Cloud event counters so ESP32 Core-0 1.2s poller deduplicates one-shot actions
   const buzzerSeqRef = useRef(0);
@@ -319,6 +345,367 @@ export default function App() {
   const lastBitmapHexRef = useRef('');
   const alarmDismissSeqRef = useRef(0);
   const otaTriggerSeqRef = useRef(0);
+
+  // Keep latest local state accessible during initial first-login migration
+  const latestLocalStateRef = useRef({
+    mode,
+    settings,
+    location,
+    hardware,
+    alarms,
+    customReactions,
+    interactionEvents,
+    playlist,
+    activeFaceId: activeScreen.faceId,
+  });
+  latestLocalStateRef.current = {
+    mode,
+    settings,
+    location,
+    hardware,
+    alarms,
+    customReactions,
+    interactionEvents,
+    playlist,
+    activeFaceId: activeScreen.faceId,
+  };
+
+  if (fbFatalError) {
+    throw fbFatalError;
+  }
+
+  // Firebase Auth State Observer
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      setFbUser(user);
+      setFbAuthReady(true);
+      if (!user) {
+        setFbWorkspaceReady(false);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Bootstrap parent workspace & attach real-time Firestore listeners once signed in
+  useEffect(() => {
+    if (!fbAuthReady || !fbUser || !fbUser.emailVerified) {
+      setFbWorkspaceReady(false);
+      return;
+    }
+
+    const uid = fbUser.uid;
+    let cancelled = false;
+    const unsubs: (() => void)[] = [];
+
+    const bootstrapAndListen = async () => {
+      try {
+        const wsRef = doc(db, 'users', uid);
+        let wsSnap;
+        try {
+          wsSnap = await getDoc(wsRef);
+        } catch (err) {
+          handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+        }
+
+        if (cancelled) return;
+
+        // First-time Google sign-in: create parent workspace first (Master Gate) & migrate existing local data!
+        if (!wsSnap.exists()) {
+          const snapLocal = latestLocalStateRef.current;
+          await saveWorkspaceToFirestore(uid, {
+            mode: snapLocal.mode,
+            settings: snapLocal.settings,
+            location: snapLocal.location,
+            hardware: snapLocal.hardware,
+            activeFaceId: snapLocal.activeFaceId,
+          });
+          for (const al of snapLocal.alarms.slice(0, 8)) {
+            await saveAlarmToFirestore(uid, al);
+          }
+          for (const rx of snapLocal.customReactions.filter((r) => r.id !== 'live-touchpad-preview').slice(0, 20)) {
+            await saveReactionToFirestore(uid, rx);
+          }
+          await savePlaylistToFirestore(uid, snapLocal.playlist);
+          const todayKey = getTodayKey();
+          for (const ev of snapLocal.interactionEvents.slice(0, 25)) {
+            await saveInteractionToFirestore(uid, ev, todayKey);
+          }
+        }
+
+        if (cancelled) return;
+        setFbWorkspaceReady(true);
+
+        // 1. Live Workspace Settings Listener
+        unsubs.push(
+          onSnapshot(
+            wsRef,
+            (docSnap) => {
+              if (!docSnap.exists()) return;
+              const d = docSnap.data();
+              skipNextWorkspaceSyncRef.current = true;
+              if (d.mode === 'auto' || d.mode === 'user') setMode(d.mode);
+              setSettings((prev) => ({
+                ...prev,
+                userName: typeof d.userName === 'string' ? d.userName : prev.userName,
+                coldThresholdC: typeof d.coldThresholdC === 'number' ? d.coldThresholdC : prev.coldThresholdC,
+                hotThresholdC: typeof d.hotThresholdC === 'number' ? d.hotThresholdC : prev.hotThresholdC,
+                autoSleepTimeoutSec:
+                  typeof d.autoSleepTimeoutSec === 'number'
+                    ? d.autoSleepTimeoutSec
+                    : prev.autoSleepTimeoutSec,
+                use24HourClock:
+                  typeof d.use24HourClock === 'boolean' ? d.use24HourClock : prev.use24HourClock,
+                wakeGreetingPrefix:
+                  typeof d.wakeGreetingPrefix === 'string'
+                    ? d.wakeGreetingPrefix
+                    : prev.wakeGreetingPrefix,
+              }));
+              setLocation((prev) => ({
+                ...prev,
+                city: typeof d.city === 'string' ? d.city : prev.city,
+                country: typeof d.country === 'string' ? d.country : prev.country,
+                latitude: typeof d.latitude === 'number' ? d.latitude : prev.latitude,
+                longitude: typeof d.longitude === 'number' ? d.longitude : prev.longitude,
+                altitude: typeof d.altitude === 'number' ? d.altitude : prev.altitude,
+                timezone: typeof d.timezone === 'string' ? d.timezone : prev.timezone,
+              }));
+              setHardware((prev) => ({
+                ...prev,
+                wifiSsid: typeof d.wifiSsid === 'string' ? d.wifiSsid : prev.wifiSsid,
+                greenLedMode: d.greenLedMode || prev.greenLedMode,
+                oledScheme: d.oledScheme || prev.oledScheme,
+                animationSpeed: d.animationSpeed || prev.animationSpeed,
+                esp32Ip: typeof d.esp32Ip === 'string' ? d.esp32Ip : prev.esp32Ip,
+                cloudSyncEnabled:
+                  typeof d.cloudSyncEnabled === 'boolean' ? d.cloudSyncEnabled : prev.cloudSyncEnabled,
+                cloudBackendType: d.cloudBackendType || prev.cloudBackendType,
+                cloudPortalUrl:
+                  typeof d.cloudPortalUrl === 'string' && d.cloudPortalUrl.length > 0
+                    ? d.cloudPortalUrl
+                    : prev.cloudPortalUrl,
+                firebaseDbUrl:
+                  typeof d.firebaseDbUrl === 'string' ? d.firebaseDbUrl : prev.firebaseDbUrl,
+                deviceId: typeof d.deviceId === 'string' ? d.deviceId : prev.deviceId,
+                firmwareVersion:
+                  typeof d.firmwareVersion === 'string' ? d.firmwareVersion : prev.firmwareVersion,
+                otaAutoCheck:
+                  typeof d.otaAutoCheck === 'boolean' ? d.otaAutoCheck : prev.otaAutoCheck,
+                buzzerMuted:
+                  typeof d.buzzerMuted === 'boolean' ? d.buzzerMuted : prev.buzzerMuted,
+              }));
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+
+        // 2. Live Alarms Listener
+        const alarmsQ = query(
+          collection(db, 'users', uid, 'alarms'),
+          where('ownerId', '==', uid)
+        );
+        unsubs.push(
+          onSnapshot(
+            alarmsQ,
+            (snap) => {
+              const loaded: AlarmItem[] = snap.docs.map((d) => {
+                const v = d.data();
+                return {
+                  id: d.id,
+                  time: String(v.time || '07:00'),
+                  label: String(v.label || 'Alarm'),
+                  enabled: Boolean(v.enabled),
+                  days: Array.isArray(v.days) ? v.days.map(Number) : [0, 1, 2, 3, 4, 5, 6],
+                  faceId: typeof v.faceId === 'number' ? v.faceId : 1,
+                  melody:
+                    v.melody === 'gentle' || v.melody === 'urgent' ? v.melody : 'classic',
+                };
+              });
+              loaded.sort((a, b) => a.time.localeCompare(b.time));
+              setAlarms(loaded);
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/alarms`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+
+        // 3. Live Touchpad Reactions Listener
+        const reactionsQ = query(
+          collection(db, 'users', uid, 'reactions'),
+          where('ownerId', '==', uid)
+        );
+        unsubs.push(
+          onSnapshot(
+            reactionsQ,
+            (snap) => {
+              const loaded: CustomReaction[] = snap.docs.map((d) => {
+                const v = d.data();
+                return {
+                  id: d.id,
+                  name: String(v.name || 'Saved Art'),
+                  createdAt: v.createdAt?.toMillis?.() ?? Date.now(),
+                  pixels: hex2048ToPixels(String(v.pixelsHex || '')),
+                  servoStyle: 'center',
+                };
+              });
+              loaded.sort((a, b) => b.createdAt - a.createdAt);
+              setCustomReactions((prev) => {
+                const preview = prev.find((r) => r.id === 'live-touchpad-preview');
+                return preview ? [preview, ...loaded] : loaded;
+              });
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/reactions`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+
+        // 4. Live Today's Interaction Events Listener
+        const todayKey = getTodayKey();
+        const interactionsQ = query(
+          collection(db, 'users', uid, 'interactions'),
+          where('ownerId', '==', uid),
+          where('dateKey', '==', todayKey)
+        );
+        unsubs.push(
+          onSnapshot(
+            interactionsQ,
+            (snap) => {
+              const loaded: InteractionEvent[] = snap.docs.map((d) => {
+                const v = d.data();
+                return {
+                  id: d.id,
+                  timestamp: typeof v.timestampMs === 'number' ? v.timestampMs : Date.now(),
+                  hour: typeof v.hour === 'number' ? v.hour : 0,
+                  category: v.category || 'oled-face',
+                  label: String(v.label || 'Event'),
+                  source: v.source || 'portal',
+                };
+              });
+              loaded.sort((a, b) => b.timestamp - a.timestamp);
+              setInteractionEvents(loaded);
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/interactions`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+
+        // 5. Live Playlist Listener
+        const playlistQ = query(
+          collection(db, 'users', uid, 'playlist'),
+          where('ownerId', '==', uid)
+        );
+        unsubs.push(
+          onSnapshot(
+            playlistQ,
+            (snap) => {
+              if (snap.empty) return;
+              const rows = snap.docs
+                .map((d) => ({ id: d.id, data: d.data() }))
+                .sort((a, b) => Number(a.data.orderIndex ?? 0) - Number(b.data.orderIndex ?? 0));
+              setPlaylist(
+                rows.map(({ id, data }) => ({
+                  id,
+                  kind: data.kind || 'face',
+                  label: String(data.label || 'Screen'),
+                  durationSec: Number(data.durationSec || 5),
+                  enabled: Boolean(data.enabled),
+                  faceId: typeof data.faceId === 'number' ? data.faceId : 0,
+                  customReactionId: data.customReactionId || undefined,
+                  textMessage: data.textMessage || undefined,
+                }))
+              );
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/playlist`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+      } catch (err) {
+        if (!cancelled) {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+    };
+
+    void bootstrapAndListen();
+
+    return () => {
+      cancelled = true;
+      unsubs.forEach((fn) => fn());
+    };
+  }, [fbAuthReady, fbUser]);
+
+  // Debounced Save of Workspace Settings/Hardware/Location to Firestore
+  useEffect(() => {
+    if (!fbUser || !fbUser.emailVerified || !fbWorkspaceReady) return;
+    if (skipNextWorkspaceSyncRef.current) {
+      skipNextWorkspaceSyncRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      saveWorkspaceToFirestore(fbUser.uid, {
+        mode,
+        settings,
+        location,
+        hardware,
+        activeFaceId: activeScreen.faceId,
+      }).catch((err) => {
+        setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [
+    fbUser,
+    fbWorkspaceReady,
+    mode,
+    settings,
+    location,
+    hardware,
+    activeScreen.faceId,
+  ]);
+
+  const handleGoogleSignIn = async () => {
+    setFbAuthError(null);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Google sign-in popup was closed.';
+      setFbAuthError(msg);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    setFbAuthError(null);
+    try {
+      await signOut(auth);
+    } catch {
+      // ignore
+    }
+  };
 
   // Persist settings to localStorage
   useEffect(() => {
@@ -367,8 +754,13 @@ export default function App() {
         source,
       };
       setInteractionEvents((prev) => [ev, ...prev].slice(0, 250));
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        saveInteractionToFirestore(fbUser.uid, ev, getTodayKey()).catch((err) => {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        });
+      }
     },
-    []
+    [fbUser, fbWorkspaceReady]
   );
 
   // Send live HTTP GET command to real ESP32 over WiFi if IP is configured
@@ -868,6 +1260,11 @@ export default function App() {
       reaction,
       ...prev.filter((r) => r.id !== 'live-touchpad-preview'),
     ]);
+    if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+      saveReactionToFirestore(fbUser.uid, reaction).catch((err) => {
+        setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }
     logInteraction('oled-face', `Saved Touchpad Art: ${reaction.name}`, 'portal');
   };
 
@@ -888,6 +1285,11 @@ export default function App() {
 
   const handleDeleteReaction = (id: string) => {
     setCustomReactions((prev) => prev.filter((r) => r.id !== id));
+    if (fbUser && fbUser.emailVerified && fbWorkspaceReady && id !== 'live-touchpad-preview') {
+      deleteReactionFromFirestore(fbUser.uid, id).catch((err) => {
+        setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }
   };
 
   const handleSimulateColdWeather = () => {
@@ -929,22 +1331,41 @@ export default function App() {
         next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
         return next;
       });
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        saveAlarmToFirestore(fbUser.uid, alarm).catch((err) => {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        });
+      }
       setAlarmSyncMessage(
-        hardware.esp32Ip.trim()
-          ? `Alarm ${alarm.time} saved and synced to ESP32.`
-          : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
+        fbUser
+          ? `Alarm ${alarm.time} saved to Firebase Cloud and synced to ESP32.`
+          : hardware.esp32Ip.trim()
+            ? `Alarm ${alarm.time} saved and synced to ESP32.`
+            : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
       );
       logInteraction('alarm', `Set Alarm ${alarm.time} (${alarm.label})`, 'portal');
     },
-    [hardware.esp32Ip, syncSingleAlarmSlot, logInteraction]
+    [fbUser, fbWorkspaceReady, hardware.esp32Ip, syncSingleAlarmSlot, logInteraction]
   );
 
   const handleToggleAlarm = (id: string) => {
+    let nextEnabled = true;
     setAlarms((prev) => {
-      const next = prev.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a));
+      const next = prev.map((a) => {
+        if (a.id === id) {
+          nextEnabled = !a.enabled;
+          return { ...a, enabled: nextEnabled };
+        }
+        return a;
+      });
       next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
       return next;
     });
+    if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+      toggleAlarmInFirestore(fbUser.uid, id, nextEnabled).catch((err) => {
+        setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }
   };
 
   const handleDismissAlarm = () => {
@@ -965,6 +1386,11 @@ export default function App() {
       next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
       return next;
     });
+    if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+      deleteAlarmFromFirestore(fbUser.uid, id).catch((err) => {
+        setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }
   };
 
   const handleTestAlarm = (alarm: AlarmItem) => {
@@ -1121,13 +1547,18 @@ export default function App() {
           next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
           return next;
         });
+        if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+          saveAlarmToFirestore(fbUser.uid, newAlarm).catch((err) => {
+            setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+          });
+        }
         badges.push(`Alarm: ${cleanTime}`);
       }
 
       logInteraction('ai-voice', action.actionSummary || `AI Agent (${faceDef?.name || 'Reply'})`, source);
       return badges;
     },
-    [hardware.buzzerMuted, sendToEsp32, syncSingleAlarmSlot, logInteraction]
+    [fbUser, fbWorkspaceReady, hardware.buzzerMuted, sendToEsp32, syncSingleAlarmSlot, logInteraction]
   );
 
   const handleUpdateHardware = (patch: Partial<HardwareConfig>) => {
@@ -1297,14 +1728,57 @@ export default function App() {
             </div>
           </div>
 
-          <button
-            onClick={handleQuickExportIno}
-            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
-          >
-            <Download className="w-3.5 h-3.5" />
-            Export ESP32 .ino
-          </button>
+          <div className="flex items-center gap-2.5 shrink-0">
+            {fbUser ? (
+              <div className="flex items-center gap-2">
+                <div className="hidden sm:flex items-center gap-1.5 text-xs text-slate-600 pr-1">
+                  <CloudCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span className="font-medium text-slate-800 max-w-[130px] truncate">
+                    {fbUser.displayName || fbUser.email}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleGoogleSignOut}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Sign Out</span>
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <LogIn className="w-3.5 h-3.5 text-blue-600" />
+                Sign in with Google
+              </button>
+            )}
+
+            <button
+              onClick={handleQuickExportIno}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export ESP32 .ino
+            </button>
+          </div>
         </header>
+
+        {fbAuthError && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-6 lg:px-8 py-2 text-xs text-amber-800 flex items-center justify-between gap-2">
+            <span>Google Sign-In: {fbAuthError}</span>
+            <button
+              type="button"
+              onClick={() => setFbAuthError(null)}
+              className="text-amber-700 hover:text-amber-900 font-semibold"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* Focused Workspace (No Cluttered Duplicated Rig on Every Page) */}
         <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-[1280px] w-full mx-auto space-y-6">
@@ -1359,6 +1833,11 @@ export default function App() {
                 setInteractionEvents([]);
                 setEsp32HourlyOverrides(null);
                 setEsp32SyncStatus(null);
+                if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+                  clearTodayInteractionsInFirestore(fbUser.uid, getTodayKey()).catch((err) => {
+                    setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+                  });
+                }
               }}
               onStartPomodoro={(mins, label) => {
                 setPomodoroLabel(label);
@@ -1452,7 +1931,14 @@ export default function App() {
                 onSelectFace={handleSelectFace}
                 onSelectSpecialScreen={handleSelectSpecialScreen}
                 onSendQuickText={handleSendQuickText}
-                onUpdatePlaylist={setPlaylist}
+                onUpdatePlaylist={(nextPlaylist) => {
+                  setPlaylist(nextPlaylist);
+                  if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+                    savePlaylistToFirestore(fbUser.uid, nextPlaylist).catch((err) => {
+                      setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+                    });
+                  }
+                }}
               />
             </div>
           )}

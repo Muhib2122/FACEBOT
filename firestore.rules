@@ -1,0 +1,299 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // GLOBAL HARDENED PRIMITIVES
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function parentWorkspaceExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    // =========================================================================
+    // VALIDATION BLUEPRINTS (Anti-Update-Gap Helpers)
+    // =========================================================================
+    function isValidUserWorkspace(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'mode', 'userName', 'coldThresholdC', 'hotThresholdC',
+          'autoSleepTimeoutSec', 'use24HourClock', 'wakeGreetingPrefix',
+          'city', 'country', 'latitude', 'longitude', 'altitude', 'timezone',
+          'wifiSsid', 'greenLedMode', 'oledScheme', 'animationSpeed', 'esp32Ip',
+          'cloudSyncEnabled', 'cloudBackendType', 'cloudPortalUrl', 'firebaseDbUrl',
+          'deviceId', 'firmwareVersion', 'otaAutoCheck', 'buzzerMuted',
+          'activeFaceId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'mode', 'userName', 'coldThresholdC', 'hotThresholdC',
+          'autoSleepTimeoutSec', 'use24HourClock', 'wakeGreetingPrefix',
+          'city', 'country', 'latitude', 'longitude', 'altitude', 'timezone',
+          'wifiSsid', 'greenLedMode', 'oledScheme', 'animationSpeed', 'esp32Ip',
+          'cloudSyncEnabled', 'cloudBackendType', 'cloudPortalUrl', 'firebaseDbUrl',
+          'deviceId', 'firmwareVersion', 'otaAutoCheck', 'buzzerMuted',
+          'activeFaceId', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.mode is string && data.mode.size() <= 8 && (data.mode == 'auto' || data.mode == 'user')
+        && data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 32
+        && data.coldThresholdC is number && data.coldThresholdC >= -40 && data.coldThresholdC <= 40
+        && data.hotThresholdC is number && data.hotThresholdC >= 10 && data.hotThresholdC <= 60
+        && data.autoSleepTimeoutSec is number && data.autoSleepTimeoutSec >= 10 && data.autoSleepTimeoutSec <= 3600
+        && data.use24HourClock is bool
+        && data.wakeGreetingPrefix is string && data.wakeGreetingPrefix.size() >= 1 && data.wakeGreetingPrefix.size() <= 20
+        && data.city is string && data.city.size() >= 1 && data.city.size() <= 48
+        && data.country is string && data.country.size() <= 48
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && data.altitude is number && data.altitude >= -500 && data.altitude <= 9000
+        && data.timezone is string && data.timezone.size() <= 48
+        && data.wifiSsid is string && data.wifiSsid.size() <= 48
+        && data.greenLedMode is string && data.greenLedMode.size() <= 8 && (data.greenLedMode == 'auto' || data.greenLedMode == 'on' || data.greenLedMode == 'blink' || data.greenLedMode == 'off')
+        && data.oledScheme is string && data.oledScheme.size() <= 20 && (data.oledScheme == 'ice-blue' || data.oledScheme == 'white' || data.oledScheme == 'dual-yellow-blue')
+        && data.animationSpeed is string && data.animationSpeed.size() <= 8 && (data.animationSpeed == 'slow' || data.animationSpeed == 'normal' || data.animationSpeed == 'fast')
+        && data.esp32Ip is string && data.esp32Ip.size() <= 80
+        && data.cloudSyncEnabled is bool
+        && data.cloudBackendType is string && data.cloudBackendType.size() <= 16 && (data.cloudBackendType == 'vercel-api' || data.cloudBackendType == 'firebase-rtdb')
+        && data.cloudPortalUrl is string && data.cloudPortalUrl.size() <= 160
+        && data.firebaseDbUrl is string && data.firebaseDbUrl.size() <= 200
+        && data.deviceId is string && data.deviceId.size() >= 1 && data.deviceId.size() <= 32 && data.deviceId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.firmwareVersion is string && data.firmwareVersion.size() >= 1 && data.firmwareVersion.size() <= 16
+        && data.otaAutoCheck is bool
+        && data.buzzerMuted is bool
+        && data.activeFaceId is int && data.activeFaceId >= 0 && data.activeFaceId <= 24
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAlarm(data, userId) {
+      return data.keys().hasAll(['ownerId', 'time', 'label', 'enabled', 'days', 'faceId', 'melody', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'time', 'label', 'enabled', 'days', 'faceId', 'melody', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.time is string && data.time.size() == 5 && data.time.matches('^[0-2][0-9]:[0-5][0-9]$')
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 32
+        && data.enabled is bool
+        && data.days is list && data.days.size() <= 7 && (data.days.size() == 0 || (data.days[0] is int && data.days[0] >= 0 && data.days[0] <= 6))
+        && data.faceId is int && data.faceId >= 0 && data.faceId <= 24
+        && data.melody is string && data.melody.size() <= 10 && (data.melody == 'classic' || data.melody == 'gentle' || data.melody == 'urgent')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidReaction(data, userId) {
+      return data.keys().hasAll(['ownerId', 'name', 'pixelsHex', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'pixelsHex', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 40
+        && data.pixelsHex is string && data.pixelsHex.size() == 2048
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInteraction(data, userId) {
+      return data.keys().hasAll(['ownerId', 'dateKey', 'hour', 'timestampMs', 'category', 'label', 'source', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'dateKey', 'hour', 'timestampMs', 'category', 'label', 'source', 'createdAt'])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.dateKey is string && data.dateKey.size() == 10 && data.dateKey.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.hour is int && data.hour >= 0 && data.hour <= 23
+        && data.timestampMs is number && data.timestampMs > 0
+        && data.category is string && data.category.size() <= 16 && (data.category == 'ai-voice' || data.category == 'oled-face' || data.category == 'alarm' || data.category == 'hardware')
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 80
+        && data.source is string && data.source.size() <= 12 && (data.source == 'portal' || data.source == 'esp32' || data.source == 'voice')
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPlaylistItem(data, userId) {
+      return data.keys().hasAll(['ownerId', 'orderIndex', 'kind', 'label', 'durationSec', 'enabled', 'faceId', 'customReactionId', 'textMessage', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'orderIndex', 'kind', 'label', 'durationSec', 'enabled', 'faceId', 'customReactionId', 'textMessage', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.orderIndex is int && data.orderIndex >= 0 && data.orderIndex <= 50
+        && data.kind is string && data.kind.size() <= 16 && (data.kind == 'face' || data.kind == 'watch' || data.kind == 'weather' || data.kind == 'greeting' || data.kind == 'custom-bitmap' || data.kind == 'custom-text')
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 48
+        && data.durationSec is int && data.durationSec >= 1 && data.durationSec <= 300
+        && data.enabled is bool
+        && data.faceId is int && data.faceId >= 0 && data.faceId <= 24
+        && data.customReactionId is string && data.customReactionId.size() <= 64
+        && data.textMessage is string && data.textMessage.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // COLLECTION 1: /users/{userId} (Owner Workspace & Settings)
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserWorkspace(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserWorkspace(incoming(), userId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Update Settings, Location, Hardware & OLED State
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'mode', 'userName', 'coldThresholdC', 'hotThresholdC',
+            'autoSleepTimeoutSec', 'use24HourClock', 'wakeGreetingPrefix',
+            'city', 'country', 'latitude', 'longitude', 'altitude', 'timezone',
+            'wifiSsid', 'greenLedMode', 'oledScheme', 'animationSpeed', 'esp32Ip',
+            'cloudSyncEnabled', 'cloudBackendType', 'cloudPortalUrl', 'firebaseDbUrl',
+            'deviceId', 'firmwareVersion', 'otaAutoCheck', 'buzzerMuted',
+            'activeFaceId', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId) && isValidId(userId);
+
+      // =======================================================================
+      // COLLECTION 2: /users/{userId}/alarms/{alarmId}
+      // =======================================================================
+      match /alarms/{alarmId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(alarmId) && parentWorkspaceExists(userId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(alarmId)
+          && isValidAlarm(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(alarmId)
+          && isValidAlarm(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId)
+          && (
+            // Action: Toggle Alarm Enable State
+            incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt']) ||
+            // Action: Edit Alarm Details
+            incoming().diff(existing()).affectedKeys().hasOnly(['time', 'label', 'enabled', 'days', 'faceId', 'melody', 'updatedAt'])
+          );
+
+        allow delete: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(alarmId) && parentWorkspaceExists(userId);
+      }
+
+      // =======================================================================
+      // COLLECTION 3: /users/{userId}/reactions/{reactionId}
+      // =======================================================================
+      match /reactions/{reactionId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(reactionId) && parentWorkspaceExists(userId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(reactionId)
+          && isValidReaction(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(reactionId)
+          && isValidReaction(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId)
+          && (
+            // Action: Rename or Redraw Pixel Art
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'pixelsHex', 'updatedAt'])
+          );
+
+        allow delete: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(reactionId) && parentWorkspaceExists(userId);
+      }
+
+      // =======================================================================
+      // COLLECTION 4: /users/{userId}/interactions/{eventId} (Append-Only Audit Log)
+      // =======================================================================
+      match /interactions/{eventId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(eventId) && parentWorkspaceExists(userId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(eventId)
+          && isValidInteraction(incoming(), userId)
+          && incoming().createdAt == request.time
+          && parentWorkspaceExists(userId);
+
+        // Append-only audit trail: updates are strictly forbidden
+        allow update: if false;
+
+        allow delete: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(eventId) && parentWorkspaceExists(userId);
+      }
+
+      // =======================================================================
+      // COLLECTION 5: /users/{userId}/playlist/{itemId}
+      // =======================================================================
+      match /playlist/{itemId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(itemId) && parentWorkspaceExists(userId);
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(itemId)
+          && isValidPlaylistItem(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId);
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(itemId)
+          && isValidPlaylistItem(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && parentWorkspaceExists(userId)
+          && (
+            // Action: Update Playlist Item Settings
+            incoming().diff(existing()).affectedKeys().hasOnly(['orderIndex', 'kind', 'label', 'durationSec', 'enabled', 'faceId', 'customReactionId', 'textMessage', 'updatedAt'])
+          );
+
+        allow delete: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(itemId) && parentWorkspaceExists(userId);
+      }
+    }
+  }
+}
