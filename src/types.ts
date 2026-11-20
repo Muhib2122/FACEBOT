@@ -5,6 +5,7 @@ export type NavSection =
   | 'agent'
   | 'control'
   | 'touchpad'
+  | 'gallery'
   | 'weather'
   | 'alarms'
   | 'hardware'
@@ -164,6 +165,15 @@ export interface AgentChatMessage {
   executedBadges?: string[];
   sources?: { title: string; uri: string }[];
   error?: boolean;
+}
+
+export interface OledScreenshot {
+  id: string;
+  title: string;
+  screenKind: string;
+  oledScheme: OledColorScheme;
+  pixelsHex: string;
+  capturedAtMs: number;
 }
 
 export interface BotSettings {

@@ -193,72 +193,95 @@ Hardware Control Rules:
 - targetMode: "auto", "user", or "unchanged".
 - actionSummary: short 2-5 word summary of action taken.`;
 
-    const contents = [
-      ...history.map((h) => ({
-        role: h.role === 'model' ? 'model' : 'user',
-        parts: [{ text: h.text }],
-      })),
-      { role: 'user', parts: [{ text: message }] },
-    ];
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reply: { type: Type.STRING },
-            screenKind: {
-              type: Type.STRING,
-              enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
-            },
-            faceId: { type: Type.INTEGER },
-            oledLine1: { type: Type.STRING },
-            oledLine2: { type: Type.STRING },
-            greenLed: {
-              type: Type.STRING,
-              enum: ['unchanged', 'on', 'off', 'blink', 'auto'],
-            },
-            buzzerSound: {
-              type: Type.STRING,
-              enum: ['none', 'beep', 'wake', 'happy', 'alarm'],
-            },
-            alarmTime: { type: Type.STRING },
-            alarmLabel: { type: Type.STRING },
-            targetMode: {
-              type: Type.STRING,
-              enum: ['unchanged', 'auto', 'user'],
-            },
-            actionSummary: { type: Type.STRING },
-          },
-          required: [
-            'reply',
-            'screenKind',
-            'faceId',
-            'oledLine1',
-            'oledLine2',
-            'greenLed',
-            'buzzerSound',
-            'alarmTime',
-            'alarmLabel',
-            'targetMode',
-            'actionSummary',
-          ],
-        },
-      },
-    });
-
-    const rawText = response.text;
-    if (!rawText) {
-      res.status(502).json({ error: 'Empty response from AI Agent.' });
-      return;
+    const cleanedContents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+    for (const h of history) {
+      const t = typeof h?.text === 'string' ? h.text.trim() : '';
+      if (!t) continue;
+      const role: 'user' | 'model' = h.role === 'model' ? 'model' : 'user';
+      if (cleanedContents.length === 0 && role === 'model') continue;
+      if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === role) {
+        cleanedContents[cleanedContents.length - 1].parts[0].text += ` ${t}`;
+      } else {
+        cleanedContents.push({ role, parts: [{ text: t }] });
+      }
+    }
+    if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === 'user') {
+      cleanedContents[cleanedContents.length - 1].parts[0].text += `\n${message}`;
+    } else {
+      cleanedContents.push({ role: 'user', parts: [{ text: message }] });
     }
 
-    res.json(JSON.parse(rawText));
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        reply: { type: Type.STRING },
+        screenKind: {
+          type: Type.STRING,
+          enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
+        },
+        faceId: { type: Type.INTEGER },
+        oledLine1: { type: Type.STRING },
+        oledLine2: { type: Type.STRING },
+        greenLed: {
+          type: Type.STRING,
+          enum: ['unchanged', 'on', 'off', 'blink', 'auto'],
+        },
+        buzzerSound: {
+          type: Type.STRING,
+          enum: ['none', 'beep', 'wake', 'happy', 'alarm'],
+        },
+        alarmTime: { type: Type.STRING },
+        alarmLabel: { type: Type.STRING },
+        targetMode: {
+          type: Type.STRING,
+          enum: ['unchanged', 'auto', 'user'],
+        },
+        actionSummary: { type: Type.STRING },
+      },
+      required: [
+        'reply',
+        'screenKind',
+        'faceId',
+        'oledLine1',
+        'oledLine2',
+        'greenLed',
+        'buzzerSound',
+        'alarmTime',
+        'alarmLabel',
+        'targetMode',
+        'actionSummary',
+      ],
+    };
+
+    const runChatModel = async (model: string, minimalThinking: boolean) => {
+      const resp = await ai.models.generateContent({
+        model,
+        contents: cleanedContents,
+        config: {
+          systemInstruction,
+          maxOutputTokens: 280,
+          ...(minimalThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } } : {}),
+          responseMimeType: 'application/json',
+          responseSchema,
+        },
+      });
+      const txt = (resp.text || '')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      if (!txt) throw new Error('Empty response from AI Agent.');
+      return JSON.parse(txt);
+    };
+
+    try {
+      const parsed = await runChatModel('gemini-4-hydrogen', true);
+      res.json(parsed);
+    } catch (primaryErr) {
+      console.warn('Primary chat failed, falling back to gemini-3.1-flash-lite:', primaryErr);
+      const fallback = await runChatModel('gemini-3.1-flash-lite', false);
+      res.json(fallback);
+    }
   } catch (err) {
     console.error('AI Agent error:', err);
     const msg = err instanceof Error ? err.message : 'AI Agent request failed.';
@@ -284,15 +307,31 @@ app.post('/api/agent/search', async (req, res) => {
       return;
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: query,
-      config: {
-        systemInstruction: `You are FaceBot, ${userName}'s desktop AI agent. Answer the user's real-time web query using Google Search results ONLY in very short, simple Banglish (1-2 crisp sentences, plain English letters, no Bengali script). If you cannot find the answer, say "Sorry ${userName}, eta Google e khuje pai ni."`,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        tools: [{ googleSearch: {} }],
-      },
-    });
+    const searchInstruction = `You are FaceBot, ${userName}'s desktop AI agent. Answer the user's real-time web query using Google Search results ONLY in very short, simple Banglish (1-2 crisp sentences, plain English letters, no Bengali script). If you cannot find the answer, say "Sorry ${userName}, eta Google e khuje pai ni."`;
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: query,
+        config: {
+          systemInstruction: searchInstruction,
+          maxOutputTokens: 220,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          tools: [{ googleSearch: {} }],
+        },
+      });
+    } catch {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: query,
+        config: {
+          systemInstruction: searchInstruction,
+          maxOutputTokens: 220,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+    }
 
     const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sources = rawChunks

@@ -20,6 +20,7 @@ import {
   HardwareConfig,
   InteractionEvent,
   LocationConfig,
+  OledScreenshot,
   PlaylistItem,
 } from '../types';
 
@@ -381,5 +382,46 @@ export async function savePlaylistToFirestore(
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function saveGalleryShotToFirestore(
+  uid: string,
+  shot: OledScreenshot
+): Promise<void> {
+  const shotId = sanitizeFirestoreId(shot.id, 'shot');
+  const path = `users/${uid}/gallery/${shotId}`;
+  const safeHex = (shot.pixelsHex || '').padEnd(2048, '0').slice(0, 2048);
+  const safeScheme = (['ice-blue', 'white', 'dual-yellow-blue'] as const).includes(
+    shot.oledScheme
+  )
+    ? shot.oledScheme
+    : 'ice-blue';
+
+  try {
+    await setDoc(doc(db, 'users', uid, 'gallery', shotId), {
+      ownerId: uid,
+      title: cleanStr(shot.title, 48, 'OLED Screenshot'),
+      screenKind: cleanStr(shot.screenKind, 24, 'face'),
+      oledScheme: safeScheme,
+      pixelsHex: safeHex,
+      capturedAtMs: clampNum(shot.capturedAtMs, 1, Number.MAX_SAFE_INTEGER, Date.now()),
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function deleteGalleryShotFromFirestore(
+  uid: string,
+  shotIdRaw: string
+): Promise<void> {
+  const shotId = sanitizeFirestoreId(shotIdRaw, 'shot');
+  const path = `users/${uid}/gallery/${shotId}`;
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'gallery', shotId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
   }
 }

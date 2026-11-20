@@ -4,6 +4,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -13,6 +14,7 @@ export default async function handler(req, res) {
 
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
     const query = typeof body.query === 'string' ? body.query.trim() : '';
+    const userName = typeof body.userName === 'string' ? body.userName : 'Muhib';
     if (!query) return res.status(400).json({ error: 'Query is required.' });
 
     const ai = new GoogleGenAI({
@@ -20,16 +22,31 @@ export default async function handler(req, res) {
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
     });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: query,
-      config: {
-        systemInstruction:
-          'You are FaceBot, Muhib\'s assistant. Answer using live Google Search results in very short, simple Banglish (1-2 short sentences max). If unsure or not found, say "Sorry Muhib, eta khuje pai ni."',
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        tools: [{ googleSearch: {} }],
-      },
-    });
+    const systemInstruction = `You are FaceBot, ${userName}'s assistant. Answer using live Google Search results in very short, simple Banglish (1-2 short sentences max). If unsure or not found, say "Sorry ${userName}, eta khuje pai ni."`;
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: query,
+        config: {
+          systemInstruction,
+          maxOutputTokens: 220,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          tools: [{ googleSearch: {} }],
+        },
+      });
+    } catch {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: query,
+        config: {
+          systemInstruction,
+          maxOutputTokens: 220,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+    }
 
     const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sources = rawChunks
@@ -38,7 +55,7 @@ export default async function handler(req, res) {
       .map((c) => ({ title: c.web.title || c.web.uri, uri: c.web.uri }));
 
     return res.status(200).json({
-      reply: response.text || 'Sorry Muhib, kono info pai ni.',
+      reply: (response.text || `Sorry ${userName}, kono info pai ni.`).trim(),
       sources,
     });
   } catch (err) {

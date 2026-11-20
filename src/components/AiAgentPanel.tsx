@@ -172,10 +172,11 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   const loadingRef = useRef(loading);
   const executeActionRef = useRef(onExecuteAgentAction);
 
-  // Refs for MediaRecorder (Gemini 3.5 Transcribe)
+  // Refs for MediaRecorder (Gemini 3.5 Transcribe) & Request Timeout
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordStreamRef = useRef<MediaStream | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
+  const activeFetchAbortRef = useRef<AbortController | null>(null);
 
   speakerEnabledRef.current = speakerEnabled;
   loadingRef.current = loading;
@@ -334,25 +335,45 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       };
 
       const historyPayload = messages
-        .filter((m) => !m.error)
+        .filter((m) => !m.error && !m.id.startsWith('welcome-') && !m.id.startsWith('reset-'))
         .slice(-8)
         .map((m) => ({ role: m.role, text: m.text }));
 
       setMessages((prev) => [...prev, userMsg]);
       setInput('');
       setLoading(true);
+      loadingRef.current = true;
+
+      // 16-second client timeout so "FaceBot bhabche..." can NEVER hang forever on slow networks
+      const controller = new AbortController();
+      activeFetchAbortRef.current = controller;
+      const timeoutId = window.setTimeout(() => controller.abort(), 16000);
+
+      const parseResponseSafe = async (res: Response) => {
+        const rawText = await res.text();
+        try {
+          return JSON.parse(rawText);
+        } catch {
+          throw new Error(
+            res.status === 504
+              ? 'Server timeout (504). Abr try koro!'
+              : `Server returned status ${res.status}`
+          );
+        }
+      };
 
       try {
         if (useSearch) {
           const res = await fetch('/api/agent/search', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
             body: JSON.stringify({
               query: trimmed,
               userName: settings.userName || 'Muhib',
             }),
           });
-          const data = await res.json();
+          const data = await parseResponseSafe(res);
           if (!res.ok) {
             throw new Error(data?.error || `Search error (${res.status})`);
           }
@@ -360,7 +381,6 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           const replyText = String(data.reply || `Sorry ${settings.userName || 'Muhib'}, info pai ni.`);
           const sources = Array.isArray(data.sources) ? data.sources : [];
 
-          // Reflect search result on OLED with Thinking/Starry face + short chime
           const badges = executeActionRef.current(
             {
               reply: replyText,
@@ -394,6 +414,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           const res = await fetch('/api/agent/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
             body: JSON.stringify({
               message: trimmed,
               history: historyPayload,
@@ -419,7 +440,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             }),
           });
 
-          const data = await res.json();
+          const data = await parseResponseSafe(res);
           if (!res.ok) {
             throw new Error(data?.error || `Server responded with ${res.status}`);
           }
@@ -441,18 +462,26 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           speakReply(action.reply);
         }
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : 'Failed to reach FaceBot AI Agent.';
+        const isAbort = err instanceof Error && err.name === 'AbortError';
+        const errMsg = isAbort
+          ? 'Response time besi laglo, abr send koro.'
+          : err instanceof Error
+            ? err.message
+            : 'Failed to reach FaceBot AI Agent.';
         setMessages((prev) => [
           ...prev,
           {
             id: `e-${Date.now()}`,
             role: 'model',
-            text: `Sorry ${settings.userName || 'Muhib'}, server e connect korte parini. (${errMsg})`,
+            text: `Sorry ${settings.userName || 'Muhib'}, ektu problem holo. (${errMsg})`,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             error: true,
           },
         ]);
       } finally {
+        window.clearTimeout(timeoutId);
+        activeFetchAbortRef.current = null;
+        loadingRef.current = false;
         setLoading(false);
       }
     },
@@ -1019,9 +1048,16 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
           {loading && (
             <div className="flex items-start">
-              <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 inline-flex items-center gap-2">
+              <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 inline-flex items-center gap-3">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
                 <span>{searchMode ? 'Google e khujche...' : 'FaceBot bhabche...'}</span>
+                <button
+                  type="button"
+                  onClick={() => activeFetchAbortRef.current?.abort()}
+                  className="text-[11px] font-semibold text-red-600 hover:text-red-700 underline underline-offset-2"
+                >
+                  Cancel
+                </button>
               </div>
             </div>
           )}

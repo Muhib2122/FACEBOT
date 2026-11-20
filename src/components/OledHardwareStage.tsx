@@ -1,6 +1,8 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   BellOff,
+  Camera,
+  Check,
   Lightbulb,
   Moon,
   RotateCcw,
@@ -50,6 +52,7 @@ interface OledHardwareStageProps {
   onDismissAlarm: () => void;
   onSnoozeAlarm: () => void;
   onUnlockScreen: () => void;
+  onCaptureScreenshot: (pixels: number[], title: string, screenKind: string) => void;
 }
 
 export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
@@ -75,9 +78,11 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
   onDismissAlarm,
   onSnoozeAlarm,
   onUnlockScreen,
+  onCaptureScreenshot,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bufferRef = useRef<SSD1306Buffer>(new SSD1306Buffer());
+  const [justCaptured, setJustCaptured] = useState(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -401,6 +406,32 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
             >
               <RotateCcw className="w-3.5 h-3.5" />
               Resume Cycle
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const snapshotPixels = Array.from(bufferRef.current.pixels);
+                onCaptureScreenshot(snapshotPixels, screenTitle, activeScreen.kind);
+                setJustCaptured(true);
+                window.setTimeout(() => setJustCaptured(false), 1800);
+              }}
+              className={`col-span-2 inline-flex items-center justify-center gap-2 px-3.5 py-2.5 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap ${
+                justCaptured
+                  ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                  : 'border-slate-900 bg-slate-900 hover:bg-slate-800 text-white'
+              }`}
+            >
+              {justCaptured ? (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  Saved 128×64 Screenshot to Gallery!
+                </>
+              ) : (
+                <>
+                  <Camera className="w-3.5 h-3.5" />
+                  Screenshot to Gallery
+                </>
+              )}
             </button>
           </div>
         </div>

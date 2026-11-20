@@ -8,6 +8,7 @@ import {
   Code2,
   Cpu,
   Download,
+  Image as ImageIcon,
   LogIn,
   LogOut,
   Menu,
@@ -22,9 +23,12 @@ import { auth, db, googleProvider, handleFirestoreError, OperationType } from '.
 import {
   clearTodayInteractionsInFirestore,
   deleteAlarmFromFirestore,
+  deleteGalleryShotFromFirestore,
   deleteReactionFromFirestore,
   hex2048ToPixels,
+  pixelsToHex2048,
   saveAlarmToFirestore,
+  saveGalleryShotToFirestore,
   saveInteractionToFirestore,
   savePlaylistToFirestore,
   saveReactionToFirestore,
@@ -45,6 +49,7 @@ import {
   InteractionEvent,
   LocationConfig,
   NavSection,
+  OledScreenshot,
   PlaylistItem,
   WeatherData,
 } from './types';
@@ -61,6 +66,7 @@ import { OledHardwareStage } from './components/OledHardwareStage';
 import { AiAgentPanel } from './components/AiAgentPanel';
 import { ControlPanel } from './components/ControlPanel';
 import { TouchpadStudio } from './components/TouchpadStudio';
+import { GalleryPanel } from './components/GalleryPanel';
 import { WeatherProfilePanel } from './components/WeatherProfilePanel';
 import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
@@ -156,6 +162,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'control', label: 'OLED Display', icon: SlidersHorizontal },
       { id: 'touchpad', label: 'Touchpad Studio', icon: PenTool },
+      { id: 'gallery', label: 'Gallery', icon: ImageIcon },
       { id: 'alarms', label: 'Alarms & Buzzer', icon: Bell },
     ],
   },
@@ -293,6 +300,9 @@ export default function App() {
   const [customReactions, setCustomReactions] = useState<CustomReaction[]>(
     Array.isArray(saved?.customReactions) ? saved.customReactions : []
   );
+  const [galleryScreenshots, setGalleryScreenshots] = useState<OledScreenshot[]>(
+    Array.isArray(saved?.galleryScreenshots) ? saved.galleryScreenshots : []
+  );
 
   // Daily Interaction Analytics State
   const [interactionEvents, setInteractionEvents] = useState<InteractionEvent[]>(() =>
@@ -354,6 +364,7 @@ export default function App() {
     hardware,
     alarms,
     customReactions,
+    galleryScreenshots,
     interactionEvents,
     playlist,
     activeFaceId: activeScreen.faceId,
@@ -365,6 +376,7 @@ export default function App() {
     hardware,
     alarms,
     customReactions,
+    galleryScreenshots,
     interactionEvents,
     playlist,
     activeFaceId: activeScreen.faceId,
@@ -426,6 +438,9 @@ export default function App() {
             await saveReactionToFirestore(uid, rx);
           }
           await savePlaylistToFirestore(uid, snapLocal.playlist);
+          for (const shot of snapLocal.galleryScreenshots.slice(0, 20)) {
+            await saveGalleryShotToFirestore(uid, shot);
+          }
           const todayKey = getTodayKey();
           for (const ev of snapLocal.interactionEvents.slice(0, 25)) {
             await saveInteractionToFirestore(uid, ev, todayKey);
@@ -644,6 +659,45 @@ export default function App() {
             }
           )
         );
+
+        // 6. Live OLED Screenshot Gallery Listener
+        const galleryQ = query(
+          collection(db, 'users', uid, 'gallery'),
+          where('ownerId', '==', uid)
+        );
+        unsubs.push(
+          onSnapshot(
+            galleryQ,
+            (snap) => {
+              const loaded: OledScreenshot[] = snap.docs.map((d) => {
+                const v = d.data();
+                return {
+                  id: d.id,
+                  title: String(v.title || 'OLED Screenshot'),
+                  screenKind: String(v.screenKind || 'face'),
+                  oledScheme:
+                    v.oledScheme === 'white' || v.oledScheme === 'dual-yellow-blue'
+                      ? v.oledScheme
+                      : 'ice-blue',
+                  pixelsHex: String(v.pixelsHex || ''),
+                  capturedAtMs:
+                    typeof v.capturedAtMs === 'number'
+                      ? v.capturedAtMs
+                      : v.createdAt?.toMillis?.() ?? Date.now(),
+                };
+              });
+              loaded.sort((a, b) => b.capturedAtMs - a.capturedAtMs);
+              setGalleryScreenshots(loaded);
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/gallery`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
       } catch (err) {
         if (!cancelled) {
           setFbFatalError(err instanceof Error ? err : new Error(String(err)));
@@ -720,12 +774,13 @@ export default function App() {
           playlist,
           alarms,
           customReactions,
+          galleryScreenshots: galleryScreenshots.slice(0, 30),
         })
       );
     } catch {
       // Ignore storage quota errors
     }
-  }, [mode, settings, location, hardware, playlist, alarms, customReactions]);
+  }, [mode, settings, location, hardware, playlist, alarms, customReactions, galleryScreenshots]);
 
   // Persist daily interaction log
   useEffect(() => {
@@ -1914,6 +1969,24 @@ export default function App() {
                   setPomodoroRunning(false);
                   setActiveScreen((prev) => ({ ...prev, locked: false }));
                 }}
+                onCaptureScreenshot={(pixels, title, screenKind) => {
+                  const shot: OledScreenshot = {
+                    id: `shot-${Date.now()}`,
+                    title: title.slice(0, 48) || 'OLED Screenshot',
+                    screenKind: screenKind.slice(0, 24) || 'face',
+                    oledScheme: hardware.oledScheme,
+                    pixelsHex: pixelsToHex2048(pixels),
+                    capturedAtMs: Date.now(),
+                  };
+                  setGalleryScreenshots((prev) => [shot, ...prev].slice(0, 40));
+                  playShortClick(hardware.buzzerMuted);
+                  if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+                    saveGalleryShotToFirestore(fbUser.uid, shot).catch((err) => {
+                      setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+                    });
+                  }
+                  logInteraction('oled-face', `Captured OLED Screenshot: ${shot.title}`, 'portal');
+                }}
               />
 
               <ControlPanel
@@ -1952,6 +2025,29 @@ export default function App() {
               onDeleteReaction={handleDeleteReaction}
               onDisplayReaction={handleDisplayReaction}
               onPushLivePixels={handlePushLivePixels}
+            />
+          )}
+
+          {/* 4b. Dedicated OLED Screenshot Gallery (Firestore Backed) */}
+          {navSection === 'gallery' && (
+            <GalleryPanel
+              screenshots={galleryScreenshots}
+              isSignedIn={Boolean(fbUser && fbUser.emailVerified)}
+              onSignIn={handleGoogleSignIn}
+              onPushToOled={(shot) => {
+                const decoded = hex2048ToPixels(shot.pixelsHex);
+                handlePushLivePixels(decoded);
+                setNavSection('control');
+              }}
+              onDeleteScreenshot={(id) => {
+                setGalleryScreenshots((prev) => prev.filter((s) => s.id !== id));
+                if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+                  deleteGalleryShotFromFirestore(fbUser.uid, id).catch((err) => {
+                    setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+                  });
+                }
+              }}
+              onGoToOled={() => setNavSection('control')}
             />
           )}
 

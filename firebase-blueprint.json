@@ -358,6 +358,54 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "GalleryRecord": {
+      "title": "OLED Screenshot Gallery Item",
+      "description": "Captured 128x64 OLED display canvas screenshot stored in lossless 2048-char hex format.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "screenKind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "oledScheme": {
+          "type": "string",
+          "enum": ["ice-blue", "white", "dual-yellow-blue"]
+        },
+        "pixelsHex": {
+          "type": "string",
+          "minLength": 2048,
+          "maxLength": 2048
+        },
+        "capturedAtMs": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "title",
+        "screenKind",
+        "oledScheme",
+        "pixelsHex",
+        "capturedAtMs",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -380,6 +428,10 @@
     "/users/{userId}/playlist/{itemId}": {
       "schema": { "$ref": "#/entities/PlaylistItemRecord" },
       "description": "Owner-only User-Mode OLED display playlist items."
+    },
+    "/users/{userId}/gallery/{shotId}": {
+      "schema": { "$ref": "#/entities/GalleryRecord" },
+      "description": "Owner-only captured 128x64 OLED display screenshots."
     }
   }
 }
