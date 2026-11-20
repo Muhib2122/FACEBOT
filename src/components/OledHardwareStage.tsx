@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import {
   BellOff,
-  Hand,
+  Lightbulb,
   Moon,
   RotateCcw,
   Sun,
@@ -15,6 +15,7 @@ import {
   BotSettings,
   CustomReaction,
   FACE_DEFINITIONS,
+  GreenLedMode,
   HardwareConfig,
   LocationConfig,
   OledColorScheme,
@@ -35,22 +36,17 @@ interface OledHardwareStageProps {
   weather: WeatherData | null;
   location: LocationConfig;
   hardware: HardwareConfig;
-  currentServoAngle: number;
-  servoPowered: boolean;
-  userDetected: boolean;
   isSleeping: boolean;
   greenLedOn: boolean;
-  redLedOn: boolean;
   activeAlarm: { id: string; time: string; label: string } | null;
   customReactions: CustomReaction[];
   onChangeOledScheme: (scheme: OledColorScheme) => void;
   onChangeAnimationSpeed: (speed: AnimationSpeed) => void;
+  onChangeGreenLedMode: (mode: GreenLedMode) => void;
+  onTestBuzzer: () => void;
   onToggleMute: () => void;
   onPutToSleep: () => void;
   onWakeUp: () => void;
-  onWaveHand: () => void;
-  onDistanceChange: (cm: number) => void;
-  onUserAngleChange: (angle: number) => void;
   onDismissAlarm: () => void;
   onSnoozeAlarm: () => void;
   onUnlockScreen: () => void;
@@ -65,22 +61,17 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
   weather,
   location,
   hardware,
-  currentServoAngle,
-  servoPowered,
-  userDetected,
   isSleeping,
   greenLedOn,
-  redLedOn,
   activeAlarm,
   customReactions,
   onChangeOledScheme,
   onChangeAnimationSpeed,
+  onChangeGreenLedMode,
+  onTestBuzzer,
   onToggleMute,
   onPutToSleep,
   onWakeUp,
-  onWaveHand,
-  onDistanceChange,
-  onUserAngleChange,
   onDismissAlarm,
   onSnoozeAlarm,
   onUnlockScreen,
@@ -118,16 +109,13 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     activeAlarm,
   ]);
 
-  // Convert servo angle (0..180, center 90) to visual head pan/tilt (-22deg to +22deg)
-  const headRotationDeg = ((currentServoAngle - 90) / 90) * 22;
-
   const activeFaceDef = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
   const screenTitle = (() => {
     if (activeScreen.kind === 'alarm') return `Alarm · ${activeAlarm?.label || 'Ringing'}`;
     if (activeScreen.kind === 'watch') return 'Watch UI';
     if (activeScreen.kind === 'weather') return `Live Weather · ${location.city}`;
     if (activeScreen.kind === 'greeting') return `Greeting · ${settings.userName}`;
-    if (activeScreen.kind === 'proximity-wake') return `HC-SR04 Wake-Up · Hi ${settings.userName}!`;
+    if (activeScreen.kind === 'proximity-wake') return `Wake-Up · Hi ${settings.userName}!`;
     if (activeScreen.kind === 'custom-bitmap') {
       const cr = customReactions.find((r) => r.id === activeScreen.customReactionId);
       return `Touchpad Art · ${cr?.name || 'Custom'}`;
@@ -150,15 +138,13 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     year: 'numeric',
   });
 
-  const isNear = hardware.simulatedDistanceCm <= hardware.wakeDistanceCm;
-
   return (
     <section className="bg-white border border-slate-200 rounded-xl p-5 lg:p-6">
       {/* Top Stage Header */}
       <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100">
         <div>
           <h2 className="text-base font-semibold text-slate-900">
-            0.96" SSD1306 OLED &amp; Hardware Rig
+            0.96" SSD1306 OLED · ESP32 Minimal Rig
           </h2>
           <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
             <span>{mode === 'auto' ? 'Auto' : 'User'}</span>
@@ -239,104 +225,51 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
         </div>
       </div>
 
-      {/* Main Rig Grid: Left = Physical Bot Enclosure + Servo, Right = Interactive Hardware Controls */}
+      {/* Main Rig Grid: Left = Clean ESP32 OLED + Single Green LED, Right = Quick Controls */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 pt-5 items-center">
-        {/* Physical Mini Face Bot Housing */}
-        <div className="xl:col-span-7 flex flex-col items-center justify-center py-4 px-3 bg-slate-50 border border-slate-200/80 rounded-xl">
-          {/* Animated Head Chassis mounted on SG90 Servo */}
-          <div
-            className="transition-transform duration-200 ease-out will-change-transform"
-            style={{ transform: `rotate(${headRotationDeg.toFixed(1)}deg)` }}
-          >
-            <div className="relative bg-slate-900 rounded-2xl p-4 sm:p-5 shadow-md border border-slate-700 w-full max-w-[432px]">
-              {/* Top Hardware Bezel Row: Mounting Screws + Physical Red/Green LEDs */}
-              <div className="flex items-center justify-between mb-3 px-1">
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center gap-1.5" title="Green LED (GPIO 26)">
-                    <span
-                      className={`inline-block w-2.5 h-2.5 rounded-full transition-colors ${
-                        greenLedOn
-                          ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
-                          : 'bg-slate-700'
-                      }`}
-                    />
-                    <span className="text-[11px] font-mono text-slate-400">GRN</span>
-                  </div>
-                  <div className="flex items-center gap-1.5" title="Red LED (GPIO 27)">
-                    <span
-                      className={`inline-block w-2.5 h-2.5 rounded-full transition-colors ${
-                        redLedOn
-                          ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
-                          : 'bg-slate-700'
-                      }`}
-                    />
-                    <span className="text-[11px] font-mono text-slate-400">RED</span>
-                  </div>
-                </div>
-                <span className="text-[11px] font-mono text-slate-400 tabular-nums">
-                  128×64 I2C 0x3C
-                </span>
-              </div>
-
-              {/* SSD1306 Glass Panel */}
-              <div className="bg-[#05080F] p-2 rounded-lg border border-slate-800 overflow-hidden">
-                <canvas
-                  ref={canvasRef}
-                  width={384}
-                  height={192}
-                  className="oled-canvas w-full h-auto block rounded-xs"
-                  aria-label="0.96 inch SSD1306 OLED live display"
+        {/* Physical Minimal ESP32 OLED Housing */}
+        <div className="xl:col-span-7 flex flex-col items-center justify-center py-5 px-3 bg-slate-50 border border-slate-200/80 rounded-xl">
+          <div className="relative bg-slate-900 rounded-2xl p-4 sm:p-5 shadow-md border border-slate-700 w-full max-w-[432px]">
+            {/* Top Hardware Bezel Row: Single Green LED (GPIO 26, No Resistor) + I2C Tag */}
+            <div className="flex items-center justify-between mb-3 px-1">
+              <div className="flex items-center gap-2" title="Green LED (GPIO 26 · Direct 3.3V, No Resistor)">
+                <span
+                  className={`inline-block w-3 h-3 rounded-full transition-all duration-150 ${
+                    greenLedOn
+                      ? 'bg-emerald-400 shadow-[0_0_10px_#34d399]'
+                      : 'bg-slate-700'
+                  }`}
                 />
-              </div>
-
-              {/* Co-Mounted HC-SR04 Ultrasonic Module directly below 0.96" OLED */}
-              <div className="flex items-center justify-between mt-3 px-2 py-2 bg-slate-800/80 rounded-lg border border-slate-700/80">
-                <div className="flex items-center gap-3">
-                  <div
-                    className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${
-                      userDetected
-                        ? 'border-blue-400 bg-slate-900'
-                        : 'border-slate-500 bg-slate-950'
-                    }`}
-                    title="HC-SR04 Transmitter"
-                  >
-                    <div className="w-2.5 h-2.5 rounded-full bg-slate-600" />
-                  </div>
-                  <div className="text-[10px] font-mono text-slate-300 leading-tight">
-                    <div>HC-SR04</div>
-                    <div className={userDetected ? 'text-blue-300' : 'text-slate-500'}>
-                      {userDetected ? `${hardware.simulatedDistanceCm}cm LOCK` : 'NO OBJECT'}
-                    </div>
-                  </div>
-                  <div
-                    className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${
-                      userDetected
-                        ? 'border-blue-400 bg-slate-900'
-                        : 'border-slate-500 bg-slate-950'
-                    }`}
-                    title="HC-SR04 Receiver"
-                  >
-                    <div className="w-2.5 h-2.5 rounded-full bg-slate-600" />
-                  </div>
-                </div>
-                <span className="text-[11px] font-mono tabular-nums text-slate-300">
-                  {servoPowered
-                    ? `SERVO ON ${Math.round(currentServoAngle)}°`
-                    : 'SERVO OFF 90°'}
+                <span className="text-[11px] font-mono text-slate-300">
+                  GREEN LED (GPIO 26) · {hardware.greenLedMode.toUpperCase()}
                 </span>
               </div>
+              <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+                128×64 0x3C
+              </span>
             </div>
-          </div>
 
-          {/* SG90 Servo Pedestal Base */}
-          <div className="flex flex-col items-center -mt-0.5">
-            <div className="w-8 h-3 bg-slate-700 rounded-b-sm" />
-            <div className="w-28 h-2.5 bg-slate-800 rounded-t-md border-t border-slate-600" />
-            <div className="w-40 h-2 bg-slate-300 rounded-full mt-1" />
+            {/* SSD1306 Glass Panel */}
+            <div className="bg-[#05080F] p-2 rounded-lg border border-slate-800 overflow-hidden">
+              <canvas
+                ref={canvasRef}
+                width={384}
+                height={192}
+                className="oled-canvas w-full h-auto block rounded-xs"
+                aria-label="0.96 inch SSD1306 OLED live display"
+              />
+            </div>
+
+            {/* Bottom Pinout Strip */}
+            <div className="flex items-center justify-between mt-3 px-2 py-1.5 bg-slate-800/70 rounded-lg border border-slate-700/70 text-[10px] font-mono text-slate-400">
+              <span>OLED: SDA 21 / SCL 22</span>
+              <span>BUZZER: GPIO 14</span>
+              <span>LED: GPIO 26</span>
+            </div>
           </div>
         </div>
 
-        {/* Interactive Hardware Controls & Live Sensor Rig */}
+        {/* Interactive Minimal Hardware Controls */}
         <div className="xl:col-span-5 flex flex-col gap-4">
           {activeAlarm && (
             <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg flex flex-wrap items-center justify-between gap-3">
@@ -367,34 +300,20 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
           {/* Live Readout Strip */}
           <div className="grid grid-cols-3 divide-x divide-slate-200 border border-slate-200 rounded-lg bg-slate-50/70">
             <div className="p-3">
-              <div className="text-[11px] font-medium text-slate-500">Servo Neck</div>
-              <div className="text-base font-semibold font-mono text-slate-900 tabular-nums mt-0.5">
-                {Math.round(currentServoAngle)}°
+              <div className="text-[11px] font-medium text-slate-500">Green LED</div>
+              <div className="text-base font-semibold font-mono text-slate-900 mt-0.5">
+                {greenLedOn ? 'ON' : 'OFF'}
               </div>
-              <div className="text-[11px] text-slate-500">
-                {servoPowered
-                  ? hardware.servoManualOverride
-                    ? 'Manual ON'
-                    : userDetected && hardware.trackingEnabled
-                      ? 'Tracking ON'
-                      : 'Active ON'
-                  : 'Idle OFF (90°)'}
+              <div className="text-[11px] text-slate-500 capitalize">
+                Mode: {hardware.greenLedMode}
               </div>
             </div>
             <div className="p-3">
-              <div className="text-[11px] font-medium text-slate-500">HC-SR04</div>
-              <div className="text-base font-semibold font-mono text-slate-900 tabular-nums mt-0.5">
-                {hardware.ultrasonicEnabled ? `${hardware.simulatedDistanceCm} cm` : 'Off'}
+              <div className="text-[11px] font-medium text-slate-500">Piezo Buzzer</div>
+              <div className="text-base font-semibold text-slate-900 mt-0.5">
+                {hardware.buzzerMuted ? 'Muted' : 'Active'}
               </div>
-              <div className="text-[11px] text-slate-500">
-                {hardware.ultrasonicEnabled
-                  ? userDetected
-                    ? isNear
-                      ? 'Wake Range'
-                      : 'Tracking User'
-                    : 'No Object'
-                  : 'Disabled'}
-              </div>
+              <div className="text-[11px] text-slate-500 font-mono">GPIO 14</div>
             </div>
             <div className="p-3">
               <div className="text-[11px] font-medium text-slate-500">Bot State</div>
@@ -402,76 +321,47 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
                 {isSleeping ? 'Sleeping' : 'Awake'}
               </div>
               <div className="text-[11px] text-slate-500">
-                {hardware.buzzerMuted ? 'Buzzer Muted' : 'Audio On'}
+                {hardware.esp32Ip.trim() ? 'ESP32 Linked' : 'Simulator'}
               </div>
             </div>
           </div>
 
-          {/* Interactive HC-SR04 Proximity & User Direction Tracking Simulator */}
-          <div className="p-3.5 border border-slate-200 rounded-lg space-y-3">
-            <div>
-              <div className="flex items-center justify-between gap-2 mb-1.5">
-                <label
-                  htmlFor="hc-sr04-sim"
-                  className="text-xs font-semibold text-slate-800"
-                >
-                  HC-SR04 Distance (Wake ≤ {hardware.wakeDistanceCm}cm · Track ≤ {hardware.trackingRangeCm}cm)
-                </label>
-                <span className="text-xs font-mono text-slate-600 tabular-nums">
-                  {hardware.simulatedDistanceCm} cm
-                </span>
-              </div>
-              <input
-                id="hc-sr04-sim"
-                type="range"
-                min={4}
-                max={120}
-                value={hardware.simulatedDistanceCm}
-                disabled={!hardware.ultrasonicEnabled}
-                onChange={(e) => onDistanceChange(Number(e.target.value))}
-                className="w-full hw-slider disabled:opacity-40"
-              />
+          {/* Single Green LED (GPIO 26) Quick Switch */}
+          <div className="p-3.5 border border-slate-200 rounded-lg space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                <Lightbulb className="w-3.5 h-3.5 text-emerald-600" />
+                Green LED (GPIO 26 · No Resistor)
+              </span>
+              <span className="text-[11px] font-mono text-slate-500">
+                {greenLedOn ? 'LIT' : 'DARK'}
+              </span>
             </div>
-
-            <div className="pt-2 border-t border-slate-100">
-              <div className="flex items-center justify-between gap-2 mb-1.5">
-                <label
-                  htmlFor="hc-sr04-angle"
-                  className="text-xs font-semibold text-slate-800"
+            <div className="grid grid-cols-4 gap-1.5">
+              {(['auto', 'on', 'blink', 'off'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => onChangeGreenLedMode(m)}
+                  className={`py-1.5 text-xs font-semibold rounded-md border uppercase transition-colors ${
+                    hardware.greenLedMode === m
+                      ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                      : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                  }`}
                 >
-                  User Direction Angle (OLED follows user)
-                </label>
-                <span className="text-xs font-mono text-slate-600 tabular-nums">
-                  {hardware.simulatedUserAngle}°
-                </span>
-              </div>
-              <input
-                id="hc-sr04-angle"
-                type="range"
-                min={30}
-                max={150}
-                value={hardware.simulatedUserAngle}
-                disabled={!hardware.ultrasonicEnabled || !hardware.trackingEnabled}
-                onChange={(e) => onUserAngleChange(Number(e.target.value))}
-                className="w-full hw-slider disabled:opacity-40"
-              />
-              <div className="flex items-center justify-between text-[11px] text-slate-500 mt-1 font-mono tabular-nums">
-                <span>30° Left</span>
-                <span>90° Straight</span>
-                <span>150° Right</span>
-              </div>
+                  {m}
+                </button>
+              ))}
             </div>
           </div>
 
           {/* Quick Hardware Action Buttons */}
           <div className="grid grid-cols-2 gap-2.5">
             <button
-              onClick={onWaveHand}
-              disabled={!hardware.ultrasonicEnabled}
-              className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 rounded-lg transition-colors whitespace-nowrap"
+              onClick={onTestBuzzer}
+              className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap"
             >
-              <Hand className="w-3.5 h-3.5" />
-              Wave Hand (&lt;{hardware.wakeDistanceCm}cm)
+              <Volume2 className="w-3.5 h-3.5" />
+              Beep Buzzer
             </button>
             <button
               onClick={isSleeping ? onWakeUp : onPutToSleep}
@@ -496,12 +386,12 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
               {hardware.buzzerMuted ? (
                 <>
                   <VolumeX className="w-3.5 h-3.5 text-slate-500" />
-                  Unmute Buzzer
+                  Unmute Browser
                 </>
               ) : (
                 <>
                   <Volume2 className="w-3.5 h-3.5 text-slate-700" />
-                  Mute Buzzer
+                  Mute Browser
                 </>
               )}
             </button>
@@ -510,7 +400,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
               className="inline-flex items-center justify-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              Resume Playback
+              Resume Cycle
             </button>
           </div>
         </div>

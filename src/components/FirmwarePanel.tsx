@@ -8,10 +8,7 @@ import {
   LocationConfig,
   PlaylistItem,
 } from '../types';
-import {
-  generateArduinoMotionFirmware,
-  generateEsp32Firmware,
-} from '../utils/firmwareGenerator';
+import { generateEsp32Firmware } from '../utils/firmwareGenerator';
 
 interface FirmwarePanelProps {
   settings: BotSettings;
@@ -23,18 +20,31 @@ interface FirmwarePanelProps {
   utcOffsetSeconds?: number;
 }
 
-const ARDUINO_WIRING_ROWS = [
-  { component: 'SG90 Servo Motor (Head)', pin: 'Orange / Red / Brown', boardPin: 'D9 / 5V / GND', notes: 'Native 5V PWM — zero jitter' },
-  { component: 'HC-SR04 Ultrasonic Sensor', pin: 'TRIG / ECHO / VCC / GND', boardPin: 'D6 / D7 / 5V / GND', notes: 'Native 5V — no resistor needed' },
-  { component: 'ESP32 Sync (RX ← TX2)', pin: 'Arduino D10 (RX)', boardPin: 'ESP32 GPIO 17 (TX2)', notes: 'Direct wire' },
-  { component: 'ESP32 Sync (TX → RX2)', pin: 'Arduino D11 (TX)', boardPin: 'ESP32 GPIO 16 (RX2)', notes: 'Via 1kΩ + 2kΩ voltage divider' },
-  { component: 'Common Ground', pin: 'Arduino GND', boardPin: 'ESP32 GND', notes: 'Required for UART sync' },
-];
-
 const ESP32_WIRING_ROWS = [
-  { component: '0.96" OLED (SSD1306 I2C)', pin: 'SDA / SCL / VCC / GND', boardPin: 'GPIO 21 / 22 / 3.3V / GND', notes: 'I2C address 0x3C' },
-  { component: 'Piezo Buzzer (Alarm)', pin: 'Positive (+) / Negative (-)', boardPin: 'GPIO 14 / GND', notes: 'Supports Passive & Active' },
-  { component: 'Arduino UART2 Link', pin: 'RX2 / TX2 / GND', boardPin: 'GPIO 16 / GPIO 17 / GND', notes: '9600 baud live sync' },
+  {
+    component: '0.96" OLED (SSD1306 I2C)',
+    pin: 'SDA / SCL / VCC / GND',
+    boardPin: 'GPIO 21 / 22 / 3.3V / GND',
+    notes: '4 wires · I2C address 0x3C · Use 3.3V',
+  },
+  {
+    component: 'Piezo Buzzer (Alarm & Chime)',
+    pin: 'Positive (+) / Negative (-)',
+    boardPin: 'GPIO 14 / GND',
+    notes: '2 wires · Works with Passive & Active buzzers',
+  },
+  {
+    component: '1× Green LED (No Resistor)',
+    pin: 'Long leg (+) / Short leg (-)',
+    boardPin: 'GPIO 26 / GND',
+    notes: '2 wires · Direct 3.3V safe (Vf ~3.0–3.2V) · Mirrors onboard LED',
+  },
+  {
+    component: 'ESP32 Power & Programming',
+    pin: 'Micro-USB / USB-C',
+    boardPin: '5V USB Port',
+    notes: 'Select "ESP32 Dev Module" in Arduino IDE · Only 3 libraries needed',
+  },
 ];
 
 export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
@@ -46,13 +56,7 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
   customReactions,
   utcOffsetSeconds = 21600,
 }) => {
-  const [selectedBoard, setSelectedBoard] = useState<'arduino' | 'esp32'>('arduino');
   const [copied, setCopied] = useState(false);
-
-  const arduinoCode = useMemo(
-    () => generateArduinoMotionFirmware(hardware),
-    [hardware]
-  );
 
   const esp32Code = useMemo(
     () =>
@@ -68,93 +72,60 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
     [settings, location, hardware, alarms, playlist, customReactions, utcOffsetSeconds]
   );
 
-  const activeCode = selectedBoard === 'arduino' ? arduinoCode : esp32Code;
-  const activeWiring = selectedBoard === 'arduino' ? ARDUINO_WIRING_ROWS : ESP32_WIRING_ROWS;
-
   const handleCopy = () => {
-    navigator.clipboard?.writeText(activeCode);
+    navigator.clipboard?.writeText(esp32Code);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownload = () => {
-    const blob = new Blob([activeCode], { type: 'text/plain;charset=utf-8' });
+    const blob = new Blob([esp32Code], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     const safeUser = (settings.userName || 'Muhib').replace(/\s+/g, '');
-    a.download =
-      selectedBoard === 'arduino'
-        ? `FaceBot_Arduino_ServoSensor_${safeUser}.ino`
-        : `FaceBot_ESP32_BrainPortal_${safeUser}.ino`;
+    a.download = `FaceBot_ESP32_${safeUser}.ino`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
+  const safeApName = `FaceBot-${(settings.userName || 'Muhib').replace(/[^a-zA-Z0-9]/g, '') || 'Muhib'}`;
+
   return (
     <div className="space-y-6">
-      {/* Dual-MCU Selector */}
+      {/* Ultra-Clean Zero-Resistor ESP32 Wiring Table */}
       <div className="bg-white border border-slate-200 rounded-xl p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Cpu className="w-4 h-4 text-blue-600" />
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                Dual-MCU Architecture (Arduino Uno/Nano + ESP32)
+                Single-Board ESP32 Minimal Wiring (8 Wires Total · Zero Resistors)
               </h3>
               <p className="text-xs text-slate-500">
-                Arduino handles native 5V Servo + HC-SR04 tracking; ESP32 handles OLED + Hotspot Web Portal + Buzzer over UART2 (no LEDs)
+                ESP32 + 0.96" SSD1306 OLED + Piezo Buzzer + 1× Green LED — No Arduino, No Servo, No HC-SR04, No Resistors
               </p>
             </div>
           </div>
-
-          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-            <button
-              onClick={() => {
-                setSelectedBoard('arduino');
-                setCopied(false);
-              }}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
-                selectedBoard === 'arduino'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-slate-700 hover:text-slate-900'
-              }`}
-            >
-              1. Arduino (Servo + HC-SR04)
-            </button>
-            <button
-              onClick={() => {
-                setSelectedBoard('esp32');
-                setCopied(false);
-              }}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
-                selectedBoard === 'esp32'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-slate-700 hover:text-slate-900'
-              }`}
-            >
-              2. ESP32 (OLED + Web + Buzzer)
-            </button>
-          </div>
+          <span className="text-xs font-mono text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md">
+            Libraries: SSD1306 · GFX · ArduinoJson
+          </span>
         </div>
 
-        {/* Wiring Table for Selected Board */}
         <div className="overflow-x-auto mt-4">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="border-b border-slate-200 text-slate-500">
                 <th className="py-2.5 pr-4 font-medium">Component</th>
                 <th className="py-2.5 px-4 font-medium">Module Pin</th>
-                <th className="py-2.5 px-4 font-medium">
-                  {selectedBoard === 'arduino' ? 'Arduino / Link Pin' : 'ESP32 Pin'}
-                </th>
+                <th className="py-2.5 px-4 font-medium">ESP32 Pin</th>
                 <th className="py-2.5 pl-4 font-medium">Notes</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {activeWiring.map((row) => (
+              {ESP32_WIRING_ROWS.map((row) => (
                 <tr key={row.component} className="hover:bg-slate-50/70">
                   <td className="py-2.5 pr-4 font-semibold text-slate-900">
                     {row.component}
@@ -171,21 +142,17 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
         </div>
       </div>
 
-      {/* Live Generated .ino Sketch */}
+      {/* Live Generated ESP32 .ino Sketch */}
       <div className="bg-white border border-slate-200 rounded-xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Code2 className="w-4 h-4 text-slate-600" />
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                {selectedBoard === 'arduino'
-                  ? 'Step 1: Arduino Uno/Nano Sketch (.ino) — SG90 Servo + HC-SR04'
-                  : 'Step 2: ESP32 Sketch (.ino) — OLED + Hotspot Portal + Buzzer'}
+                ESP32 Arduino Sketch (.ino) — OLED + Buzzer + Green LED + Dual-Mode WiFi
               </h3>
               <p className="text-xs text-slate-500">
-                {selectedBoard === 'arduino'
-                  ? 'Zero external libraries needed. Smooth non-blocking servo tracking, median-filtered HC-SR04, auto idle power-off, and 9600-baud UART sync.'
-                  : `Connects to Home WiFi (${hardware.wifiSsid || 'muhib'}) + Hotspot FaceBot-${(settings.userName || 'Muhib').replace(/[^a-zA-Z0-9]/g, '')} (12345678) → http://192.168.4.1`}
+                Home WiFi (<span className="font-mono">{hardware.wifiSsid || 'muhib'}</span>) + Built-in Hotspot <span className="font-mono">{safeApName}</span> (pass: <span className="font-mono">12345678</span>) → <span className="font-mono">http://192.168.4.1</span>
               </p>
             </div>
           </div>
@@ -217,8 +184,8 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
           </div>
         </div>
 
-        <pre className="mt-4 p-4 bg-slate-950 text-slate-100 rounded-lg text-[11px] leading-relaxed font-mono overflow-x-auto max-h-[520px] overflow-y-auto">
-          <code>{activeCode}</code>
+        <pre className="mt-4 p-4 bg-slate-950 text-slate-100 rounded-lg text-[11px] leading-relaxed font-mono overflow-x-auto max-h-[540px] overflow-y-auto">
+          <code>{esp32Code}</code>
         </pre>
       </div>
     </div>

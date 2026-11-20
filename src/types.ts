@@ -1,12 +1,15 @@
 export type BotMode = 'auto' | 'user';
 
 export type NavSection =
+  | 'agent'
   | 'control'
   | 'touchpad'
   | 'weather'
   | 'alarms'
   | 'hardware'
   | 'firmware';
+
+export type GreenLedMode = 'auto' | 'on' | 'off' | 'blink';
 
 export type OledColorScheme = 'ice-blue' | 'white' | 'dual-yellow-blue';
 
@@ -110,6 +113,7 @@ export interface HardwareConfig {
   buzzerMuted: boolean;
   redLedManual: boolean | null;
   greenLedManual: boolean | null;
+  greenLedMode: GreenLedMode;
   oledScheme: OledColorScheme;
   animationSpeed: AnimationSpeed;
   esp32Ip: string;
@@ -123,6 +127,30 @@ export interface HardwareConfig {
   deviceId: string;
   firmwareVersion: string;
   otaAutoCheck: boolean;
+}
+
+export interface AgentActionResponse {
+  reply: string;
+  screenKind: 'face' | 'watch' | 'weather' | 'greeting' | 'custom-text' | 'sleep' | 'wake' | 'none';
+  faceId: number;
+  oledLine1: string;
+  oledLine2: string;
+  greenLed: 'unchanged' | 'on' | 'off' | 'blink' | 'auto';
+  buzzerSound: 'none' | 'beep' | 'wake' | 'happy' | 'alarm';
+  alarmTime: string;
+  alarmLabel: string;
+  targetMode: 'unchanged' | 'auto' | 'user';
+  actionSummary: string;
+}
+
+export interface AgentChatMessage {
+  id: string;
+  role: 'user' | 'model';
+  text: string;
+  timestamp: string;
+  actionSummary?: string;
+  executedBadges?: string[];
+  error?: boolean;
 }
 
 export interface BotSettings {

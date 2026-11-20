@@ -8,26 +8,34 @@ import {
   Menu,
   PenTool,
   SlidersHorizontal,
+  Sparkles,
   X,
 } from 'lucide-react';
 import {
   ActiveScreenState,
+  AgentActionResponse,
   AlarmItem,
   BotMode,
   BotSettings,
   CustomReaction,
   FACE_DEFINITIONS,
+  GreenLedMode,
   HardwareConfig,
   LocationConfig,
   NavSection,
   PlaylistItem,
-  ServoMotionStyle,
   WeatherData,
 } from './types';
 import { PRESET_CITIES, fetchLiveWeather } from './utils/weatherApi';
-import { playAlarmMelody, playShortClick, playWakeChime } from './utils/buzzerAudio';
+import {
+  playAlarmMelody,
+  playBuzzerTest,
+  playShortClick,
+  playWakeChime,
+} from './utils/buzzerAudio';
 import { generateEsp32Firmware } from './utils/firmwareGenerator';
 import { OledHardwareStage } from './components/OledHardwareStage';
+import { AiAgentPanel } from './components/AiAgentPanel';
 import { ControlPanel } from './components/ControlPanel';
 import { TouchpadStudio } from './components/TouchpadStudio';
 import { WeatherProfilePanel } from './components/WeatherProfilePanel';
@@ -51,10 +59,10 @@ const DEFAULT_LOCATION: LocationConfig = PRESET_CITIES[0]; // Dhaka
 const DEFAULT_HARDWARE: HardwareConfig = {
   servoManualOverride: false,
   servoAngle: 90,
-  servoAutoSync: true,
+  servoAutoSync: false,
   servoPowerOffWhenIdle: true,
-  ultrasonicEnabled: true,
-  trackingEnabled: true,
+  ultrasonicEnabled: false,
+  trackingEnabled: false,
   wakeDistanceCm: 25,
   trackingRangeCm: 60,
   simulatedDistanceCm: 75,
@@ -62,22 +70,23 @@ const DEFAULT_HARDWARE: HardwareConfig = {
   buzzerMuted: false,
   redLedManual: null,
   greenLedManual: null,
+  greenLedMode: 'auto',
   oledScheme: 'ice-blue',
   animationSpeed: 'normal',
   esp32Ip: '',
   esp32Connected: false,
   wifiSsid: 'muhib',
   wifiPassword: '12345678',
-  cloudSyncEnabled: true,
+  cloudSyncEnabled: false,
   cloudBackendType: 'vercel-api',
   cloudPortalUrl:
     typeof window !== 'undefined' && window.location.origin.startsWith('http')
       ? window.location.origin
-      : 'https://muhib-facebot.vercel.app',
+      : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '1.0.0',
-  otaAutoCheck: true,
+  firmwareVersion: '2.0.0',
+  otaAutoCheck: false,
 };
 
 const DEFAULT_PLAYLIST: PlaylistItem[] = [
@@ -102,11 +111,12 @@ const DEFAULT_ALARMS: AlarmItem[] = [
 ];
 
 const NAV_ITEMS: { id: NavSection; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+  { id: 'agent', label: 'AI Agent', icon: Sparkles },
   { id: 'control', label: 'Live Control', icon: SlidersHorizontal },
   { id: 'touchpad', label: 'OLED Touchpad', icon: PenTool },
   { id: 'weather', label: 'Weather & Profile', icon: CloudSun },
   { id: 'alarms', label: 'Alarms & Buzzer', icon: Bell },
-  { id: 'hardware', label: 'Admin & Hardware', icon: Cpu },
+  { id: 'hardware', label: 'WiFi & Hardware', icon: Cpu },
   { id: 'firmware', label: 'ESP32 Firmware', icon: Code2 },
 ];
 
@@ -120,10 +130,26 @@ function loadSavedState() {
   }
 }
 
+function pixelsToHex(pixels: number[]): string {
+  let hex = '';
+  for (let y = 0; y < 64; y++) {
+    for (let xb = 0; xb < 16; xb++) {
+      let b = 0;
+      for (let bit = 0; bit < 8; bit++) {
+        if (pixels[y * 128 + xb * 8 + bit]) {
+          b |= 1 << (7 - bit);
+        }
+      }
+      hex += b.toString(16).padStart(2, '0');
+    }
+  }
+  return hex;
+}
+
 export default function App() {
   const saved = useMemo(() => loadSavedState(), []);
 
-  const [navSection, setNavSection] = useState<NavSection>('control');
+  const [navSection, setNavSection] = useState<NavSection>('agent');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mode, setMode] = useState<BotMode>(saved?.mode ?? 'auto');
   const [settings, setSettings] = useState<BotSettings>({
@@ -137,6 +163,7 @@ export default function App() {
   const [hardware, setHardware] = useState<HardwareConfig>({
     ...DEFAULT_HARDWARE,
     ...(saved?.hardware ?? {}),
+    greenLedMode: saved?.hardware?.greenLedMode ?? 'auto',
   });
   const [playlist, setPlaylist] = useState<PlaylistItem[]>(
     Array.isArray(saved?.playlist) && saved.playlist.length > 0 ? saved.playlist : DEFAULT_PLAYLIST
@@ -158,9 +185,6 @@ export default function App() {
   const [pingStatus, setPingStatus] = useState<string | null>(null);
   const [alarmSyncMessage, setAlarmSyncMessage] = useState<string | null>(null);
   const [wifiSaveStatus, setWifiSaveStatus] = useState<string | null>(null);
-  const [cloudSyncStatus, setCloudSyncStatus] = useState<string | null>(null);
-  const alarmDismissSeqRef = useRef(0);
-  const otaTriggerSeqRef = useRef(0);
 
   const [activeScreen, setActiveScreen] = useState<ActiveScreenState>({
     kind: 'face',
@@ -172,7 +196,6 @@ export default function App() {
   const lastAlarmMinuteRef = useRef<string>('');
   const autoStepRef = useRef(0);
   const userStepRef = useRef(0);
-  const wakeTimerRef = useRef<number | null>(null);
 
   // Persist user configuration to localStorage
   useEffect(() => {
@@ -183,7 +206,7 @@ export default function App() {
           mode,
           settings,
           location,
-          hardware: { ...hardware, simulatedDistanceCm: 75 },
+          hardware,
           playlist,
           alarms,
           customReactions,
@@ -194,13 +217,27 @@ export default function App() {
     }
   }, [mode, settings, location, hardware, playlist, alarms, customReactions]);
 
-  // Send live HTTP command to real ESP32 over LAN if IP is configured
+  // Send live HTTP GET command to real ESP32 over WiFi if IP is configured
   const sendToEsp32 = useCallback(
     (path: string) => {
       const ip = hardware.esp32Ip.trim();
       if (!ip) return;
       const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
       fetch(`${base}${path}`, { mode: 'no-cors' }).catch(() => {});
+    },
+    [hardware.esp32Ip]
+  );
+
+  const postBitmapToEsp32 = useCallback(
+    (pixels: number[]) => {
+      const ip = hardware.esp32Ip.trim();
+      if (!ip) return;
+      const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
+      fetch(`${base}/api/bitmap`, {
+        method: 'POST',
+        mode: 'no-cors',
+        body: pixelsToHex(pixels),
+      }).catch(() => {});
     },
     [hardware.esp32Ip]
   );
@@ -282,12 +319,11 @@ export default function App() {
 
   // Auto Mode & User Mode Screen Sequencer
   useEffect(() => {
-    if (isSleeping || activeAlarm || activeScreen.locked || activeScreen.kind === 'proximity-wake') {
+    if (isSleeping || activeAlarm || activeScreen.locked) {
       return;
     }
 
     if (mode === 'auto') {
-      // Auto Mode sequence: alternates Watch, Weather (with cold reaction), Greeting, and rotating 25 faces
       const stepMs = 5500;
       const timer = window.setTimeout(() => {
         const step = autoStepRef.current;
@@ -298,15 +334,10 @@ export default function App() {
         if (step % 5 === 0) {
           setActiveScreen({ kind: 'watch', faceId: 0, locked: false });
         } else if (step % 5 === 1) {
-          if (isCold) {
-            setActiveScreen({ kind: 'weather', faceId: 3, locked: false });
-          } else {
-            setActiveScreen({ kind: 'weather', faceId: 0, locked: false });
-          }
+          setActiveScreen({ kind: 'weather', faceId: isCold ? 3 : 0, locked: false });
         } else if (step % 5 === 2) {
           setActiveScreen({ kind: 'greeting', faceId: 1, locked: false });
         } else {
-          // Cycle smoothly across all 25 expressions (skipping 7=Sleepy while awake)
           const awakeFaces = FACE_DEFINITIONS.filter((f) => f.id !== 7);
           const pick = awakeFaces[Math.floor(step / 2) % awakeFaces.length];
           setActiveScreen({ kind: 'face', faceId: pick.id, locked: false });
@@ -316,7 +347,7 @@ export default function App() {
       return () => window.clearTimeout(timer);
     }
 
-    // User Mode: Follow exact custom playlist durations
+    // User Mode: Follow custom playlist durations
     const enabledItems = playlist.filter((item) => item.enabled);
     if (enabledItems.length === 0) return;
 
@@ -346,177 +377,53 @@ export default function App() {
     settings.coldThresholdC,
   ]);
 
-  // Trigger Proximity Wake-Up Sequence (HC-SR04 <= wakeDistanceCm)
-  const triggerProximityWake = useCallback(() => {
-    if (!hardware.ultrasonicEnabled) return;
-    setIsSleeping(false);
-    playWakeChime(hardware.buzzerMuted);
-    const happyFace = Math.random() > 0.5 ? 1 : 4; // Super Happy or In Love
-    setActiveScreen({
-      kind: 'proximity-wake',
-      faceId: happyFace,
-      locked: false,
-    });
-    sendToEsp32(`/api/face?id=${happyFace}`);
+  // Compute Single Green LED (GPIO 26) State
+  const greenLedOn = useMemo(() => {
+    if (hardware.greenLedMode === 'on') return true;
+    if (hardware.greenLedMode === 'off') return false;
+    if (hardware.greenLedMode === 'blink') return frame % 2 === 0;
+    // Auto mode: blink during alarm, OFF during sleep, ON when awake
+    if (activeAlarm) return frame % 2 === 0;
+    return !isSleeping;
+  }, [hardware.greenLedMode, frame, activeAlarm, isSleeping]);
 
-    if (wakeTimerRef.current) window.clearTimeout(wakeTimerRef.current);
-    wakeTimerRef.current = window.setTimeout(() => {
-      setActiveScreen({ kind: 'face', faceId: 0, locked: false });
-    }, 4500);
-  }, [hardware.ultrasonicEnabled, hardware.buzzerMuted, sendToEsp32]);
+  // Hardware Action Handlers
+  const handleChangeGreenLedMode = useCallback(
+    (nextMode: GreenLedMode) => {
+      setHardware((prev) => ({ ...prev, greenLedMode: nextMode }));
+      sendToEsp32(`/api/led?green=${nextMode}`);
+    },
+    [sendToEsp32]
+  );
 
-  // Monitor simulated HC-SR04 distance changes
-  const handleDistanceChange = (cm: number) => {
-    setHardware((prev) => ({ ...prev, simulatedDistanceCm: cm }));
-    if (hardware.ultrasonicEnabled && isSleeping && cm <= hardware.wakeDistanceCm) {
-      triggerProximityWake();
-    }
-  };
-
-  const handleWaveHand = () => {
-    if (!hardware.ultrasonicEnabled) return;
-    setHardware((prev) => ({
-      ...prev,
-      simulatedDistanceCm: Math.max(8, prev.wakeDistanceCm - 8),
-    }));
-    triggerProximityWake();
-    window.setTimeout(() => {
-      setHardware((prev) => ({ ...prev, simulatedDistanceCm: 75 }));
-    }, 2400);
-  };
+  const handleTestBuzzer = useCallback(
+    (sound: 'tone' | 'happy' | 'dc' = 'tone') => {
+      if (sound === 'happy') {
+        playWakeChime(hardware.buzzerMuted);
+      } else {
+        playBuzzerTest(hardware.buzzerMuted);
+      }
+      sendToEsp32(`/api/buzzer?mode=${sound}`);
+    },
+    [hardware.buzzerMuted, sendToEsp32]
+  );
 
   const handlePutToSleep = () => {
     setActiveAlarm(null);
     setIsSleeping(true);
-    setActiveScreen({ kind: 'face', faceId: 7, locked: false });
+    setActiveScreen({ kind: 'face', faceId: 7, locked: true });
     sendToEsp32('/api/face?id=7');
   };
 
   const handleWakeUp = () => {
-    triggerProximityWake();
+    setIsSleeping(false);
+    setActiveAlarm(null);
+    playWakeChime(hardware.buzzerMuted);
+    setActiveScreen({ kind: 'face', faceId: 1, locked: false });
+    sendToEsp32('/api/face?id=1');
+    sendToEsp32('/api/buzzer?mode=happy');
   };
 
-  // Detect if user/object is currently inside HC-SR04 tracking range
-  const userDetected =
-    hardware.ultrasonicEnabled &&
-    hardware.simulatedDistanceCm <= hardware.trackingRangeCm;
-
-  // Compute Expressive SG90 Servo Head Angle (0°..180°, center 90°) + Idle Servo Power-Off
-  const { currentServoAngle, servoPowered } = useMemo(() => {
-    if (hardware.servoManualOverride) {
-      return { currentServoAngle: hardware.servoAngle, servoPowered: true };
-    }
-
-    if (!hardware.servoAutoSync) {
-      return {
-        currentServoAngle: 90,
-        servoPowered: !hardware.servoPowerOffWhenIdle,
-      };
-    }
-
-    // No object detected & idle (not alarming, not waking, not locked to an active reaction)
-    const isIdleNoObject =
-      !userDetected &&
-      !activeAlarm &&
-      activeScreen.kind !== 'proximity-wake' &&
-      (!activeScreen.locked || activeScreen.kind === 'watch' || activeScreen.kind === 'weather' || isSleeping);
-
-    if (isIdleNoObject && hardware.servoPowerOffWhenIdle) {
-      return { currentServoAngle: 90, servoPowered: false };
-    }
-
-    let style: ServoMotionStyle = 'center';
-    if (activeAlarm) {
-      style = 'angry-shake';
-    } else if (isSleeping) {
-      style = 'sleepy-droop';
-    } else if (activeScreen.kind === 'proximity-wake') {
-      style = 'happy-sway';
-    } else if (activeScreen.kind === 'custom-bitmap') {
-      const cr = customReactions.find((r) => r.id === activeScreen.customReactionId);
-      style = cr?.servoStyle ?? 'center';
-    } else if (
-      activeScreen.kind === 'weather' &&
-      weather &&
-      weather.temperature <= settings.coldThresholdC
-    ) {
-      style = 'shiver';
-    } else if (activeScreen.kind === 'face') {
-      const def = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
-      style = def?.servoStyle ?? 'center';
-    }
-
-    // Anchor head around tracked user direction when detected; otherwise 90° straight
-    const base =
-      userDetected && hardware.trackingEnabled ? hardware.simulatedUserAngle : 90;
-    const clampAngle = (a: number) => Math.max(15, Math.min(165, a));
-
-    let targetAngle = base;
-    switch (style) {
-      case 'happy-sway':
-        targetAngle = clampAngle(frame % 4 < 2 ? base - 20 : base + 20);
-        break;
-      case 'surprised-tilt':
-        targetAngle = clampAngle(base + 24);
-        break;
-      case 'angry-shake':
-        targetAngle = clampAngle(frame % 2 === 0 ? base - 18 : base + 18);
-        break;
-      case 'sleepy-droop':
-        targetAngle = clampAngle(base + 16);
-        break;
-      case 'shiver':
-        targetAngle = clampAngle(frame % 2 === 0 ? base - 6 : base + 6);
-        break;
-      case 'look-around': {
-        const offsets = [-24, 0, 24];
-        targetAngle = clampAngle(base + offsets[Math.floor(frame / 3) % 3]);
-        break;
-      }
-      case 'center':
-      default:
-        targetAngle = base;
-        break;
-    }
-
-    const activeMotion = style !== 'center' || userDetected;
-    return {
-      currentServoAngle: targetAngle,
-      servoPowered: activeMotion || !hardware.servoPowerOffWhenIdle,
-    };
-  }, [
-    hardware.servoManualOverride,
-    hardware.servoAutoSync,
-    hardware.servoAngle,
-    hardware.servoPowerOffWhenIdle,
-    hardware.trackingEnabled,
-    hardware.simulatedUserAngle,
-    userDetected,
-    activeAlarm,
-    isSleeping,
-    activeScreen,
-    customReactions,
-    weather,
-    settings.coldThresholdC,
-    frame,
-  ]);
-
-  // Compute Red & Green Physical LED States
-  const isColdAlert = weather !== null && weather.temperature <= settings.coldThresholdC;
-  const greenLedOn =
-    hardware.greenLedManual !== null
-      ? hardware.greenLedManual
-      : !activeAlarm && !isSleeping;
-  const redLedOn =
-    hardware.redLedManual !== null
-      ? hardware.redLedManual
-      : Boolean(activeAlarm)
-        ? frame % 2 === 0
-        : (activeScreen.kind === 'face' &&
-            (activeScreen.faceId === 5 || activeScreen.faceId === 19)) ||
-          (activeScreen.kind === 'weather' && isColdAlert);
-
-  // Handlers
   const handleSelectFace = (faceId: number) => {
     playShortClick(hardware.buzzerMuted);
     setActiveAlarm(null);
@@ -556,7 +463,7 @@ export default function App() {
       name: 'Live Touchpad',
       createdAt: Date.now(),
       pixels,
-      servoStyle: 'happy-sway',
+      servoStyle: 'center',
     };
     setCustomReactions((prev) => {
       const withoutTemp = prev.filter((r) => r.id !== tempId);
@@ -571,6 +478,7 @@ export default function App() {
       locked: true,
     });
     playShortClick(hardware.buzzerMuted);
+    postBitmapToEsp32(pixels);
   };
 
   const handleSaveReaction = (reaction: CustomReaction) => {
@@ -590,6 +498,7 @@ export default function App() {
       locked: true,
     });
     playShortClick(hardware.buzzerMuted);
+    postBitmapToEsp32(reaction.pixels);
   };
 
   const handleDeleteReaction = (id: string) => {
@@ -627,18 +536,21 @@ export default function App() {
     [sendToEsp32]
   );
 
-  const handleAddAlarm = (alarm: AlarmItem) => {
-    setAlarms((prev) => {
-      const next = [alarm, ...prev];
-      next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
-      return next;
-    });
-    setAlarmSyncMessage(
-      hardware.esp32Ip.trim()
-        ? `Alarm ${alarm.time} saved and synced to ESP32.`
-        : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
-    );
-  };
+  const handleAddAlarm = useCallback(
+    (alarm: AlarmItem) => {
+      setAlarms((prev) => {
+        const next = [alarm, ...prev];
+        next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
+        return next;
+      });
+      setAlarmSyncMessage(
+        hardware.esp32Ip.trim()
+          ? `Alarm ${alarm.time} saved and synced to ESP32.`
+          : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
+      );
+    },
+    [hardware.esp32Ip, syncSingleAlarmSlot]
+  );
 
   const handleToggleAlarm = (id: string) => {
     setAlarms((prev) => {
@@ -646,6 +558,12 @@ export default function App() {
       next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
       return next;
     });
+  };
+
+  const handleDismissAlarm = () => {
+    setActiveAlarm(null);
+    setActiveScreen({ kind: 'face', faceId: 0, locked: false });
+    sendToEsp32('/api/alarm/dismiss');
   };
 
   const handleDeleteAlarm = (id: string) => {
@@ -670,13 +588,6 @@ export default function App() {
     });
     const slot = Math.max(0, alarms.findIndex((a) => a.id === alarm.id));
     sendToEsp32(`/api/alarm/test?slot=${slot}`);
-  };
-
-  const handleDismissAlarm = () => {
-    alarmDismissSeqRef.current += 1;
-    setActiveAlarm(null);
-    setActiveScreen({ kind: 'face', faceId: 0, locked: false });
-    sendToEsp32('/api/alarm/dismiss');
   };
 
   const handleSnoozeAlarm = () => {
@@ -704,133 +615,126 @@ export default function App() {
     setAlarmSyncMessage(
       hardware.esp32Ip.trim()
         ? `Dispatched ${Math.min(alarms.length, 8)} alarm(s) to ${hardware.esp32Ip.trim()}.`
-        : 'Add your ESP32 local IP in Hardware & Servo to push alarms live over WiFi.'
+        : 'Add your ESP32 IP in WiFi & Hardware to push alarms live over WiFi.'
     );
   };
 
-  const handleUpdateHardware = (patch: Partial<HardwareConfig>) => {
-    setHardware((prev) => {
-      const next = { ...prev, ...patch };
-      if (patch.servoAngle !== undefined) {
-        sendToEsp32(`/api/servo?angle=${patch.servoAngle}`);
-      }
-      if (patch.servoManualOverride !== undefined) {
-        sendToEsp32(`/api/servo?auto=${patch.servoManualOverride ? 0 : 1}`);
-      }
-      if (patch.servoPowerOffWhenIdle !== undefined) {
-        sendToEsp32(`/api/servo?idleoff=${patch.servoPowerOffWhenIdle ? 1 : 0}`);
-      }
-      if (patch.ultrasonicEnabled !== undefined) {
-        sendToEsp32(`/api/sensor?ultrasonic=${patch.ultrasonicEnabled ? 1 : 0}`);
-      }
-      if (patch.trackingEnabled !== undefined) {
-        sendToEsp32(`/api/sensor?tracking=${patch.trackingEnabled ? 1 : 0}`);
-      }
-      return next;
-    });
-  };
+  // Execute structured hardware & OLED actions returned by the Portal AI Agent
+  const handleExecuteAgentAction = useCallback(
+    (action: AgentActionResponse): string[] => {
+      const badges: string[] = [];
+      const clampedFace = Math.max(0, Math.min(24, Number(action.faceId) || 0));
+      const faceDef = FACE_DEFINITIONS.find((f) => f.id === clampedFace);
 
-  const buildCloudPayload = useCallback(() => {
-    return {
-      deviceId: hardware.deviceId || 'muhib-bot-1',
-      mode,
-      screen: activeScreen.kind === 'custom-text' ? 'text' : activeScreen.kind,
-      faceId: activeScreen.faceId,
-      textLine1: activeScreen.textLine1 || '',
-      textLine2: activeScreen.textLine2 || '',
-      userName: settings.userName || 'Muhib',
-      city: location.city,
-      manualServo: hardware.servoManualOverride,
-      servoAngle: hardware.servoAngle,
-      ultrasonicOn: hardware.ultrasonicEnabled,
-      trackingOn: hardware.trackingEnabled,
-      servoIdleOff: hardware.servoPowerOffWhenIdle,
-      alarms: alarms.slice(0, 8).map((a) => {
-        const [hh, mm] = a.time.split(':').map(Number);
-        return {
-          hour: hh || 7,
-          min: mm || 0,
-          on: a.enabled,
-          face: a.faceId,
-          melody: a.melody === 'gentle' ? 1 : a.melody === 'urgent' ? 2 : 0,
-          label: a.label,
-        };
-      }),
-      alarmDismissSeq: alarmDismissSeqRef.current,
-      otaTriggerSeq: otaTriggerSeqRef.current,
-      updatedAt: Date.now(),
-    };
-  }, [hardware, mode, activeScreen, settings.userName, location.city, alarms]);
+      if (action.targetMode === 'auto' || action.targetMode === 'user') {
+        setMode(action.targetMode);
+        sendToEsp32(`/api/mode?mode=${action.targetMode}`);
+        badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
+      }
 
-  const pushStateToCloud = useCallback(
-    async (silent = false) => {
-      if (!hardware.cloudSyncEnabled && silent) return;
-      const payload = buildCloudPayload();
-      const isFirebase =
-        hardware.cloudBackendType === 'firebase-rtdb' &&
-        hardware.firebaseDbUrl.trim().length > 8;
-      const base = (hardware.cloudPortalUrl || window.location.origin).replace(/\/$/, '');
-      const targetUrl = isFirebase
-        ? hardware.firebaseDbUrl.trim()
-        : `${base}/api/bot-state?device=${encodeURIComponent(hardware.deviceId || 'muhib-bot-1')}`;
-
-      try {
-        const res = await fetch(targetUrl, {
-          method: isFirebase ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+      if (action.screenKind === 'sleep') {
+        setActiveAlarm(null);
+        setIsSleeping(true);
+        setActiveScreen({ kind: 'face', faceId: 7, locked: true });
+        sendToEsp32('/api/face?id=7');
+        badges.push('OLED: Sleep Mode');
+      } else if (action.screenKind === 'wake') {
+        setActiveAlarm(null);
+        setIsSleeping(false);
+        setActiveScreen({ kind: 'face', faceId: clampedFace || 1, locked: true });
+        sendToEsp32(`/api/face?id=${clampedFace || 1}`);
+        badges.push('OLED: Awake');
+      } else if (action.screenKind === 'custom-text' && (action.oledLine1 || action.oledLine2)) {
+        const l1 = (action.oledLine1 || '').slice(0, 18);
+        const l2 = (action.oledLine2 || '').slice(0, 9);
+        setActiveAlarm(null);
+        setIsSleeping(false);
+        setActiveScreen({
+          kind: 'custom-text',
+          faceId: clampedFace,
+          textLine1: l1,
+          textLine2: l2,
+          locked: true,
         });
-        if (!silent) {
-          if (res.ok) {
-            setCloudSyncStatus(
-              `Synced live state to ${isFirebase ? 'Firebase RTDB' : 'Vercel Cloud API'} (${new Date().toLocaleTimeString()}). ESP32 pulls it within 2.5s.`
-            );
-          } else {
-            setCloudSyncStatus(
-              'Cloud API responded with an error. Deploy this repo to Vercel (or paste a Firebase RTDB URL) for live cloud sync.'
-            );
-          }
-        }
-      } catch {
-        if (!silent) {
-          setCloudSyncStatus(
-            'Cloud endpoint is ready once deployed to Vercel (or paste a Firebase RTDB .json URL above).'
-          );
-        }
+        sendToEsp32(
+          `/api/screen?kind=text&l1=${encodeURIComponent(l1)}&l2=${encodeURIComponent(l2)}`
+        );
+        badges.push(`OLED Text: "${l1}${l2 ? ' / ' + l2 : ''}"`);
+      } else if (
+        action.screenKind === 'watch' ||
+        action.screenKind === 'weather' ||
+        action.screenKind === 'greeting'
+      ) {
+        setActiveAlarm(null);
+        setIsSleeping(false);
+        setActiveScreen({ kind: action.screenKind, faceId: clampedFace, locked: true });
+        sendToEsp32(`/api/screen?kind=${action.screenKind}`);
+        badges.push(`OLED: ${action.screenKind.toUpperCase()}`);
+      } else if (action.screenKind === 'face') {
+        setActiveAlarm(null);
+        setIsSleeping(clampedFace === 7);
+        setActiveScreen({ kind: 'face', faceId: clampedFace, locked: true });
+        sendToEsp32(`/api/face?id=${clampedFace}`);
+        badges.push(`Face: ${faceDef?.name || `#${clampedFace + 1}`}`);
       }
+
+      if (
+        action.greenLed === 'on' ||
+        action.greenLed === 'off' ||
+        action.greenLed === 'blink' ||
+        action.greenLed === 'auto'
+      ) {
+        handleChangeGreenLedMode(action.greenLed);
+        badges.push(`Green LED: ${action.greenLed.toUpperCase()}`);
+      }
+
+      if (action.buzzerSound && action.buzzerSound !== 'none') {
+        if (action.buzzerSound === 'wake' || action.buzzerSound === 'happy') {
+          playWakeChime(hardware.buzzerMuted);
+          sendToEsp32('/api/buzzer?mode=happy');
+        } else if (action.buzzerSound === 'alarm') {
+          playAlarmMelody('classic', hardware.buzzerMuted);
+          sendToEsp32('/api/buzzer?mode=alarm');
+        } else {
+          playBuzzerTest(hardware.buzzerMuted);
+          sendToEsp32('/api/buzzer?mode=tone');
+        }
+        badges.push(`Buzzer: ${action.buzzerSound}`);
+      }
+
+      if (action.alarmTime && /^\d{2}:\d{2}$/.test(action.alarmTime.trim())) {
+        const cleanTime = action.alarmTime.trim();
+        const cleanLabel = (action.alarmLabel || 'AI Agent Alarm').slice(0, 18);
+        const newAlarm: AlarmItem = {
+          id: `al-ai-${Date.now()}`,
+          time: cleanTime,
+          label: cleanLabel,
+          enabled: true,
+          days: [0, 1, 2, 3, 4, 5, 6],
+          faceId: clampedFace || 1,
+          melody: 'classic',
+        };
+        handleAddAlarm(newAlarm);
+        badges.push(`Alarm: ${cleanTime} (${cleanLabel})`);
+      }
+
+      if (hardware.esp32Ip.trim()) {
+        badges.push('Sent to ESP32');
+      }
+
+      return badges;
     },
-    [hardware.cloudSyncEnabled, hardware.cloudBackendType, hardware.firebaseDbUrl, hardware.cloudPortalUrl, hardware.deviceId, buildCloudPayload]
+    [
+      hardware.buzzerMuted,
+      hardware.esp32Ip,
+      handleAddAlarm,
+      handleChangeGreenLedMode,
+      sendToEsp32,
+    ]
   );
 
-  // Auto-sync live state changes to Cloud Portal when Cloud Sync is enabled
-  useEffect(() => {
-    if (!hardware.cloudSyncEnabled) return;
-    const t = window.setTimeout(() => {
-      pushStateToCloud(true);
-    }, 350);
-    return () => window.clearTimeout(t);
-  }, [
-    hardware.cloudSyncEnabled,
-    mode,
-    activeScreen.kind,
-    activeScreen.faceId,
-    activeScreen.textLine1,
-    activeScreen.textLine2,
-    hardware.servoManualOverride,
-    hardware.servoAngle,
-    hardware.ultrasonicEnabled,
-    hardware.trackingEnabled,
-    hardware.servoPowerOffWhenIdle,
-    alarms,
-    pushStateToCloud,
-  ]);
-
-  const handleTriggerOtaUpdate = async () => {
-    otaTriggerSeqRef.current += 1;
-    await pushStateToCloud(false);
-    setCloudSyncStatus(
-      `OTA update signal (#${otaTriggerSeqRef.current}) queued. Your ESP32 will check ${hardware.cloudPortalUrl.replace(/\/$/, '')}/ota/version.json and self-flash if a newer version exists.`
-    );
+  const handleUpdateHardware = (patch: Partial<HardwareConfig>) => {
+    setHardware((prev) => ({ ...prev, ...patch }));
   };
 
   const handleSaveWifiCredentials = (ssid: string, password: string) => {
@@ -852,14 +756,14 @@ export default function App() {
   const handlePingEsp32 = async () => {
     const ip = hardware.esp32Ip.trim();
     if (!ip) {
-      setPingStatus('Enter your ESP32 local IP address first (e.g. http://192.168.1.50).');
+      setPingStatus('Enter your ESP32 IP first (e.g. http://192.168.4.1 or http://192.168.1.50).');
       return;
     }
     setPingStatus('Sending test command to ESP32...');
     try {
       const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
       await fetch(`${base}/api/face?id=${activeScreen.faceId}`, { mode: 'no-cors' });
-      setPingStatus(`Command dispatched to ${base}. Ensure your browser and ESP32 share the same WiFi.`);
+      setPingStatus(`Command dispatched to ${base}. Ensure your browser and ESP32 share the same WiFi/Hotspot.`);
     } catch {
       setPingStatus('Could not reach ESP32 IP. Verify WiFi connection and IP address.');
     }
@@ -879,7 +783,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `ESP32_MiniFaceBot_${(settings.userName || 'Muhib').replace(/\s+/g, '')}.ino`;
+    a.download = `FaceBot_ESP32_${(settings.userName || 'Muhib').replace(/\s+/g, '')}.ino`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -894,7 +798,7 @@ export default function App() {
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white border-r border-slate-200 sticky top-0 h-screen">
         <div className="h-16 px-6 flex items-center border-b border-slate-200">
           <span className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
-            FaceBot Portal
+            FaceBot AI Portal
           </span>
         </div>
 
@@ -927,7 +831,7 @@ export default function App() {
             {weather ? ` · ${Math.round(weather.temperature)}°C` : ''}
           </div>
           <div>
-            {mode === 'auto' ? 'Auto Mode' : 'User Mode'} · 25 Faces
+            OLED · Buzzer · 1× Green LED
           </div>
         </div>
       </aside>
@@ -941,7 +845,7 @@ export default function App() {
           />
           <div className="relative w-64 max-w-[80vw] bg-white h-full flex flex-col border-r border-slate-200 z-10">
             <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200">
-              <span className="text-base font-bold text-slate-900">FaceBot Portal</span>
+              <span className="text-base font-bold text-slate-900">FaceBot AI Portal</span>
               <button
                 onClick={() => setMobileMenuOpen(false)}
                 className="p-2 text-slate-500 hover:text-slate-900"
@@ -979,7 +883,6 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Bar Contract: Breadcrumb on left + 1 Primary Action on right */}
         <header className="h-16 bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 sticky top-0 z-30">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -1009,7 +912,7 @@ export default function App() {
 
         {/* Scrollable Workspace */}
         <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-[1280px] w-full mx-auto space-y-6">
-          {/* Persistent Live 0.96" OLED & Hardware Rig */}
+          {/* Persistent Live 0.96" OLED + Green LED + Buzzer Stage */}
           <OledHardwareStage
             mode={mode}
             activeScreen={activeScreen}
@@ -1019,28 +922,21 @@ export default function App() {
             weather={weather}
             location={location}
             hardware={hardware}
-            currentServoAngle={currentServoAngle}
-            servoPowered={servoPowered}
-            userDetected={userDetected}
             isSleeping={isSleeping}
             greenLedOn={greenLedOn}
-            redLedOn={redLedOn}
             activeAlarm={activeAlarm}
             customReactions={customReactions}
             onChangeOledScheme={(scheme) => handleUpdateHardware({ oledScheme: scheme })}
             onChangeAnimationSpeed={(animationSpeed) =>
               handleUpdateHardware({ animationSpeed })
             }
+            onChangeGreenLedMode={handleChangeGreenLedMode}
+            onTestBuzzer={() => handleTestBuzzer('tone')}
             onToggleMute={() =>
               handleUpdateHardware({ buzzerMuted: !hardware.buzzerMuted })
             }
             onPutToSleep={handlePutToSleep}
             onWakeUp={handleWakeUp}
-            onWaveHand={handleWaveHand}
-            onDistanceChange={handleDistanceChange}
-            onUserAngleChange={(simulatedUserAngle) =>
-              setHardware((prev) => ({ ...prev, simulatedUserAngle }))
-            }
             onDismissAlarm={handleDismissAlarm}
             onSnoozeAlarm={handleSnoozeAlarm}
             onUnlockScreen={() => {
@@ -1051,6 +947,22 @@ export default function App() {
           />
 
           {/* Active Section Panel */}
+          {navSection === 'agent' && (
+            <AiAgentPanel
+              settings={settings}
+              location={location}
+              weather={weather}
+              now={now}
+              mode={mode}
+              isSleeping={isSleeping}
+              greenLedMode={hardware.greenLedMode}
+              activeScreen={activeScreen}
+              alarmCount={alarms.length}
+              esp32Ip={hardware.esp32Ip}
+              onExecuteAgentAction={handleExecuteAgentAction}
+            />
+          )}
+
           {navSection === 'control' && (
             <ControlPanel
               mode={mode}
@@ -1129,17 +1041,13 @@ export default function App() {
           {navSection === 'hardware' && (
             <HardwarePanel
               hardware={hardware}
-              currentServoAngle={currentServoAngle}
-              servoPowered={servoPowered}
-              userDetected={userDetected}
               onUpdateHardware={handleUpdateHardware}
+              onChangeGreenLedMode={handleChangeGreenLedMode}
+              onTestBuzzer={handleTestBuzzer}
               onSaveWifiCredentials={handleSaveWifiCredentials}
               wifiSaveStatus={wifiSaveStatus}
               onPingEsp32={handlePingEsp32}
               pingStatus={pingStatus}
-              onPushCloudState={() => pushStateToCloud(false)}
-              onTriggerOtaUpdate={handleTriggerOtaUpdate}
-              cloudSyncStatus={cloudSyncStatus}
             />
           )}
 

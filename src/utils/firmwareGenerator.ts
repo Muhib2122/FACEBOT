@@ -25,361 +25,7 @@ export function pixelsToCppProgmem(pixels: number[], varName = 'customBitmap'): 
 }
 
 // =========================================================================
-// 1. ARDUINO UNO / NANO SKETCH (Dedicated 5V SG90 Servo + HC-SR04 Controller)
-// =========================================================================
-export function generateArduinoMotionFirmware(hardware: HardwareConfig): string {
-  return `/*
- * =========================================================================
- * FaceBot — ARDUINO UNO / NANO Motion & Proximity Co-Processor
- * Handles: SG90 Servo Head (5V PWM) + HC-SR04 Ultrasonic Tracking (5V Native)
- * Syncs live with ESP32 over UART (9600 baud)
- * =========================================================================
- * ZERO external libraries needed! (Uses built-in Servo.h & SoftwareSerial.h)
- *
- * Arduino Pinout Wiring (5V Native — Rock Solid!):
- *   - SG90 Servo Motor  : Signal (Orange) -> Pin D9, VCC (Red) -> 5V, GND (Brown) -> GND
- *   - HC-SR04 Sensor    : TRIG -> Pin D6, ECHO -> Pin D7, VCC -> 5V, GND -> GND
- *   - ESP32 UART Sync   : Arduino D10 (RX) <- ESP32 GPIO 17 (TX2) [Direct Wire]
- *                         Arduino D11 (TX) -> ESP32 GPIO 16 (RX2) [Via 1k/2k Voltage Divider]
- *                         Arduino GND      <-> ESP32 GND          [MUST connect Common GND!]
- */
-
-#include <Servo.h>
-#include <SoftwareSerial.h>
-
-// -------- Pin Definitions --------
-#define PIN_SERVO   9
-#define PIN_TRIG    6
-#define PIN_ECHO    7
-#define PIN_ESP_RX  10   // Connects to ESP32 TX2 (GPIO 17)
-#define PIN_ESP_TX  11   // Connects to ESP32 RX2 (GPIO 16 via 1k/2k divider)
-
-Servo headServo;
-SoftwareSerial espLink(PIN_ESP_RX, PIN_ESP_TX);
-
-// -------- Tuning Parameters --------
-const int WAKE_DIST_CM   = ${hardware.wakeDistanceCm};
-const int TRACK_RANGE_CM = ${hardware.trackingRangeCm};
-
-// -------- Runtime State --------
-bool ultrasonicOn     = ${hardware.ultrasonicEnabled ? 'true' : 'false'};
-bool trackingEnabled  = ${hardware.trackingEnabled ? 'true' : 'false'};
-bool servoOffWhenIdle = ${hardware.servoPowerOffWhenIdle ? 'true' : 'false'};
-bool manualServo      = false;
-bool servoAttached    = false;
-bool objectLocked     = false;
-
-int  currentAngle     = 90;
-int  targetAngle      = 90;
-int  trackedUserAngle = 90;
-int  activeFaceId     = 0;
-int  animTick         = 0;
-float lastDistCm      = 999.0;
-
-unsigned long lastServoStepMs  = 0;
-unsigned long lastServoMoveMs  = 0;
-unsigned long lastSensorMs     = 0;
-unsigned long lastObjectSeenMs = 0;
-unsigned long lastWakeSentMs   = 0;
-unsigned long lastAnimMs       = 0;
-unsigned long lastTelemetryMs  = 0;
-unsigned long lastSweepMs      = 0;
-
-String rxBuf = "";
-
-// -------- Smooth Non-Blocking Servo Engine --------
-void attachServoIfNeeded() {
-  if (!servoAttached) {
-    headServo.attach(PIN_SERVO, 500, 2400);
-    headServo.write(currentAngle);
-    servoAttached = true;
-  }
-}
-
-void setTargetAngle(int deg) {
-  deg = constrain(deg, 20, 160);
-  if (deg != targetAngle || !servoAttached) {
-    targetAngle = deg;
-    attachServoIfNeeded();
-    lastServoMoveMs = millis();
-  }
-}
-
-void stepServoSmooth() {
-  if (!servoAttached) return;
-  if (millis() - lastServoStepMs < 15) return;
-  lastServoStepMs = millis();
-
-  if (currentAngle < targetAngle) {
-    currentAngle = min(currentAngle + 2, targetAngle);
-    headServo.write(currentAngle);
-    lastServoMoveMs = millis();
-  } else if (currentAngle > targetAngle) {
-    currentAngle = max(currentAngle - 2, targetAngle);
-    headServo.write(currentAngle);
-    lastServoMoveMs = millis();
-  }
-}
-
-void parkAndDetachIfIdle() {
-  if (manualServo) return;
-  if (targetAngle != 90 || currentAngle != 90) {
-    setTargetAngle(90);
-    return;
-  }
-  if (servoOffWhenIdle && servoAttached && (millis() - lastServoMoveMs > 450)) {
-    headServo.detach();
-    servoAttached = false;
-  }
-}
-
-bool isExpressiveFace(int f) {
-  return (f == 1 || f == 4 || f == 5 || f == 6 || f == 7 || f == 9 || f == 12 || f == 19 || f == 24);
-}
-
-// -------- Native 5V HC-SR04 Reader (60ms+ Datasheet Spacing + Stuck-Echo Auto-Reset) --------
-unsigned long lastEchoUs = 0;
-float distHist[3] = { 999.0, 999.0, 999.0 };
-int   distHistIdx = 0;
-
-float pingOnceCm() {
-  // Auto-unstick cheap HC-SR04 clones if ECHO latches HIGH
-  if (digitalRead(PIN_ECHO) == HIGH) {
-    pinMode(PIN_ECHO, OUTPUT);
-    digitalWrite(PIN_ECHO, LOW);
-    delayMicroseconds(200);
-    pinMode(PIN_ECHO, INPUT);
-    delay(2);
-  }
-  digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(4);
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-
-  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 38000UL);
-  lastEchoUs = dur;
-  if (dur == 0) return 999.0;
-  float cm = (dur * 0.0343f) / 2.0f;
-  if (cm < 2.0f || cm > 400.0f) return 999.0;
-  return cm;
-}
-
-float readSmoothedDistCm() {
-  float d = pingOnceCm();
-  distHist[distHistIdx] = d;
-  distHistIdx = (distHistIdx + 1) % 3;
-  float a = distHist[0], b = distHist[1], c = distHist[2];
-  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-  return c;
-}
-
-// -------- Smart User Tracking + Proximity Wake-Up --------
-void updateUltrasonicAndTracking() {
-  // Datasheet requires >= 60ms between pings; 100ms keeps echo crystal-clean
-  if (millis() - lastSensorMs < 100) return;
-  lastSensorMs = millis();
-
-  lastDistCm = readSmoothedDistCm();
-
-  if (!ultrasonicOn) {
-    digitalWrite(LED_BUILTIN, LOW);
-    return;
-  }
-
-  // User detected within tracking range!
-  if (lastDistCm > 2.0f && lastDistCm <= (float)TRACK_RANGE_CM) {
-    bool justArrived = !objectLocked;
-    objectLocked = true;
-    trackedUserAngle = currentAngle;
-    lastObjectSeenMs = millis();
-    digitalWrite(LED_BUILTIN, HIGH);
-
-    // Send instant WAKE / GREETING event to ESP32 when user enters wake range (25cm)
-    if (lastDistCm <= (float)WAKE_DIST_CM && (justArrived || (millis() - lastWakeSentMs > 10000UL))) {
-      lastWakeSentMs = millis();
-      espLink.print("W:");
-      espLink.println((int)lastDistCm);
-      Serial.print("WAKE sent to ESP32! Dist=");
-      Serial.println(lastDistCm);
-    }
-    return;
-  }
-
-  digitalWrite(LED_BUILTIN, LOW);
-
-  // User moved slightly left/right while locked -> actively scan to keep OLED facing user!
-  if (trackingEnabled && !manualServo && objectLocked &&
-      (millis() - lastObjectSeenMs < 3500UL) && (millis() - lastSweepMs > 300UL)) {
-    lastSweepMs = millis();
-    int offsets[4] = { -20, 20, -40, 40 };
-    for (int i = 0; i < 4; i++) {
-      int cand = constrain(trackedUserAngle + offsets[i], 30, 150);
-      attachServoIfNeeded();
-      headServo.write(cand);
-      currentAngle = cand;
-      targetAngle = cand;
-      delay(150);
-      float d = pingOnceCm();
-      if (d > 2.0f && d <= (float)TRACK_RANGE_CM) {
-        trackedUserAngle = cand;
-        lastDistCm = d;
-        lastObjectSeenMs = millis();
-        digitalWrite(LED_BUILTIN, HIGH);
-        return;
-      }
-    }
-  }
-
-  // No object found for 4 seconds -> center straight (90 deg) and power Servo OFF
-  if (millis() - lastObjectSeenMs > 4000UL) {
-    objectLocked = false;
-    trackedUserAngle = 90;
-    if (!manualServo && !isExpressiveFace(activeFaceId)) {
-      parkAndDetachIfIdle();
-    }
-  }
-}
-
-// -------- Face-Synced Expressive Head Motion --------
-void updateFaceMotion() {
-  if (manualServo) return;
-  if (millis() - lastAnimMs < 280) return;
-  lastAnimMs = millis();
-  animTick++;
-
-  int base = objectLocked ? trackedUserAngle : 90;
-
-  if (activeFaceId == 1 || activeFaceId == 4 || activeFaceId == 12) {
-    // Happy / Love / Starry: joyful left-right wiggle
-    setTargetAngle((animTick % 2 == 0) ? base - 20 : base + 20);
-  } else if (activeFaceId == 5 || activeFaceId == 19) {
-    // Angry / Shout / Alarm: rapid "No" head shake
-    setTargetAngle((animTick % 2 == 0) ? base - 18 : base + 18);
-  } else if (activeFaceId == 6) {
-    // Surprised: sudden tilt
-    setTargetAngle(base + 24);
-  } else if (activeFaceId == 7 || activeFaceId == 9) {
-    // Sleepy / Sad: slight tilt (then parks if no user)
-    if (objectLocked) setTargetAngle(base + 14);
-    else parkAndDetachIfIdle();
-  } else if (activeFaceId == 24) {
-    // Look Around
-    int off[3] = { -26, 0, 26 };
-    setTargetAngle(base + off[(animTick / 2) % 3]);
-  } else if (objectLocked) {
-    setTargetAngle(trackedUserAngle);
-  } else {
-    parkAndDetachIfIdle();
-  }
-}
-
-// -------- Receive Commands from ESP32 Web Portal --------
-void handleEspCommand(String cmd) {
-  cmd.trim();
-  if (cmd.length() < 2) return;
-
-  Serial.println("ESP32 -> Arduino: " + cmd);
-
-  if (cmd.startsWith("A:")) {
-    manualServo = true;
-    setTargetAngle(cmd.substring(2).toInt());
-  } else if (cmd.startsWith("T:")) {
-    manualServo = true;
-    attachServoIfNeeded();
-    headServo.write(45);  delay(350);
-    headServo.write(135); delay(420);
-    headServo.write(90);  delay(300);
-    currentAngle = 90;
-    targetAngle = 90;
-    lastServoMoveMs = millis();
-  } else if (cmd.startsWith("F:")) {
-    activeFaceId = constrain(cmd.substring(2).toInt(), 0, 24);
-    manualServo = false;
-  } else if (cmd == "M:AUTO") {
-    manualServo = false;
-  } else if (cmd.startsWith("S:")) {
-    ultrasonicOn = (cmd.substring(2).toInt() == 1);
-    trackingEnabled = ultrasonicOn;
-  } else if (cmd.startsWith("I:")) {
-    servoOffWhenIdle = (cmd.substring(2).toInt() == 1);
-  }
-}
-
-void pollEspSerial() {
-  while (espLink.available()) {
-    char c = (char)espLink.read();
-    if (c == '\\n' || c == '\\r') {
-      if (rxBuf.length() > 0) {
-        handleEspCommand(rxBuf);
-        rxBuf = "";
-      }
-    } else if (rxBuf.length() < 32) {
-      rxBuf += c;
-    }
-  }
-}
-
-// -------- Send Live Telemetry to ESP32 (every 350ms) --------
-void sendTelemetryToEsp() {
-  if (millis() - lastTelemetryMs < 350) return;
-  lastTelemetryMs = millis();
-
-  // Format: D:<dist_cm>,<locked>,<angle>,<servoOn>
-  espLink.print("D:");
-  espLink.print((int)round(lastDistCm));
-  espLink.print(",");
-  espLink.print(objectLocked ? 1 : 0);
-  espLink.print(",");
-  espLink.print(currentAngle);
-  espLink.print(",");
-  espLink.println(servoAttached ? 1 : 0);
-
-  // Also print to Arduino Serial Monitor (115200 baud) for easy hardware verification
-  Serial.print("HC-SR04: ");
-  if (lastDistCm > 400) {
-    Serial.print("No Object (echo="); Serial.print(lastEchoUs); Serial.print("us)");
-  } else {
-    Serial.print(lastDistCm, 1); Serial.print(" cm");
-  }
-  Serial.print(" | Locked: "); Serial.print(objectLocked ? "YES" : "NO");
-  Serial.print(" | Servo: "); Serial.print(currentAngle);
-  Serial.println(servoAttached ? " deg (ON)" : " deg (IDLE OFF)");
-}
-
-void setup() {
-  Serial.begin(115200);
-  espLink.begin(9600);
-
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  // Boot Self-Test: Smooth Servo Wave (65 -> 115 -> 90) proves Servo wiring immediately!
-  attachServoIfNeeded();
-  headServo.write(65);  delay(300);
-  headServo.write(115); delay(350);
-  headServo.write(90);  delay(300);
-  currentAngle = 90;
-  targetAngle = 90;
-  lastServoMoveMs = millis();
-
-  Serial.println("FaceBot Arduino Co-Processor Ready (Servo D9, HC-SR04 D6/D7, ESP32 D10/D11)");
-}
-
-void loop() {
-  pollEspSerial();
-  stepServoSmooth();
-  updateUltrasonicAndTracking();
-  updateFaceMotion();
-  sendTelemetryToEsp();
-}
-`;
-}
-
-// =========================================================================
-// 2. ESP32 SKETCH (OLED + Dual-Mode Hotspot Portal + LEDs + Buzzer + UART2)
+// SINGLE-BOARD ESP32 SKETCH (OLED + Piezo Buzzer + 1x Green LED, Zero Resistors!)
 // =========================================================================
 export function generateEsp32Firmware(
   settings: BotSettings,
@@ -414,29 +60,29 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * FaceBot — ESP32 Main Brain (Dual-Mode Hotspot Portal + OLED + Buzzer)
+ * FaceBot — Single-Board ESP32 Firmware (Minimal Zero-Resistor Edition)
+ * Hardware: ESP32 + 0.96" SSD1306 OLED + Piezo Buzzer + 1x Green LED
  * Generated for: ${safeUser} (${location.city}, ${location.country})
- * Works with: Arduino Uno/Nano Co-Processor over Hardware Serial2 (GPIO 16/17)
  * =========================================================================
- * HOW TO CONNECT (Zero Hassle!):
- *   1. ESP32 connects to Home WiFi ("${safeSsid}" / "${safePass}") for live Weather & Time.
- *   2. AT THE SAME TIME, ESP32 broadcasts its own WiFi Hotspot:
+ * HOW TO CONNECT:
+ *   1. ESP32 connects to Home WiFi ("${safeSsid}" / "${safePass}") for live Weather & NTP Time.
+ *   2. AT THE SAME TIME, ESP32 creates its own Hotspot:
  *        Hotspot Name : ${safeApName}
  *        Password     : 12345678
- *   3. Connect your Phone/PC to "${safeApName}" and open:
+ *   3. Connect phone/PC to "${safeApName}" and open:
  *        http://192.168.4.1
+ *   4. Or paste ESP32's Home WiFi IP into the FaceBot AI Agent Web Portal for live AI control!
  *
- * Required Arduino Libraries (ONLY 3 — No ESP32Servo needed!):
+ * Required Arduino Libraries (ONLY 3):
  *   1. Adafruit SSD1306
  *   2. Adafruit GFX Library
  *   3. ArduinoJson (v7+)
  *
- * ESP32 Pinout Wiring (No external LEDs):
+ * Ultra-Clean ESP32 Pinout Wiring (NO Arduino, NO Servo, NO HC-SR04, ZERO Resistors!):
  *   - 0.96" SSD1306 OLED (I2C): SDA -> GPIO 21, SCL -> GPIO 22, VCC -> 3.3V, GND -> GND
  *   - Piezo Buzzer            : (+) -> GPIO 14, (-) -> GND
- *   - Arduino UART2 Sync      : ESP32 GPIO 16 (RX2) <- Arduino D11 (TX) [via 1k/2k divider]
- *                               ESP32 GPIO 17 (TX2) -> Arduino D10 (RX) [direct wire]
- *                               ESP32 GND           <-> Arduino GND     [Common GND]
+ *   - 1x Green LED (Direct)   : Long leg (+) -> GPIO 26, Short leg (-) -> GND
+ *     (ESP32 3.3V GPIO matches standard 3.0V-3.2V Green LED forward voltage safely!)
  */
 
 #include <WiFi.h>
@@ -466,13 +112,13 @@ long   utcOffsetSec   = ${utcOffsetSeconds};
 float  coldThresholdC = ${settings.coldThresholdC.toFixed(1)};
 float  hotThresholdC  = ${settings.hotThresholdC.toFixed(1)};
 
-// -------- ESP32 Hardware Pins --------
+// -------- ESP32 Hardware Pins (Zero Resistors!) --------
 #define SCREEN_WIDTH    128
 #define SCREEN_HEIGHT    64
 #define OLED_RESET       -1
-#define PIN_BUZZER       14
-#define PIN_ARDUINO_RX   16   // ESP32 RX2 <- Arduino D11 (TX)
-#define PIN_ARDUINO_TX   17   // ESP32 TX2 -> Arduino D10 (RX)
+#define PIN_BUZZER       14   // Piezo Buzzer (+) -> GPIO 14, (-) -> GND
+#define PIN_LED_GREEN    26   // Green LED (+) -> GPIO 26, (-) -> GND (no resistor)
+#define PIN_LED_ONBOARD   2   // Built-in ESP32 blue status LED mirror
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
@@ -494,27 +140,19 @@ bool      alarmRinging     = false;
 int       ringingAlarmIdx  = -1;
 int       lastTriggeredMin = -1;
 
-// -------- Bot State & Arduino Telemetry Cache --------
-String botMode            = "auto"; // "auto" or "user"
-String activeScreen       = "face"; // "face", "watch", "weather", "greeting", "text", "bitmap"
-String customLine1        = "Hi ${safeUser}!";
-String customLine2        = "";
-int    currentFace        = 0;
-int    lastSentFaceToArd  = -1;
-int    frameCount         = 0;
-bool   screenLocked       = false;
-bool   isSleeping         = false;
-bool   buzzerActiveMode   = false; // false = Passive melody, true = Active DC HIGH
+// -------- Bot Runtime State --------
+String botMode          = "auto"; // "auto" or "user"
+String activeScreen     = "face"; // "face", "watch", "weather", "greeting", "text", "bitmap"
+String customLine1      = "Hi ${safeUser}!";
+String customLine2      = "";
+String greenLedMode     = "auto"; // "auto", "on", "off", "blink"
+int    currentFace      = 0;
+int    frameCount       = 0;
+bool   screenLocked     = false;
+bool   isSleeping       = false;
+bool   buzzerActiveMode = false; // false = Passive melody, true = Active DC HIGH
 
-// Live Telemetry received from Arduino Uno/Nano over Serial2
-float  ardDistCm          = 999.0;
-bool   ardObjectLocked    = false;
-int    ardServoAngle      = 90;
-bool   ardServoOn         = false;
-unsigned long lastArdPacketMs = 0;
-String ardRxBuf           = "";
-
-// Screen durations (seconds) customizable via Built-in Web Portal
+// Screen durations (seconds)
 int watchDurSec   = ${watchDur};
 int weatherDurSec = ${weatherDur};
 int faceDurSec    = ${faceDur};
@@ -528,11 +166,11 @@ float  liveWindKmh    = 6.0;
 String liveCondition  = "Clear";
 unsigned long lastWeatherFetch = 0;
 
-// Custom 128x64 Touchpad Bitmap (RAM so phone touchpad updates live!)
+// Custom 128x64 Touchpad Bitmap
 ${customBitmapBlock}
 
 // =========================================================================
-// BUILT-IN MOBILE WEB PORTAL (Served directly at http://192.168.4.1)
+// BUILT-IN MOBILE WEB PORTAL (Served at http://192.168.4.1 & Home WiFi IP)
 // =========================================================================
 const char PORTAL_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -540,7 +178,7 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<title>FaceBot Portal</title>
+<title>FaceBot ESP32 Portal</title>
 <style>
   *{box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}
   body{margin:0;background:#0f172a;color:#f1f5f9;padding:12px 12px 48px}
@@ -559,49 +197,40 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
   .grid button{padding:8px 6px;font-size:11px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;text-align:center}
   .grid button:active{background:#2563eb;border-color:#2563eb}
   .lbl{font-size:11px;color:#94a3b8;margin:6px 0 4px;display:block}
-  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:10px;color:#38bdf8;font-family:monospace;line-height:1.5}
+  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:10px;color:#34d399;font-family:monospace;line-height:1.5}
   canvas{width:100%;max-width:384px;aspect-ratio:2/1;background:#020617;border:2px solid #38bdf8;border-radius:8px;touch-action:none;display:block;margin:8px auto}
   .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:12px;display:none;z-index:99}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>FaceBot Dual-MCU Portal</h1>
+  <h1>FaceBot ESP32 Local Portal</h1>
   <div class="sub" id="statusLine">Connected to Hotspot (192.168.4.1)</div>
 
-  <!-- Live Hardware Controls: Arduino Servo + HC-SR04 & ESP32 LEDs + Buzzer -->
+  <!-- Green LED (GPIO 26) & Piezo Buzzer (GPIO 14) -->
   <div class="card">
-    <h2>Hardware Control &amp; Live Arduino Sensor</h2>
-    <div class="stat" id="hwStat">Arduino Link: Checking...</div>
+    <h2>Green LED (GPIO 26) &amp; Piezo Buzzer (GPIO 14)</h2>
+    <div class="stat" id="hwStat">Green LED: AUTO | Buzzer: PASSIVE</div>
 
-    <span class="lbl">Arduino SG90 Servo Head (Pin D9): <b id="angLbl">90</b>&deg;</span>
-    <input id="angSlider" type="range" min="20" max="160" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
-    <div class="row" style="margin-top:8px">
-      <button class="sec" onclick="setAng(45)">Left 45&deg;</button>
-      <button class="sec" onclick="setAng(90)">Center 90&deg;</button>
-      <button class="sec" onclick="setAng(135)">Right 135&deg;</button>
-      <button class="ok" onclick="cmd('/api/servo?test=1','Servo Sweeping!')">Sweep Test</button>
-      <button class="sec" onclick="cmd('/api/servo?auto=1','Auto Head Sync ON')">Auto Sync</button>
-      <button class="sec" onclick="cmd('/api/servo?idleoff=1','Idle Servo OFF enabled')">Idle Off ON</button>
-      <button class="sec" onclick="cmd('/api/servo?idleoff=0','Idle Servo OFF disabled')">Idle Off OFF</button>
+    <span class="lbl">Single Green LED (Direct GPIO 26, No Resistor)</span>
+    <div class="row" style="margin-bottom:10px">
+      <button class="ok" onclick="cmd('/api/led?green=on','Green LED ON')">LED ON</button>
+      <button class="sec" onclick="cmd('/api/led?green=off','Green LED OFF')">LED OFF</button>
+      <button onclick="cmd('/api/led?green=blink','Green LED Blinking')">LED Blink</button>
+      <button class="sec" onclick="cmd('/api/led?green=auto','Green LED Auto')">LED Auto</button>
     </div>
 
-    <span class="lbl" style="margin-top:10px">Arduino HC-SR04 Ultrasonic (D6 / D7)</span>
+    <span class="lbl">Piezo Buzzer (GPIO 14)</span>
     <div class="row">
-      <button class="ok" onclick="cmd('/api/sensor?ultrasonic=1','HC-SR04 + Tracking ON')">Sensor + Track ON</button>
-      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
-    </div>
-
-    <span class="lbl" style="margin-top:10px">ESP32 Piezo Buzzer (GPIO 14)</span>
-    <div class="row">
-      <button onclick="cmd('/api/buzzer?mode=tone','Passive Melody Beep')">Beep Melody</button>
-      <button class="sec" onclick="cmd('/api/buzzer?mode=dc','Active DC Beep')">Beep DC (Active)</button>
-      <button class="sec" onclick="cmd('/api/buzzer?type=passive','Set Passive Buzzer')">Use Passive</button>
-      <button class="sec" onclick="cmd('/api/buzzer?type=active','Set Active Buzzer')">Use Active</button>
+      <button onclick="cmd('/api/buzzer?mode=tone','Melody Beep!')">Beep Melody</button>
+      <button class="ok" onclick="cmd('/api/buzzer?mode=happy','Happy Chime!')">Happy Chime</button>
+      <button class="sec" onclick="cmd('/api/buzzer?mode=dc','Active DC Beep')">DC Beep</button>
+      <button class="sec" onclick="cmd('/api/buzzer?type=passive','Passive Mode')">Passive</button>
+      <button class="sec" onclick="cmd('/api/buzzer?type=active','Active Mode')">Active</button>
     </div>
   </div>
 
-  <!-- Mode & Quick Screens -->
+  <!-- Mode & OLED Screens -->
   <div class="card">
     <h2>Mode &amp; OLED Screens</h2>
     <div class="row" style="margin-bottom:8px">
@@ -703,11 +332,6 @@ function toast(m){
 function cmd(url,msg){
   fetch(url).then(()=>{toast(msg||'Done');pollStatus(false);}).catch(()=>toast('Check WiFi connection'));
 }
-function setAng(a){
-  document.getElementById('angSlider').value=a;
-  document.getElementById('angLbl').textContent=a;
-  cmd('/api/servo?angle='+a,'Servo '+a+' deg');
-}
 function sendText(){
   const l1=encodeURIComponent(document.getElementById('txt1').value);
   const l2=encodeURIComponent(document.getElementById('txt2').value);
@@ -776,10 +400,8 @@ function pollStatus(fillInputs){
   fetch('/api/status').then(r=>r.json()).then(d=>{
     document.getElementById('statusLine').textContent=
       'Home WiFi: '+(d.wifi?'Connected ('+d.staIp+')':'Offline')+' · Temp: '+d.temp+'C · Mode: '+d.mode;
-    const distTxt = d.dist > 400 ? 'No Object' : (d.dist.toFixed(0)+' cm'+(d.locked?' [LOCKED]':''));
     document.getElementById('hwStat').textContent=
-      'Arduino: '+(d.ardOk?'ONLINE':'WAITING')+' | HC-SR04: '+distTxt+
-      ' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | Buzzer: '+d.buz;
+      'Green LED: '+d.led.toUpperCase()+' | Buzzer: '+d.buz+' | Screen: '+d.screen;
     if(fillInputs){
       document.getElementById('uName').value=d.user;
       document.getElementById('uCity').value=d.city;
@@ -788,13 +410,34 @@ function pollStatus(fillInputs){
   }).catch(()=>{});
 }
 pollStatus(true);
-setInterval(()=>pollStatus(false), 1000);
+setInterval(()=>pollStatus(false), 1500);
 </script>
 </body>
 </html>
 )rawliteral";
 
-// -------- High-Reliability Buzzer Driver (Supports Passive & Active Buzzers!) --------
+// -------- Single Green LED (GPIO 26, No Resistor) Controller --------
+void updateGreenLed() {
+  bool ledOn = false;
+  if (greenLedMode == "on") {
+    ledOn = true;
+  } else if (greenLedMode == "off") {
+    ledOn = false;
+  } else if (greenLedMode == "blink") {
+    ledOn = ((millis() / 320UL) % 2 == 0);
+  } else {
+    // Auto: blink fast during alarm, OFF when sleeping, ON when awake
+    if (alarmRinging) {
+      ledOn = ((millis() / 180UL) % 2 == 0);
+    } else {
+      ledOn = !isSleeping;
+    }
+  }
+  digitalWrite(PIN_LED_GREEN, ledOn ? HIGH : LOW);
+  digitalWrite(PIN_LED_ONBOARD, ledOn ? HIGH : LOW);
+}
+
+// -------- High-Reliability Piezo Buzzer Driver (Passive & Active Supported!) --------
 void playToneSafe(int freqHz, int durationMs, bool forceDc = false) {
   if (forceDc || buzzerActiveMode || freqHz <= 0) {
     digitalWrite(PIN_BUZZER, HIGH);
@@ -824,22 +467,11 @@ void stopBuzzer() {
   digitalWrite(PIN_BUZZER, LOW);
 }
 
-void playWakeSound() {
+void playHappyChime() {
   playToneSafe(523, 85); delay(25);
   playToneSafe(659, 85); delay(25);
-  playToneSafe(784, 120);
-}
-
-// -------- Hardware Serial2 Bridge to Arduino Uno/Nano --------
-void sendToArduino(const String& cmd) {
-  Serial2.println(cmd);
-}
-
-void syncFaceToArduino(int faceId) {
-  if (faceId != lastSentFaceToArd) {
-    lastSentFaceToArd = faceId;
-    sendToArduino("F:" + String(faceId));
-  }
+  playToneSafe(784, 120); delay(20);
+  playToneSafe(1046, 150);
 }
 
 // -------- Helper Drawing Functions --------
@@ -943,7 +575,7 @@ void drawFace(int type, int frame) {
       display.print("Zzz");
       break;
 
-    case 8: // 9. Cool / Thug Life
+    case 8: // 9. Cool Shades
       display.fillRect(20, 18 + bob, 38, 16, SSD1306_WHITE);
       display.fillRect(70, 18 + bob, 38, 16, SSD1306_WHITE);
       display.drawLine(58, 22 + bob, 70, 22 + bob, SSD1306_WHITE);
@@ -952,7 +584,7 @@ void drawFace(int type, int frame) {
       display.drawLine(54, 50, 74, 46, SSD1306_WHITE);
       break;
 
-    case 9: // 10. Sad / Puppy Eyes
+    case 9: // 10. Sad Puppy
       display.fillRoundRect(26, 22, 28, 22, 6, SSD1306_WHITE);
       display.fillRoundRect(74, 22, 28, 22, 6, SSD1306_WHITE);
       display.fillTriangle(24, 18, 44, 18, 24, 28, SSD1306_BLACK);
@@ -969,7 +601,7 @@ void drawFace(int type, int frame) {
       display.drawRoundRect(52, 46, 24, 10, 4, SSD1306_WHITE);
       break;
 
-    case 11: // 12. Dizzy / Confused
+    case 11: // 12. Dizzy
       {
         int r = (frame % 2 == 0) ? 10 : 7;
         display.drawCircle(40, 26, 12, SSD1306_WHITE);
@@ -982,27 +614,27 @@ void drawFace(int type, int frame) {
       }
       break;
 
-    case 12: // 13. Starry Eyed / Excited
+    case 12: // 13. Starry Eyed
       drawStar(40, 26, 10 + (frame % 3));
       drawStar(88, 26, 10 + (frame % 3));
       display.fillCircle(64, 48, 8, SSD1306_WHITE);
       display.fillRect(54, 39, 20, 9, SSD1306_BLACK);
       break;
 
-    case 13: // 14. Skeptical / Suspicious
+    case 13: // 14. Skeptical
       display.fillRect(26, 24, 28, 10, SSD1306_WHITE);
       display.fillRoundRect(74, 16, 28, 26, 6, SSD1306_WHITE);
       display.drawLine(52, 50, 76, 48, SSD1306_WHITE);
       break;
 
-    case 14: // 15. Cheeky / Tongue Out
+    case 14: // 15. Cheeky Tongue
       display.fillRoundRect(26, 16, 28, 26, 8, SSD1306_WHITE);
       display.fillRoundRect(74, 16, 28, 26, 8, SSD1306_WHITE);
       display.drawLine(48, 46, 80, 46, SSD1306_WHITE);
       display.fillRoundRect(60, 46, 12, 10 + (frame % 2) * 2, 4, SSD1306_WHITE);
       break;
 
-    case 15: // 16. Kawaii Cat Face
+    case 15: // 16. Kawaii Cat
       display.fillCircle(40, 26 + bob, 11, SSD1306_WHITE);
       display.fillCircle(36, 22 + bob, 3, SSD1306_BLACK);
       display.fillCircle(88, 26 + bob, 11, SSD1306_WHITE);
@@ -1012,7 +644,7 @@ void drawFace(int type, int frame) {
       display.fillRect(50, 40, 28, 8, SSD1306_BLACK);
       break;
 
-    case 16: // 17. Dead / Knocked Out
+    case 16: // 17. Knocked Out
       display.drawLine(30, 18, 50, 36, SSD1306_WHITE);
       display.drawLine(50, 18, 30, 36, SSD1306_WHITE);
       display.drawLine(78, 18, 98, 36, SSD1306_WHITE);
@@ -1028,7 +660,7 @@ void drawFace(int type, int frame) {
       display.drawCircle(68, 50, 4, SSD1306_WHITE);
       break;
 
-    case 18: // 19. Shy / Blushing
+    case 18: // 19. Shy Blushing
       display.fillCircle(40, 26, 10, SSD1306_WHITE);
       display.fillCircle(88, 26, 10, SSD1306_WHITE);
       display.drawLine(22, 40, 26, 44, SSD1306_WHITE);
@@ -1045,13 +677,13 @@ void drawFace(int type, int frame) {
       display.fillRoundRect(48, 42, 32, 16, 6, SSD1306_WHITE);
       break;
 
-    case 20: // 21. Cyclops / Alien
+    case 20: // 21. Cyclops Alien
       display.drawCircle(64, 26, 18, SSD1306_WHITE);
       display.fillCircle(64 + ((frame % 3) - 1) * 4, 26, 7, SSD1306_WHITE);
       display.drawLine(50, 52, 78, 52, SSD1306_WHITE);
       break;
 
-    case 21: // 22. Money / Rich Eyes
+    case 21: // 22. Money Eyes
       display.setTextSize(3);
       display.setTextColor(SSD1306_WHITE);
       display.setCursor(32, 16 + bob);
@@ -1073,7 +705,7 @@ void drawFace(int type, int frame) {
       }
       break;
 
-    case 23: // 24. Smug / Proud
+    case 23: // 24. Smug Proud
       display.fillRoundRect(26, 22, 28, 16, 4, SSD1306_WHITE);
       display.fillRoundRect(74, 22, 28, 16, 4, SSD1306_WHITE);
       display.drawLine(52, 48, 66, 50, SSD1306_WHITE);
@@ -1094,7 +726,7 @@ void drawFace(int type, int frame) {
   display.display();
 }
 
-// -------- Watch, Weather, Greeting, Text, Wake & Alarm Screens --------
+// -------- Watch, Weather, Greeting, Text & Alarm Screens --------
 void drawWatchOled() {
   struct tm t;
   display.clearDisplay();
@@ -1210,143 +842,226 @@ void drawAlarmOled(int idx, int frame) {
   display.display();
 }
 
-void showWakeGreeting() {
-  isSleeping = false;
-  screenLocked = false;
-  syncFaceToArduino(1); // Tell Arduino to do Happy head wiggle!
-  playWakeSound();
-  for (int i = 0; i < 6; i++) {
-    drawFace((i % 2 == 0) ? 1 : 4, i);
-    server.handleClient();
-    delay(200);
-  }
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(14, 24);
-  display.print("Hi " + userName + "!");
-  display.display();
-  for (int k = 0; k < 15; k++) {
-    server.handleClient();
-    delay(100);
-  }
-}
-
-// -------- Parse Live Telemetry & Wake Events from Arduino over Serial2 --------
-void handleArduinoLine(String line) {
-  line.trim();
-  if (line.length() < 2) return;
-  lastArdPacketMs = millis();
-
-  if (line.startsWith("W:")) {
-    // Arduino HC-SR04 detected user within 25cm!
-    ardDistCm = line.substring(2).toFloat();
-    ardObjectLocked = true;
-    showWakeGreeting();
-  } else if (line.startsWith("D:")) {
-    // D:<dist>,<locked>,<angle>,<servoOn>
-    int c1 = line.indexOf(',');
-    int c2 = line.indexOf(',', c1 + 1);
-    int c3 = line.indexOf(',', c2 + 1);
-    if (c1 > 0 && c2 > c1 && c3 > c2) {
-      ardDistCm       = line.substring(2, c1).toFloat();
-      ardObjectLocked = (line.substring(c1 + 1, c2).toInt() == 1);
-      ardServoAngle   = line.substring(c2 + 1, c3).toInt();
-      ardServoOn      = (line.substring(c3 + 1).toInt() == 1);
-    }
-  }
-}
-
-void pollArduinoSerial() {
-  while (Serial2.available()) {
-    char c = (char)Serial2.read();
-    if (c == '\\n' || c == '\\r') {
-      if (ardRxBuf.length() > 0) {
-        handleArduinoLine(ardRxBuf);
-        ardRxBuf = "";
-      }
-    } else if (ardRxBuf.length() < 48) {
-      ardRxBuf += c;
-    }
-  }
-}
-
-void playAlarmBeepTick(int melody, int frame) {
-  if (melody == 1) {
-    int notes[3] = {523, 659, 784};
-    playToneSafe(notes[frame % 3], 110);
-  } else if (melody == 2) {
-    playToneSafe((frame % 2 == 0) ? 2200 : 1400, 100);
-  } else {
-    playToneSafe((frame % 4 == 3) ? 2093 : 1760, 110);
-  }
-}
-
-void checkScheduledAlarms() {
-  if (alarmRinging) return;
-  struct tm t;
-  if (!getLocalTime(&t)) return;
-  int currentMinKey = t.tm_hour * 60 + t.tm_min;
-  if (currentMinKey == lastTriggeredMin || t.tm_sec > 3) return;
-
-  for (int i = 0; i < alarmCount; i++) {
-    if (alarms[i].enabled && alarms[i].hour == t.tm_hour && alarms[i].minute == t.tm_min) {
-      lastTriggeredMin = currentMinKey;
-      alarmRinging = true;
-      ringingAlarmIdx = i;
-      isSleeping = false;
-      syncFaceToArduino(19);
-      break;
-    }
-  }
-}
-
-void fetchWeatherFromOpenMeteo() {
+// -------- Live Weather Fetch (Open-Meteo over Home WiFi) --------
+void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   String url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(locLat, 4) +
                "&longitude=" + String(locLon, 4) +
-               "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code";
+               "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto";
   http.begin(url);
+  http.setTimeout(5000);
   int code = http.GET();
   if (code == 200) {
     JsonDocument doc;
     if (!deserializeJson(doc, http.getString())) {
-      liveTempC    = doc["current"]["temperature_2m"] | 24.0;
-      liveHumidity = doc["current"]["relative_humidity_2m"] | 60;
-      liveWindKmh  = doc["current"]["wind_speed_10m"] | 5.0;
+      liveTempC    = doc["current"]["temperature_2m"] | liveTempC;
+      liveHumidity = doc["current"]["relative_humidity_2m"] | liveHumidity;
+      liveWindKmh  = doc["current"]["wind_speed_10m"] | liveWindKmh;
+      int wcode    = doc["current"]["weather_code"] | 0;
+      if (wcode == 0) liveCondition = "Clear Sky";
+      else if (wcode <= 3) liveCondition = "Partly Cloudy";
+      else if (wcode >= 51 && wcode <= 82) liveCondition = "Rainy";
+      else if (wcode >= 95) liveCondition = "Thunderstorm";
+      else liveCondition = "Cloudy";
     }
   }
   http.end();
 }
 
-// -------- Built-In Web Portal + REST API Routes --------
-void setupWebPortalRoutes() {
-  server.enableCORS(true);
+// -------- Alarm Scheduler & Piezo Buzzer Ringer --------
+void checkAlarms() {
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+  int nowMin = t.tm_hour * 60 + t.tm_min;
+  if (nowMin == lastTriggeredMin) return;
 
-  server.on("/", HTTP_GET, []() {
+  for (int i = 0; i < alarmCount; i++) {
+    if (alarms[i].enabled && alarms[i].hour == t.tm_hour && alarms[i].minute == t.tm_min) {
+      lastTriggeredMin = nowMin;
+      alarmRinging = true;
+      ringingAlarmIdx = i;
+      isSleeping = false;
+      break;
+    }
+  }
+}
+
+void serviceRingingAlarm() {
+  if (!alarmRinging || ringingAlarmIdx < 0) return;
+  static unsigned long lastBeep = 0;
+  if (millis() - lastBeep >= 900) {
+    lastBeep = millis();
+    int m = alarms[ringingAlarmIdx].melody;
+    if (m == 1) playToneSafe(587, 180);
+    else if (m == 2) playToneSafe(2200, 160);
+    else playToneSafe(1760, 180);
+  }
+}
+
+// -------- Built-in Web Portal + AI Agent Bridge HTTP API --------
+void sendCorsOk(const String& body = "OK", const char* mime = "text/plain") {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, mime, body);
+}
+
+void setupWebServer() {
+  server.on("/", []() {
     server.send_P(200, "text/html", PORTAL_HTML);
   });
 
-  server.on("/api/status", HTTP_GET, []() {
-    bool ardOnline = (lastArdPacketMs > 0 && (millis() - lastArdPacketMs < 3000));
-    String json = "{\\"wifi\\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
-                  ",\\"staIp\\":\\"" + WiFi.localIP().toString() +
-                  "\\",\\"temp\\":" + String(liveTempC, 1) +
-                  ",\\"mode\\":\\"" + botMode +
-                  "\\",\\"user\\":\\"" + userName +
-                  "\\",\\"city\\":\\"" + cityName +
-                  "\\",\\"ssid\\":\\"" + wifiSsid +
-                  "\\",\\"ardOk\\":" + String(ardOnline ? "true" : "false") +
-                  ",\\"dist\\":" + String(ardDistCm, 1) +
-                  ",\\"locked\\":" + String(ardObjectLocked ? "true" : "false") +
-                  ",\\"servo\\":" + String(ardServoAngle) +
-                  ",\\"servoOn\\":" + String(ardServoOn ? "true" : "false") +
-                  ",\\"buz\\":\\"" + String(buzzerActiveMode ? "Active" : "Passive") + "\\"}";
-    server.send(200, "application/json", json);
+  server.on("/api/status", []() {
+    String json = "{";
+    json += "\\"wifi\\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\\"staIp\\":\\"" + WiFi.localIP().toString() + "\\",";
+    json += "\\"apIp\\":\\"" + WiFi.softAPIP().toString() + "\\",";
+    json += "\\"temp\\":" + String(liveTempC, 1) + ",";
+    json += "\\"mode\\":\\"" + botMode + "\\",";
+    json += "\\"screen\\":\\"" + activeScreen + "\\",";
+    json += "\\"face\\":" + String(currentFace) + ",";
+    json += "\\"led\\":\\"" + greenLedMode + "\\",";
+    json += "\\"buz\\":\\"" + String(buzzerActiveMode ? "ACTIVE" : "PASSIVE") + "\\",";
+    json += "\\"user\\":\\"" + userName + "\\",";
+    json += "\\"city\\":\\"" + cityName + "\\",";
+    json += "\\"ssid\\":\\"" + wifiSsid + "\\"";
+    json += "}";
+    sendCorsOk(json, "application/json");
   });
 
-  server.on("/api/wifi", HTTP_GET, []() {
+  server.on("/api/face", []() {
+    if (server.hasArg("id")) {
+      currentFace = constrain(server.arg("id").toInt(), 0, 24);
+      activeScreen = "face";
+      screenLocked = true;
+      isSleeping = (currentFace == 7);
+      alarmRinging = false;
+      stopBuzzer();
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/mode", []() {
+    if (server.hasArg("mode")) {
+      botMode = server.arg("mode");
+      screenLocked = false;
+      isSleeping = false;
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/screen", []() {
+    if (server.hasArg("kind")) {
+      activeScreen = server.arg("kind");
+      screenLocked = true;
+      isSleeping = false;
+      alarmRinging = false;
+      stopBuzzer();
+      if (server.hasArg("l1")) customLine1 = server.arg("l1");
+      if (server.hasArg("l2")) customLine2 = server.arg("l2");
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/led", []() {
+    if (server.hasArg("green")) {
+      String g = server.arg("green");
+      if (g == "1" || g == "on") greenLedMode = "on";
+      else if (g == "0" || g == "off") greenLedMode = "off";
+      else if (g == "blink") greenLedMode = "blink";
+      else greenLedMode = "auto";
+      updateGreenLed();
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/buzzer", []() {
+    if (server.hasArg("type")) {
+      buzzerActiveMode = (server.arg("type") == "active");
+    }
+    String modeArg = server.hasArg("mode") ? server.arg("mode") : "tone";
+    if (modeArg == "dc") {
+      playToneSafe(0, 250, true);
+    } else if (modeArg == "happy" || modeArg == "wake") {
+      playHappyChime();
+    } else if (modeArg == "alarm") {
+      playToneSafe(1760, 140); delay(50);
+      playToneSafe(2093, 180);
+    } else {
+      playToneSafe(880, 110); delay(30);
+      playToneSafe(1318, 150);
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/durations", []() {
+    if (server.hasArg("watch")) watchDurSec = max(2, server.arg("watch").toInt());
+    if (server.hasArg("weather")) weatherDurSec = max(2, server.arg("weather").toInt());
+    if (server.hasArg("face")) faceDurSec = max(2, server.arg("face").toInt());
+    sendCorsOk();
+  });
+
+  server.on("/api/bitmap", HTTP_POST, []() {
+    String hex = server.arg("plain");
+    hex.trim();
+    if (hex.length() >= 2048) {
+      for (int i = 0; i < 1024; i++) {
+        char hi = hex[i * 2];
+        char lo = hex[i * 2 + 1];
+        uint8_t h = (hi >= 'a') ? (hi - 'a' + 10) : (hi >= 'A') ? (hi - 'A' + 10) : (hi - '0');
+        uint8_t l = (lo >= 'a') ? (lo - 'a' + 10) : (lo >= 'A') ? (lo - 'A' + 10) : (lo - '0');
+        customTouchpadBitmap[i] = (h << 4) | l;
+      }
+      activeScreen = "bitmap";
+      screenLocked = true;
+      isSleeping = false;
+    }
+    sendCorsOk();
+  });
+
+  server.on("/api/alarm/set", []() {
+    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, MAX_ALARMS - 1) : 0;
+    if (slot >= alarmCount) alarmCount = slot + 1;
+    alarms[slot].hour    = server.hasArg("hour") ? constrain(server.arg("hour").toInt(), 0, 23) : 7;
+    alarms[slot].minute  = server.hasArg("min") ? constrain(server.arg("min").toInt(), 0, 59) : 0;
+    alarms[slot].enabled = !server.hasArg("on") || server.arg("on").toInt() == 1;
+    alarms[slot].faceId  = server.hasArg("face") ? constrain(server.arg("face").toInt(), 0, 24) : 1;
+    alarms[slot].melody  = server.hasArg("melody") ? constrain(server.arg("melody").toInt(), 0, 2) : 0;
+    if (server.hasArg("label")) alarms[slot].label = server.arg("label").substring(0, 18);
+    sendCorsOk();
+  });
+
+  server.on("/api/alarm/test", []() {
+    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, MAX_ALARMS - 1) : 0;
+    if (alarmCount == 0) {
+      alarmCount = 1;
+      alarms[0] = { 7, 0, true, 1, 0, "Test Alarm" };
+    }
+    ringingAlarmIdx = min(slot, alarmCount - 1);
+    alarmRinging = true;
+    isSleeping = false;
+    sendCorsOk();
+  });
+
+  server.on("/api/alarm/dismiss", []() {
+    alarmRinging = false;
+    ringingAlarmIdx = -1;
+    stopBuzzer();
+    activeScreen = "face";
+    currentFace = 0;
+    screenLocked = false;
+    sendCorsOk();
+  });
+
+  server.on("/api/config", []() {
+    if (server.hasArg("name")) userName = server.arg("name").substring(0, 16);
+    if (server.hasArg("city")) cityName = server.arg("city").substring(0, 18);
+    if (server.hasArg("lat"))  locLat   = server.arg("lat").toFloat();
+    if (server.hasArg("lon"))  locLon   = server.arg("lon").toFloat();
+    fetchWeather();
+    sendCorsOk();
+  });
+
+  server.on("/api/wifi", []() {
     if (server.hasArg("ssid") && server.hasArg("pass")) {
       wifiSsid = server.arg("ssid");
       wifiPassword = server.arg("pass");
@@ -1354,137 +1069,12 @@ void setupWebPortalRoutes() {
       prefs.putString("ssid", wifiSsid);
       prefs.putString("pass", wifiPassword);
       prefs.end();
-      server.send(200, "application/json", "{\\"ok\\":true}");
+      sendCorsOk("Saved! Rebooting...");
       delay(400);
       ESP.restart();
       return;
     }
-    server.send(400, "application/json", "{\\"ok\\":false}");
-  });
-
-  server.on("/api/face", HTTP_GET, []() {
-    if (server.hasArg("id")) {
-      currentFace = constrain(server.arg("id").toInt(), 0, 24);
-      activeScreen = "face";
-      screenLocked = true;
-      isSleeping = (currentFace == 7);
-      drawFace(currentFace, frameCount);
-      syncFaceToArduino(currentFace);
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/screen", HTTP_GET, []() {
-    if (server.hasArg("kind")) {
-      activeScreen = server.arg("kind");
-      screenLocked = true;
-      isSleeping = false;
-      syncFaceToArduino(0);
-    }
-    if (server.hasArg("l1")) customLine1 = server.arg("l1");
-    if (server.hasArg("l2")) customLine2 = server.arg("l2");
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/bitmap", HTTP_POST, []() {
-    String hex = server.arg("plain");
-    if (hex.length() >= 2048) {
-      for (int i = 0; i < 1024; i++) {
-        char buf[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
-        customTouchpadBitmap[i] = (unsigned char)strtol(buf, NULL, 16);
-      }
-      activeScreen = "bitmap";
-      screenLocked = true;
-      isSleeping = false;
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/durations", HTTP_GET, []() {
-    if (server.hasArg("watch"))   watchDurSec   = constrain(server.arg("watch").toInt(), 2, 120);
-    if (server.hasArg("weather")) weatherDurSec = constrain(server.arg("weather").toInt(), 2, 120);
-    if (server.hasArg("face"))    faceDurSec    = constrain(server.arg("face").toInt(), 2, 120);
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  // Forward Servo Commands directly to Arduino Uno/Nano over Serial2
-  server.on("/api/servo", HTTP_GET, []() {
-    if (server.hasArg("test"))    sendToArduino("T:1");
-    if (server.hasArg("angle"))   sendToArduino("A:" + String(constrain(server.arg("angle").toInt(), 20, 160)));
-    if (server.hasArg("auto") && server.arg("auto") == "1") sendToArduino("M:AUTO");
-    if (server.hasArg("idleoff")) sendToArduino("I:" + String(server.arg("idleoff") == "1" ? 1 : 0));
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  // Forward HC-SR04 Sensor Toggle to Arduino Uno/Nano
-  server.on("/api/sensor", HTTP_GET, []() {
-    if (server.hasArg("ultrasonic")) {
-      sendToArduino("S:" + String(server.arg("ultrasonic") == "1" ? 1 : 0));
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  // ESP32 Direct Buzzer Controls
-  server.on("/api/buzzer", HTTP_GET, []() {
-    if (server.hasArg("type")) {
-      buzzerActiveMode = (server.arg("type") == "active");
-    }
-    if (server.hasArg("mode")) {
-      if (server.arg("mode") == "dc") playToneSafe(0, 220, true);
-      else playWakeSound();
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/mode", HTTP_GET, []() {
-    if (server.hasArg("mode")) {
-      botMode = server.arg("mode");
-      screenLocked = false;
-      isSleeping = false;
-      sendToArduino("M:AUTO");
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/alarm/set", HTTP_GET, []() {
-    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, MAX_ALARMS - 1) : 0;
-    alarms[slot].hour    = server.hasArg("hour")   ? server.arg("hour").toInt()   : 7;
-    alarms[slot].minute  = server.hasArg("min")    ? server.arg("min").toInt()    : 0;
-    alarms[slot].enabled = server.hasArg("on")     ? (server.arg("on") == "1")    : true;
-    alarms[slot].faceId  = server.hasArg("face")   ? server.arg("face").toInt()   : 1;
-    alarms[slot].melody  = server.hasArg("melody") ? server.arg("melody").toInt() : 0;
-    alarms[slot].label   = server.hasArg("label")  ? server.arg("label")          : "Alarm";
-    if (slot + 1 > alarmCount) alarmCount = slot + 1;
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/alarm/dismiss", HTTP_GET, []() {
-    alarmRinging = false;
-    ringingAlarmIdx = -1;
-    stopBuzzer();
-    syncFaceToArduino(0);
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/alarm/test", HTTP_GET, []() {
-    if (alarmCount == 0) {
-      alarms[0] = { 7, 0, true, 1, 0, "Test Alarm" };
-      alarmCount = 1;
-    }
-    alarmRinging = true;
-    ringingAlarmIdx = 0;
-    isSleeping = false;
-    syncFaceToArduino(19);
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
-  server.on("/api/config", HTTP_GET, []() {
-    if (server.hasArg("name")) userName = server.arg("name");
-    if (server.hasArg("city")) cityName = server.arg("city");
-    if (server.hasArg("lat"))  locLat = server.arg("lat").toFloat();
-    if (server.hasArg("lon"))  locLon = server.arg("lon").toFloat();
-    fetchWeatherFromOpenMeteo();
-    server.send(200, "application/json", "{\\"ok\\":true}");
+    sendCorsOk("Missing args");
   });
 
   server.begin();
@@ -1492,93 +1082,110 @@ void setupWebPortalRoutes() {
 
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(9600, SERIAL_8N1, PIN_ARDUINO_RX, PIN_ARDUINO_TX);
+  Wire.begin(21, 22);
 
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  pinMode(PIN_LED_ONBOARD, OUTPUT);
+  digitalWrite(PIN_LED_ONBOARD, LOW);
 
-  // Boot Self-Test on ESP32: Buzzer Double Beep
-  playToneSafe(1047, 100); delay(40);
-  playToneSafe(1568, 120);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 init failed! Check SDA=21 SCL=22 3.3V GND.");
+    for (;;) delay(500);
+  }
 
-  // Load saved Home WiFi from NVS (default: muhib / 12345678)
+  // Boot Self-Test: Green LED flash + friendly Piezo chirp!
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(PIN_LED_GREEN, HIGH);
+    digitalWrite(PIN_LED_ONBOARD, HIGH);
+    delay(110);
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_ONBOARD, LOW);
+    delay(90);
+  }
+  playHappyChime();
+
+  // Load saved Home WiFi from NVS Flash
   prefs.begin("facebot", true);
   wifiSsid     = prefs.getString("ssid", wifiSsid);
   wifiPassword = prefs.getString("pass", wifiPassword);
   prefs.end();
 
-${alarmInitLines.join('\n')}
+  // Initialize Default Alarms
+${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0, true, 1, 0, "Good Morning" }; alarmCount = 1;'}
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 OLED not found!");
-    for (;;);
-  }
-
-  // Dual Mode: Broadcast ESP32 Hotspot + Connect to Home WiFi simultaneously!
+  // Dual-Mode WiFi: Hotspot (AP) + Home WiFi (STA)
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
-  // Show Hotspot Info directly on 0.96" OLED
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 4);  display.print("Hotspot:");
-  display.setCursor(0, 15); display.print(AP_SSID);
-  display.setCursor(0, 28); display.print("Pass: 12345678");
-  display.setCursor(0, 41); display.print("Open: 192.168.4.1");
-  display.setCursor(0, 54); display.print("Home WiFi...");
+  display.setTextSize(1);
+  display.setCursor(4, 6);
+  display.println("FaceBot AI Ready");
+  display.setCursor(4, 20);
+  display.println("AP: " + String(AP_SSID));
+  display.setCursor(4, 34);
+  display.println("IP: 192.168.4.1");
+  display.setCursor(4, 48);
+  display.println("WiFi: " + wifiSsid);
   display.display();
 
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 20) {
-    delay(400);
-    tries++;
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+    delay(250);
   }
-
-  setupWebPortalRoutes();
 
   if (WiFi.status() == WL_CONNECTED) {
-    configTime(utcOffsetSec, 0, "pool.ntp.org");
-    fetchWeatherFromOpenMeteo();
-    Serial.println("Home WiFi Connected! IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("Home WiFi offline — Hotspot Portal active at 192.168.4.1");
+    configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+    fetchWeather();
+    Serial.print("Home WiFi IP: ");
+    Serial.println(WiFi.localIP());
+    display.clearDisplay();
+    display.setCursor(4, 14);
+    display.println("WiFi Connected!");
+    display.setCursor(4, 30);
+    display.println("LAN: " + WiFi.localIP().toString());
+    display.setCursor(4, 46);
+    display.println("AP : 192.168.4.1");
+    display.display();
+    delay(1500);
   }
-  Serial.println("Hotspot Portal: http://192.168.4.1 | Arduino UART2: RX=16, TX=17");
+
+  setupWebServer();
+  lastCycleSwitchMs = millis();
 }
 
 void loop() {
   server.handleClient();
-  pollArduinoSerial();
-  checkScheduledAlarms();
+  updateGreenLed();
+  checkAlarms();
+  serviceRingingAlarm();
 
-  // Active Alarm Ringing
-  if (alarmRinging && ringingAlarmIdx >= 0) {
-    drawAlarmOled(ringingAlarmIdx, frameCount);
-    playAlarmBeepTick(alarms[ringingAlarmIdx].melody, frameCount);
-    frameCount++;
-    delay(150);
-    return;
-  }
-
-  // Refresh live weather every 10 minutes
-  if (millis() - lastWeatherFetch > 600000) {
-    fetchWeatherFromOpenMeteo();
+  // Refresh weather every 10 minutes
+  if (WiFi.status() == WL_CONNECTED && millis() - lastWeatherFetch > 600000UL) {
     lastWeatherFetch = millis();
+    fetchWeather();
   }
 
-  // Auto/User Mode Automatic Screen Cycling (unless locked from portal)
-  if (!isSleeping && !screenLocked) {
-    unsigned long holdMs = (activeScreen == "watch") ? (watchDurSec * 1000UL)
-                         : (activeScreen == "weather") ? (weatherDurSec * 1000UL)
-                         : (faceDurSec * 1000UL);
-    if (millis() - lastCycleSwitchMs > holdMs) {
+  // Automatic Screen Sequencer (when unlocked and not sleeping/alarming)
+  if (!alarmRinging && !isSleeping && !screenLocked) {
+    unsigned long holdMs = (activeScreen == "watch")
+      ? (unsigned long)watchDurSec * 1000UL
+      : (activeScreen == "weather")
+        ? (unsigned long)weatherDurSec * 1000UL
+        : (unsigned long)faceDurSec * 1000UL;
+
+    if (millis() - lastCycleSwitchMs >= holdMs) {
       lastCycleSwitchMs = millis();
       cycleStep++;
-      if (cycleStep % 5 == 0)      activeScreen = "watch";
-      else if (cycleStep % 5 == 1) activeScreen = "weather";
-      else if (cycleStep % 5 == 2) activeScreen = "greeting";
+      int slot = cycleStep % 6;
+      if (slot == 0) activeScreen = "watch";
+      else if (slot == 1) activeScreen = "weather";
+      else if (slot == 2) activeScreen = "greeting";
       else {
         activeScreen = "face";
         currentFace = (currentFace + 1) % 25;
@@ -1587,43 +1194,34 @@ void loop() {
     }
   }
 
-  // Render Active Screen on 0.96" OLED & Sync Emotion to Arduino
-  if (isSleeping) {
-    drawFace(7, frameCount);
-    syncFaceToArduino(7);
-  } else if (activeScreen == "watch") {
-    drawWatchOled();
-    syncFaceToArduino(0);
-  } else if (activeScreen == "weather") {
-    if (liveTempC <= coldThresholdC && frameCount % 8 >= 4) {
-      drawFace(3, frameCount);
-      display.fillRect(0, 0, 128, 12, SSD1306_BLACK);
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(10, 2);
-      display.print("Today is too cold!");
+  // Render OLED at ~5 FPS
+  static unsigned long lastFrameMs = 0;
+  if (millis() - lastFrameMs >= 200) {
+    lastFrameMs = millis();
+    frameCount++;
+
+    if (alarmRinging && ringingAlarmIdx >= 0) {
+      drawAlarmOled(ringingAlarmIdx, frameCount);
+    } else if (activeScreen == "watch") {
+      drawWatchOled();
+    } else if (activeScreen == "weather") {
+      if (liveTempC <= coldThresholdC && (frameCount % 16 < 8)) {
+        drawFace(3, frameCount); // Freezing Cold shiver face!
+      } else {
+        drawWeatherOled();
+      }
+    } else if (activeScreen == "greeting") {
+      drawGreetingOled();
+    } else if (activeScreen == "text") {
+      drawCustomTextOled();
+    } else if (activeScreen == "bitmap") {
+      display.clearDisplay();
+      display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
       display.display();
     } else {
-      drawWeatherOled();
+      drawFace(currentFace, frameCount);
     }
-    syncFaceToArduino(0);
-  } else if (activeScreen == "greeting") {
-    drawGreetingOled();
-    syncFaceToArduino(0);
-  } else if (activeScreen == "text") {
-    drawCustomTextOled();
-    syncFaceToArduino(0);
-  } else if (activeScreen == "bitmap") {
-    display.clearDisplay();
-    display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
-    display.display();
-  } else {
-    drawFace(currentFace, frameCount);
-    syncFaceToArduino(currentFace);
   }
-
-  frameCount++;
-  delay(180);
 }
 `;
 }

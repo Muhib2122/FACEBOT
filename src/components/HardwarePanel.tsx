@@ -1,65 +1,45 @@
 import React, { useState } from 'react';
 import {
-  Cloud,
   Cpu,
-  DownloadCloud,
   Eye,
   EyeOff,
+  Lightbulb,
   Lock,
-  Radio,
-  RefreshCw,
-  RotateCw,
   Save,
   Volume2,
   Wifi,
 } from 'lucide-react';
-import { CloudBackendType, HardwareConfig } from '../types';
-import { playBuzzerTest } from '../utils/buzzerAudio';
+import { GreenLedMode, HardwareConfig } from '../types';
 
 interface HardwarePanelProps {
   hardware: HardwareConfig;
-  currentServoAngle: number;
-  servoPowered: boolean;
-  userDetected: boolean;
   onUpdateHardware: (patch: Partial<HardwareConfig>) => void;
+  onChangeGreenLedMode: (mode: GreenLedMode) => void;
+  onTestBuzzer: (mode?: 'tone' | 'happy' | 'dc') => void;
   onSaveWifiCredentials: (ssid: string, password: string) => void;
   wifiSaveStatus: string | null;
   onPingEsp32: () => Promise<void>;
   pingStatus: string | null;
-  onPushCloudState: () => Promise<void>;
-  onTriggerOtaUpdate: () => Promise<void>;
-  cloudSyncStatus: string | null;
 }
 
 export const HardwarePanel: React.FC<HardwarePanelProps> = ({
   hardware,
-  currentServoAngle,
-  servoPowered,
-  userDetected,
   onUpdateHardware,
+  onChangeGreenLedMode,
+  onTestBuzzer,
   onSaveWifiCredentials,
   wifiSaveStatus,
   onPingEsp32,
   pingStatus,
-  onPushCloudState,
-  onTriggerOtaUpdate,
-  cloudSyncStatus,
 }) => {
   const [testingBuzzer, setTestingBuzzer] = useState(false);
   const [ssidInput, setSsidInput] = useState(hardware.wifiSsid);
   const [passInput, setPassInput] = useState(hardware.wifiPassword);
   const [showPassword, setShowPassword] = useState(false);
 
-  const handleManualServoAngle = (angle: number) => {
-    onUpdateHardware({
-      servoManualOverride: true,
-      servoAngle: Math.max(0, Math.min(180, angle)),
-    });
-  };
-
-  const handleTestBuzzer = () => {
+  const handleTestBuzzer = (mode: 'tone' | 'happy' | 'dc') => {
     setTestingBuzzer(true);
-    playBuzzerTest(hardware.buzzerMuted);
+    onTestBuzzer(mode);
     setTimeout(() => setTestingBuzzer(false), 320);
   };
 
@@ -71,17 +51,17 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Admin Panel: Home WiFi SSID & Password Configuration */}
+      {/* Admin Panel: Home WiFi SSID & Password + ESP32 Direct Link */}
       <div className="bg-white border border-slate-200 rounded-xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Wifi className="w-4 h-4 text-slate-600" />
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                Admin Panel · Home WiFi Configuration
+                Admin Panel · Home WiFi &amp; ESP32 Bridge
               </h3>
               <p className="text-xs text-slate-500">
-                Set your home WiFi SSID &amp; password (initial default: <span className="font-mono text-slate-700">muhib</span> / <span className="font-mono text-slate-700">12345678</span>) — saved to ESP32 flash &amp; firmware
+                ESP32 joins Home WiFi (<span className="font-mono text-slate-700">muhib</span> / <span className="font-mono text-slate-700">12345678</span>) and broadcasts Hotspot <span className="font-mono text-slate-700">FaceBot-Muhib</span> at <span className="font-mono text-slate-700">http://192.168.4.1</span>
               </p>
             </div>
           </div>
@@ -149,13 +129,13 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-12 gap-4 mt-5 pt-4 border-t border-slate-100 items-end">
           <div className="md:col-span-9">
             <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              ESP32 Local IP Address (optional direct LAN control — for Vercel HTTPS use Cloud Sync below)
+              ESP32 IP Address (Paste Home WiFi IP shown on OLED or http://192.168.4.1 so AI Agent controls real hardware)
             </label>
             <input
               type="text"
               value={hardware.esp32Ip}
               onChange={(e) => onUpdateHardware({ esp32Ip: e.target.value })}
-              placeholder="http://192.168.1.50"
+              placeholder="http://192.168.4.1 or http://192.168.1.50"
               className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg"
             />
           </div>
@@ -176,476 +156,105 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
         )}
       </div>
 
-      {/* Vercel Cloud Sync & GitHub OTA Firmware Auto-Update */}
-      <div className="bg-white border border-slate-200 rounded-xl p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
-          <div className="flex items-center gap-2">
-            <Cloud className="w-4 h-4 text-slate-600" />
-            <div>
-              <h3 className="text-sm font-semibold text-slate-900">
-                Vercel Cloud Sync &amp; GitHub OTA Auto-Update
-              </h3>
-              <p className="text-xs text-slate-500">
-                Control ESP32 remotely from your published Vercel URL over HTTPS &amp; auto-flash new display functions via GitHub OTA
-              </p>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={() =>
-              onUpdateHardware({ cloudSyncEnabled: !hardware.cloudSyncEnabled })
-            }
-            role="switch"
-            aria-checked={hardware.cloudSyncEnabled}
-            className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 ${
-              hardware.cloudSyncEnabled ? 'bg-blue-600' : 'bg-slate-200'
-            }`}
-          >
-            <span
-              className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                hardware.cloudSyncEnabled ? 'translate-x-4' : 'translate-x-0'
-              }`}
-            />
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 pt-4">
-          <div className="md:col-span-5">
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Published Vercel Portal URL
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="url"
-                value={hardware.cloudPortalUrl}
-                onChange={(e) => onUpdateHardware({ cloudPortalUrl: e.target.value })}
-                placeholder="https://muhib-facebot.vercel.app"
-                className="flex-1 px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg"
-              />
-              <button
-                type="button"
-                onClick={() =>
-                  onUpdateHardware({ cloudPortalUrl: window.location.origin })
-                }
-                className="px-2.5 py-2 text-[11px] font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap"
-              >
-                Use Current
-              </button>
-            </div>
-          </div>
-
-          <div className="md:col-span-4">
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Cloud State Backend
-            </label>
-            <select
-              value={hardware.cloudBackendType}
-              onChange={(e) =>
-                onUpdateHardware({
-                  cloudBackendType: e.target.value as CloudBackendType,
-                })
-              }
-              className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-white"
-            >
-              <option value="vercel-api">Vercel Built-in API (/api/bot-state)</option>
-              <option value="firebase-rtdb">Firebase Realtime DB (.json URL)</option>
-            </select>
-          </div>
-
-          <div className="md:col-span-3">
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Device ID
-            </label>
-            <input
-              type="text"
-              value={hardware.deviceId}
-              onChange={(e) => onUpdateHardware({ deviceId: e.target.value })}
-              placeholder="muhib-bot-1"
-              className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg"
-            />
-          </div>
-
-          {hardware.cloudBackendType === 'firebase-rtdb' && (
-            <div className="md:col-span-12">
-              <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                Firebase Realtime Database JSON URL (100% persistent free cloud state)
-              </label>
-              <input
-                type="url"
-                value={hardware.firebaseDbUrl}
-                onChange={(e) => onUpdateHardware({ firebaseDbUrl: e.target.value })}
-                placeholder="https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app/facebot/muhib-bot-1.json"
-                className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg"
-              />
-            </div>
-          )}
-        </div>
-
-        {/* OTA Firmware Auto-Update Row */}
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 mt-4 pt-4 border-t border-slate-100 items-end">
-          <div className="md:col-span-3">
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              ESP32 Firmware Version
-            </label>
-            <input
-              type="text"
-              value={hardware.firmwareVersion}
-              onChange={(e) => onUpdateHardware({ firmwareVersion: e.target.value })}
-              placeholder="1.0.0"
-              className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg tabular-nums"
-            />
-          </div>
-
-          <div className="md:col-span-4 flex items-center justify-between gap-3 py-2 px-3 bg-slate-50 border border-slate-200 rounded-lg">
-            <div>
-              <div className="text-xs font-semibold text-slate-800">Auto-Check GitHub OTA</div>
-              <div className="text-[11px] text-slate-500">Checks /ota/version.json on boot</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => onUpdateHardware({ otaAutoCheck: !hardware.otaAutoCheck })}
-              role="switch"
-              aria-checked={hardware.otaAutoCheck}
-              className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 ${
-                hardware.otaAutoCheck ? 'bg-blue-600' : 'bg-slate-200'
-              }`}
-            >
-              <span
-                className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                  hardware.otaAutoCheck ? 'translate-x-4' : 'translate-x-0'
-                }`}
-              />
-            </button>
-          </div>
-
-          <div className="md:col-span-5 flex flex-wrap gap-2 justify-end">
-            <button
-              type="button"
-              onClick={onPushCloudState}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-800 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Push State to Cloud
-            </button>
-            <button
-              type="button"
-              onClick={onTriggerOtaUpdate}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap"
-            >
-              <DownloadCloud className="w-3.5 h-3.5" />
-              Trigger OTA Update
-            </button>
-          </div>
-        </div>
-
-        {cloudSyncStatus && (
-          <p className="text-xs text-blue-700 mt-3">{cloudSyncStatus}</p>
-        )}
-
-        <p className="text-[11px] text-slate-500 mt-3 leading-relaxed">
-          How GitHub → Vercel OTA works: When you add new C++ faces/functions later, export the compiled binary in Arduino IDE (<code className="font-mono text-slate-700">Sketch → Export Compiled Binary</code>), drop it into <code className="font-mono text-slate-700">public/ota/firmware.bin</code>, bump <code className="font-mono text-slate-700">public/ota/version.json</code>, and push to GitHub. Vercel publishes it and your ESP32 self-updates over WiFi with zero USB cable.
-        </p>
-      </div>
-
-      {/* SG90 Servo Motor & HC-SR04 Co-Mounted User Tracking */}
+      {/* Minimal Hardware Controls: Single Green LED (GPIO 26) & Piezo Buzzer (GPIO 14) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Green LED Card */}
         <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-5">
           <div className="flex items-center justify-between gap-2 pb-4 border-b border-slate-100">
             <div className="flex items-center gap-2">
-              <RotateCw className="w-4 h-4 text-slate-600" />
+              <Lightbulb className="w-4 h-4 text-emerald-600" />
               <div>
                 <h3 className="text-sm font-semibold text-slate-900">
-                  SG90 Servo Head Control
+                  Single Green LED (GPIO 26 · No Resistor)
                 </h3>
                 <p className="text-xs text-slate-500">
-                  0°–180° · Center 90° · GPIO 13 · {servoPowered ? 'Motor Powered ON' : 'Motor Idle OFF (90°)'}
+                  Long leg (+) → GPIO 26 · Short leg (−) → GND · Direct 3.3V safe
                 </p>
               </div>
             </div>
-            <span className="text-sm font-mono font-bold text-slate-900 tabular-nums">
-              {Math.round(currentServoAngle)}°
+            <span className="text-xs font-mono font-semibold text-emerald-700 uppercase">
+              {hardware.greenLedMode}
             </span>
           </div>
 
-          <div className="pt-4 space-y-4">
-            {/* Sync Mode Switch */}
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-xs font-semibold text-slate-800">
-                  Expressive Auto Head Movement
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Happy sways 70°↔110°, Surprised tilts, Angry shakes, Sleepy droops
-                </div>
-              </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-4">
+            {(
+              [
+                { id: 'auto', label: 'Auto' },
+                { id: 'on', label: 'Always ON' },
+                { id: 'blink', label: 'Blink' },
+                { id: 'off', label: 'OFF' },
+              ] as const
+            ).map((opt) => (
               <button
-                onClick={() =>
-                  onUpdateHardware({
-                    servoManualOverride: !hardware.servoManualOverride,
-                    servoAutoSync: hardware.servoManualOverride,
-                  })
-                }
-                role="switch"
-                aria-checked={!hardware.servoManualOverride}
-                className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 ${
-                  !hardware.servoManualOverride ? 'bg-blue-600' : 'bg-slate-200'
+                key={opt.id}
+                type="button"
+                onClick={() => onChangeGreenLedMode(opt.id)}
+                className={`px-3 py-2.5 text-xs font-semibold rounded-lg border transition-colors ${
+                  hardware.greenLedMode === opt.id
+                    ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                    : 'border-slate-200 text-slate-700 hover:bg-slate-50'
                 }`}
               >
-                <span
-                  className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                    !hardware.servoManualOverride ? 'translate-x-4' : 'translate-x-0'
-                  }`}
-                />
+                {opt.label}
               </button>
-            </div>
-
-            {/* Idle Servo Power Off at 90° Switch */}
-            <div className="flex items-center justify-between gap-3 pt-3 border-t border-slate-100">
-              <div>
-                <div className="text-xs font-semibold text-slate-800">
-                  Auto Servo OFF When No Object Found
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Centers straight at 90° and detaches PWM (<code className="font-mono">headServo.detach()</code>) when nobody is in range
-                </div>
-              </div>
-              <button
-                onClick={() =>
-                  onUpdateHardware({
-                    servoPowerOffWhenIdle: !hardware.servoPowerOffWhenIdle,
-                  })
-                }
-                role="switch"
-                aria-checked={hardware.servoPowerOffWhenIdle}
-                className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 ${
-                  hardware.servoPowerOffWhenIdle ? 'bg-blue-600' : 'bg-slate-200'
-                }`}
-              >
-                <span
-                  className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                    hardware.servoPowerOffWhenIdle ? 'translate-x-4' : 'translate-x-0'
-                  }`}
-                />
-              </button>
-            </div>
-
-            {/* Manual Servo Angle Slider */}
-            <div className="pt-3 border-t border-slate-100">
-              <div className="flex items-center justify-between text-xs mb-2">
-                <span className="font-medium text-slate-700">Manual Angle Override</span>
-                <span className="font-mono text-slate-600 tabular-nums">
-                  {hardware.servoAngle}°
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={180}
-                value={hardware.servoManualOverride ? hardware.servoAngle : Math.round(currentServoAngle)}
-                onChange={(e) => handleManualServoAngle(Number(e.target.value))}
-                className="w-full hw-slider"
-              />
-              <div className="flex justify-between text-[11px] font-mono text-slate-400 mt-1 tabular-nums">
-                <span>0° Left</span>
-                <span>90° Straight</span>
-                <span>180° Right</span>
-              </div>
-            </div>
-
-            {/* Quick Angle Presets */}
-            <div className="flex flex-wrap gap-2">
-              {[0, 45, 70, 90, 110, 135, 180].map((deg) => (
-                <button
-                  key={deg}
-                  onClick={() => handleManualServoAngle(deg)}
-                  className={`px-2.5 py-1.5 text-xs font-mono font-medium rounded-lg border transition-colors tabular-nums ${
-                    hardware.servoManualOverride && hardware.servoAngle === deg
-                      ? 'border-blue-600 bg-blue-50 text-blue-700'
-                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  {deg}°{deg === 90 ? ' Center' : ''}
-                </button>
-              ))}
-            </div>
+            ))}
           </div>
+          <p className="text-[11px] text-slate-500 mt-3">
+            In Auto mode, the Green LED stays ON while FaceBot is awake, turns OFF during Sleep, and blinks rapidly when an Alarm rings.
+          </p>
         </div>
 
-        {/* HC-SR04 Ultrasonic Sensor & Co-Mounted User Tracking */}
+        {/* Piezo Buzzer Card */}
         <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-5">
           <div className="flex items-center justify-between gap-2 pb-4 border-b border-slate-100">
             <div className="flex items-center gap-2">
-              <Radio className="w-4 h-4 text-slate-600" />
+              <Volume2 className="w-4 h-4 text-blue-600" />
               <div>
                 <h3 className="text-sm font-semibold text-slate-900">
-                  HC-SR04 Proximity &amp; User Tracking
+                  Piezo Buzzer (GPIO 14)
                 </h3>
                 <p className="text-xs text-slate-500">
-                  OLED mounted above HC-SR04 · {userDetected ? 'User Locked in Range' : 'No Object — Looking Straight (90°)'}
+                  Positive (+) → GPIO 14 · Negative (−) → GND · Passive &amp; Active supported
                 </p>
               </div>
             </div>
+            <span className="text-xs font-mono text-slate-500">
+              {hardware.buzzerMuted ? 'Browser Muted' : 'Audio Ready'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2.5 pt-4">
             <button
-              onClick={() =>
-                onUpdateHardware({ ultrasonicEnabled: !hardware.ultrasonicEnabled })
-              }
-              role="switch"
-              aria-checked={hardware.ultrasonicEnabled}
-              className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 ${
-                hardware.ultrasonicEnabled ? 'bg-blue-600' : 'bg-slate-200'
+              type="button"
+              onClick={() => handleTestBuzzer('tone')}
+              className={`inline-flex items-center justify-center gap-1.5 px-3 py-2.5 text-xs font-semibold rounded-lg border transition-colors ${
+                testingBuzzer
+                  ? 'border-blue-600 bg-blue-50 text-blue-700'
+                  : 'border-slate-200 text-slate-700 hover:bg-slate-50'
               }`}
             >
-              <span
-                className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                  hardware.ultrasonicEnabled ? 'translate-x-4' : 'translate-x-0'
-                }`}
-              />
+              <Volume2 className="w-3.5 h-3.5" />
+              Beep Test
+            </button>
+            <button
+              type="button"
+              onClick={() => handleTestBuzzer('happy')}
+              className="px-3 py-2.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100/70 rounded-lg transition-colors"
+            >
+              Happy Chime
+            </button>
+            <button
+              type="button"
+              onClick={() => handleTestBuzzer('dc')}
+              className="px-3 py-2.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
+            >
+              Active DC Beep
             </button>
           </div>
-
-          <div className="pt-4 space-y-4">
-            {/* Follow User Direction Toggle */}
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-xs font-semibold text-slate-800">
-                  Face Detected User Direction
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Turns OLED + HC-SR04 toward user inside tracking range; rests straight at 90° when empty
-                </div>
-              </div>
-              <button
-                onClick={() =>
-                  onUpdateHardware({ trackingEnabled: !hardware.trackingEnabled })
-                }
-                disabled={!hardware.ultrasonicEnabled}
-                role="switch"
-                aria-checked={hardware.trackingEnabled}
-                className={`w-10 h-6 rounded-full transition-colors p-0.5 shrink-0 disabled:opacity-40 ${
-                  hardware.trackingEnabled ? 'bg-blue-600' : 'bg-slate-200'
-                }`}
-              >
-                <span
-                  className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                    hardware.trackingEnabled ? 'translate-x-4' : 'translate-x-0'
-                  }`}
-                />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-slate-100">
-              <div>
-                <div className="flex items-center justify-between text-xs mb-1.5">
-                  <span className="font-medium text-slate-700">Sleep Wake Radius</span>
-                  <span className="font-mono font-semibold text-blue-600 tabular-nums">
-                    ≤ {hardware.wakeDistanceCm} cm
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={5}
-                  max={45}
-                  disabled={!hardware.ultrasonicEnabled}
-                  value={hardware.wakeDistanceCm}
-                  onChange={(e) =>
-                    onUpdateHardware({ wakeDistanceCm: Number(e.target.value) })
-                  }
-                  className="w-full hw-slider disabled:opacity-40"
-                />
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between text-xs mb-1.5">
-                  <span className="font-medium text-slate-700">User Tracking Range</span>
-                  <span className="font-mono font-semibold text-slate-800 tabular-nums">
-                    ≤ {hardware.trackingRangeCm} cm
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={25}
-                  max={100}
-                  disabled={!hardware.ultrasonicEnabled || !hardware.trackingEnabled}
-                  value={hardware.trackingRangeCm}
-                  onChange={(e) =>
-                    onUpdateHardware({ trackingRangeCm: Number(e.target.value) })
-                  }
-                  className="w-full hw-slider disabled:opacity-40"
-                />
-              </div>
-            </div>
-
-            {/* Physical Red/Green LEDs & Buzzer Test */}
-            <div className="pt-4 border-t border-slate-100">
-              <div className="text-xs font-semibold text-slate-800 mb-2.5">
-                LED &amp; Piezo Buzzer Manual Test
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() =>
-                    onUpdateHardware({
-                      greenLedManual:
-                        hardware.greenLedManual === true
-                          ? false
-                          : hardware.greenLedManual === false
-                            ? null
-                            : true,
-                    })
-                  }
-                  className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${
-                    hardware.greenLedManual === true
-                      ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
-                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  Green LED:{' '}
-                  {hardware.greenLedManual === null
-                    ? 'Auto'
-                    : hardware.greenLedManual
-                      ? 'ON'
-                      : 'OFF'}
-                </button>
-
-                <button
-                  onClick={() =>
-                    onUpdateHardware({
-                      redLedManual:
-                        hardware.redLedManual === true
-                          ? false
-                          : hardware.redLedManual === false
-                            ? null
-                            : true,
-                    })
-                  }
-                  className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${
-                    hardware.redLedManual === true
-                      ? 'border-red-600 bg-red-50 text-red-800'
-                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  Red LED:{' '}
-                  {hardware.redLedManual === null
-                    ? 'Auto'
-                    : hardware.redLedManual
-                      ? 'ON'
-                      : 'OFF'}
-                </button>
-
-                <button
-                  onClick={handleTestBuzzer}
-                  className={`inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${
-                    testingBuzzer
-                      ? 'border-blue-600 bg-blue-50 text-blue-700'
-                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <Volume2 className="w-3.5 h-3.5" />
-                  Beep Test
-                </button>
-              </div>
-            </div>
-          </div>
+          <p className="text-[11px] text-slate-500 mt-3">
+            Software tone generator avoids all ESP32 timer conflicts. Works out of the box with both Passive melody buzzers and Active DC buzzers.
+          </p>
         </div>
       </div>
     </div>
