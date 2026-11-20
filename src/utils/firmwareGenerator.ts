@@ -166,6 +166,21 @@ float  liveWindKmh    = 6.0;
 String liveCondition  = "Clear";
 unsigned long lastWeatherFetch = 0;
 
+// Daily Interaction Stats (24 hourly buckets for Portal Dashboard Line Chart)
+int hourlyHits[24] = { 0 };
+unsigned long totalHitsToday = 0;
+
+void logEspInteraction() {
+  totalHitsToday++;
+  struct tm t;
+  if (getLocalTime(&t)) {
+    hourlyHits[t.tm_hour % 24]++;
+  } else {
+    int approxHour = (millis() / 3600000UL) % 24;
+    hourlyHits[approxHour]++;
+  }
+}
+
 // Custom 128x64 Touchpad Bitmap
 ${customBitmapBlock}
 
@@ -928,6 +943,16 @@ void setupWebServer() {
     sendCorsOk(json, "application/json");
   });
 
+  server.on("/api/stats", []() {
+    String json = "{\\"total\\":" + String(totalHitsToday) + ",\\"hourly\\":[";
+    for (int h = 0; h < 24; h++) {
+      json += String(hourlyHits[h]);
+      if (h < 23) json += ",";
+    }
+    json += "]}";
+    sendCorsOk(json, "application/json");
+  });
+
   server.on("/api/face", []() {
     if (server.hasArg("id")) {
       currentFace = constrain(server.arg("id").toInt(), 0, 24);
@@ -936,6 +961,7 @@ void setupWebServer() {
       isSleeping = (currentFace == 7);
       alarmRinging = false;
       stopBuzzer();
+      logEspInteraction();
     }
     sendCorsOk();
   });
@@ -945,6 +971,7 @@ void setupWebServer() {
       botMode = server.arg("mode");
       screenLocked = false;
       isSleeping = false;
+      logEspInteraction();
     }
     sendCorsOk();
   });
@@ -958,6 +985,7 @@ void setupWebServer() {
       stopBuzzer();
       if (server.hasArg("l1")) customLine1 = server.arg("l1");
       if (server.hasArg("l2")) customLine2 = server.arg("l2");
+      logEspInteraction();
     }
     sendCorsOk();
   });
@@ -970,6 +998,7 @@ void setupWebServer() {
       else if (g == "blink") greenLedMode = "blink";
       else greenLedMode = "auto";
       updateGreenLed();
+      logEspInteraction();
     }
     sendCorsOk();
   });
@@ -990,6 +1019,7 @@ void setupWebServer() {
       playToneSafe(880, 110); delay(30);
       playToneSafe(1318, 150);
     }
+    logEspInteraction();
     sendCorsOk();
   });
 
@@ -1014,6 +1044,7 @@ void setupWebServer() {
       activeScreen = "bitmap";
       screenLocked = true;
       isSleeping = false;
+      logEspInteraction();
     }
     sendCorsOk();
   });
@@ -1027,6 +1058,7 @@ void setupWebServer() {
     alarms[slot].faceId  = server.hasArg("face") ? constrain(server.arg("face").toInt(), 0, 24) : 1;
     alarms[slot].melody  = server.hasArg("melody") ? constrain(server.arg("melody").toInt(), 0, 2) : 0;
     if (server.hasArg("label")) alarms[slot].label = server.arg("label").substring(0, 18);
+    logEspInteraction();
     sendCorsOk();
   });
 

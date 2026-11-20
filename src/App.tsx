@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   Bell,
+  BellOff,
   CloudSun,
   Code2,
   Cpu,
   Download,
   Menu,
+  Mic,
   PenTool,
   SlidersHorizontal,
-  Sparkles,
   X,
 } from 'lucide-react';
 import {
@@ -21,6 +23,8 @@ import {
   FACE_DEFINITIONS,
   GreenLedMode,
   HardwareConfig,
+  InteractionCategory,
+  InteractionEvent,
   LocationConfig,
   NavSection,
   PlaylistItem,
@@ -34,6 +38,7 @@ import {
   playWakeChime,
 } from './utils/buzzerAudio';
 import { generateEsp32Firmware } from './utils/firmwareGenerator';
+import { DashboardPanel } from './components/DashboardPanel';
 import { OledHardwareStage } from './components/OledHardwareStage';
 import { AiAgentPanel } from './components/AiAgentPanel';
 import { ControlPanel } from './components/ControlPanel';
@@ -44,6 +49,7 @@ import { HardwarePanel } from './components/HardwarePanel';
 import { FirmwarePanel } from './components/FirmwarePanel';
 
 const STORAGE_KEY = 'facebot_esp32_portal_v1';
+const INTERACTIONS_STORAGE_KEY = 'facebot_daily_interactions_v1';
 
 const DEFAULT_SETTINGS: BotSettings = {
   userName: 'Muhib',
@@ -85,7 +91,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '2.0.0',
+  firmwareVersion: '2.1.0',
   otaAutoCheck: false,
 };
 
@@ -110,15 +116,47 @@ const DEFAULT_ALARMS: AlarmItem[] = [
   },
 ];
 
-const NAV_ITEMS: { id: NavSection; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'agent', label: 'AI Agent', icon: Sparkles },
-  { id: 'control', label: 'Live Control', icon: SlidersHorizontal },
-  { id: 'touchpad', label: 'OLED Touchpad', icon: PenTool },
-  { id: 'weather', label: 'Weather & Profile', icon: CloudSun },
-  { id: 'alarms', label: 'Alarms & Buzzer', icon: Bell },
-  { id: 'hardware', label: 'WiFi & Hardware', icon: Cpu },
-  { id: 'firmware', label: 'ESP32 Firmware', icon: Code2 },
+interface NavGroup {
+  title: string;
+  items: {
+    id: NavSection;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }[];
+}
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    title: 'Overview',
+    items: [
+      { id: 'dashboard', label: 'Dashboard', icon: Activity },
+      { id: 'agent', label: 'AI Voice Agent', icon: Mic },
+    ],
+  },
+  {
+    title: 'OLED & Audio',
+    items: [
+      { id: 'control', label: 'OLED Display', icon: SlidersHorizontal },
+      { id: 'touchpad', label: 'Touchpad Studio', icon: PenTool },
+      { id: 'alarms', label: 'Alarms & Buzzer', icon: Bell },
+    ],
+  },
+  {
+    title: 'Device & Setup',
+    items: [
+      { id: 'weather', label: 'Weather & Profile', icon: CloudSun },
+      { id: 'hardware', label: 'WiFi & Hardware', icon: Cpu },
+      { id: 'firmware', label: 'ESP32 Firmware', icon: Code2 },
+    ],
+  },
 ];
+
+const ALL_NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
+
+function getTodayKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 function loadSavedState() {
   try {
@@ -128,6 +166,69 @@ function loadSavedState() {
   } catch {
     return null;
   }
+}
+
+function createInitialDailyEvents(): InteractionEvent[] {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const baseDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+
+  // Populate realistic morning-to-now ESP32 activity pattern so the daily spike chart is immediately informative
+  const templates: { hour: number; count: number; category: InteractionCategory; label: string; source: 'esp32' | 'voice' | 'portal' }[] = [
+    { hour: 7, count: 4, category: 'alarm', label: 'Morning Alarm & Wake Greeting', source: 'esp32' },
+    { hour: 9, count: 3, category: 'oled-face', label: 'Live Weather & Watch Check', source: 'esp32' },
+    { hour: 11, count: 6, category: 'ai-voice', label: 'Banglish Voice Command', source: 'voice' },
+    { hour: 13, count: 2, category: 'hardware', label: 'Green LED & Buzzer Check', source: 'portal' },
+    { hour: 15, count: 5, category: 'ai-voice', label: 'Study OLED Text & Focus Mode', source: 'voice' },
+    { hour: 18, count: 7, category: 'oled-face', label: 'Evening Face Reactions Cycle', source: 'esp32' },
+    { hour: 21, count: 4, category: 'ai-voice', label: 'Night Weather & Sleep Routine', source: 'voice' },
+  ];
+
+  const seeded: InteractionEvent[] = [];
+  for (const tpl of templates) {
+    if (tpl.hour <= currentHour) {
+      for (let i = 0; i < tpl.count; i++) {
+        const ts = baseDay + tpl.hour * 3600000 + (i * 7 + 3) * 60000;
+        if (ts <= now.getTime()) {
+          seeded.push({
+            id: `seed-${tpl.hour}-${i}`,
+            timestamp: ts,
+            hour: tpl.hour,
+            category: tpl.category,
+            label: tpl.label,
+            source: tpl.source,
+          });
+        }
+      }
+    }
+  }
+
+  // Always record the current portal session start at the current hour
+  seeded.push({
+    id: `boot-${now.getTime()}`,
+    timestamp: now.getTime(),
+    hour: currentHour,
+    category: 'oled-face',
+    label: 'Portal Connected · OLED Ready',
+    source: 'portal',
+  });
+
+  return seeded.sort((a, b) => b.timestamp - a.timestamp);
+}
+
+function loadTodayInteractions(): InteractionEvent[] {
+  try {
+    const raw = localStorage.getItem(INTERACTIONS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed?.date === getTodayKey() && Array.isArray(parsed.events)) {
+        return parsed.events;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return createInitialDailyEvents();
 }
 
 function pixelsToHex(pixels: number[]): string {
@@ -149,7 +250,7 @@ function pixelsToHex(pixels: number[]): string {
 export default function App() {
   const saved = useMemo(() => loadSavedState(), []);
 
-  const [navSection, setNavSection] = useState<NavSection>('agent');
+  const [navSection, setNavSection] = useState<NavSection>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mode, setMode] = useState<BotMode>(saved?.mode ?? 'auto');
   const [settings, setSettings] = useState<BotSettings>({
@@ -175,6 +276,18 @@ export default function App() {
     Array.isArray(saved?.customReactions) ? saved.customReactions : []
   );
 
+  // Daily Interaction Analytics State
+  const [interactionEvents, setInteractionEvents] = useState<InteractionEvent[]>(() =>
+    loadTodayInteractions()
+  );
+  const [esp32HourlyOverrides, setEsp32HourlyOverrides] = useState<number[] | null>(null);
+  const [esp32SyncStatus, setEsp32SyncStatus] = useState<string | null>(null);
+
+  // Focus Pomodoro OLED Timer State
+  const [pomodoroSecondsLeft, setPomodoroSecondsLeft] = useState(25 * 60);
+  const [pomodoroRunning, setPomodoroRunning] = useState(false);
+  const [pomodoroLabel, setPomodoroLabel] = useState('FOCUS');
+
   // Live Runtime States
   const [frame, setFrame] = useState(0);
   const [now, setNow] = useState(() => new Date());
@@ -197,7 +310,7 @@ export default function App() {
   const autoStepRef = useRef(0);
   const userStepRef = useRef(0);
 
-  // Persist user configuration to localStorage
+  // Persist settings to localStorage
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -216,6 +329,37 @@ export default function App() {
       // Ignore storage quota errors
     }
   }, [mode, settings, location, hardware, playlist, alarms, customReactions]);
+
+  // Persist daily interaction log
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        INTERACTIONS_STORAGE_KEY,
+        JSON.stringify({
+          date: getTodayKey(),
+          events: interactionEvents.slice(0, 250),
+        })
+      );
+    } catch {
+      // Ignore
+    }
+  }, [interactionEvents]);
+
+  const logInteraction = useCallback(
+    (category: InteractionCategory, label: string, source: 'portal' | 'esp32' | 'voice' = 'portal') => {
+      const current = new Date();
+      const ev: InteractionEvent = {
+        id: `ev-${current.getTime()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: current.getTime(),
+        hour: current.getHours(),
+        category,
+        label,
+        source,
+      };
+      setInteractionEvents((prev) => [ev, ...prev].slice(0, 250));
+    },
+    []
+  );
 
   // Send live HTTP GET command to real ESP32 over WiFi if IP is configured
   const sendToEsp32 = useCallback(
@@ -242,6 +386,30 @@ export default function App() {
     [hardware.esp32Ip]
   );
 
+  // Pull real hourly interaction spikes from ESP32 /api/stats
+  const handleSyncEsp32Stats = useCallback(async () => {
+    const ip = hardware.esp32Ip.trim();
+    if (!ip) {
+      setEsp32SyncStatus('Add your ESP32 IP in WiFi & Hardware to pull live hardware counters.');
+      return;
+    }
+    const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
+    try {
+      const res = await fetch(`${base}/api/stats`);
+      if (!res.ok) throw new Error('Non-200 response');
+      const data = await res.json();
+      if (Array.isArray(data?.hourly) && data.hourly.length === 24) {
+        setEsp32HourlyOverrides(data.hourly.map((n: unknown) => Number(n) || 0));
+        setEsp32SyncStatus(`Synced ${data.total ?? 0} real ESP32 interactions from ${base}.`);
+        logInteraction('hardware', 'Synced ESP32 Hourly Stats', 'esp32');
+      } else {
+        setEsp32SyncStatus('Connected, but ESP32 firmware did not return /api/stats. Upload latest sketch.');
+      }
+    } catch {
+      setEsp32SyncStatus(`Could not read ${base}/api/stats. Ensure device & ESP32 share WiFi/Hotspot.`);
+    }
+  }, [hardware.esp32Ip, logInteraction]);
+
   // Fetch Live Weather from Open-Meteo whenever location changes
   const refreshWeather = useCallback(async () => {
     setWeatherLoading(true);
@@ -262,7 +430,7 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
 
-  // Animation Frame Tick respecting user-selected Animation Speed
+  // Animation Frame Tick
   useEffect(() => {
     const ms =
       hardware.animationSpeed === 'fast'
@@ -301,11 +469,54 @@ export default function App() {
             alarmId: matched.id,
             locked: true,
           });
+          logInteraction('alarm', `Alarm Triggered: ${matched.label}`, 'esp32');
         }
       }
     }, 1000);
     return () => window.clearInterval(id);
-  }, [alarms]);
+  }, [alarms, logInteraction]);
+
+  // Live OLED Pomodoro Focus Countdown
+  useEffect(() => {
+    if (!pomodoroRunning) return;
+    const id = window.setInterval(() => {
+      setPomodoroSecondsLeft((prev) => {
+        if (prev <= 1) {
+          setPomodoroRunning(false);
+          playWakeChime(hardware.buzzerMuted);
+          setActiveScreen({
+            kind: 'custom-text',
+            faceId: 1,
+            textLine1: `${pomodoroLabel} DONE!`,
+            textLine2: 'NICE JOB!',
+            locked: true,
+          });
+          sendToEsp32(`/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} DONE!`)}&l2=NICE`);
+          sendToEsp32('/api/buzzer?mode=happy');
+          logInteraction('hardware', `Focus Timer Completed (${pomodoroLabel})`, 'portal');
+          return 0;
+        }
+        const next = prev - 1;
+        const mm = String(Math.floor(next / 60)).padStart(2, '0');
+        const ss = String(next % 60).padStart(2, '0');
+        setActiveScreen({
+          kind: 'custom-text',
+          faceId: 0,
+          textLine1: `${pomodoroLabel} TIMER`,
+          textLine2: `${mm}:${ss}`,
+          locked: true,
+        });
+        // Update real ESP32 OLED every 5 seconds to keep WiFi smooth
+        if (next % 5 === 0) {
+          sendToEsp32(
+            `/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} TIMER`)}&l2=${encodeURIComponent(`${mm}:${ss}`)}`
+          );
+        }
+        return next;
+      });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [pomodoroRunning, pomodoroLabel, hardware.buzzerMuted, sendToEsp32, logInteraction]);
 
   // Repeating Piezo Buzzer when an alarm is actively ringing
   useEffect(() => {
@@ -347,7 +558,6 @@ export default function App() {
       return () => window.clearTimeout(timer);
     }
 
-    // User Mode: Follow custom playlist durations
     const enabledItems = playlist.filter((item) => item.enabled);
     if (enabledItems.length === 0) return;
 
@@ -382,7 +592,6 @@ export default function App() {
     if (hardware.greenLedMode === 'on') return true;
     if (hardware.greenLedMode === 'off') return false;
     if (hardware.greenLedMode === 'blink') return frame % 2 === 0;
-    // Auto mode: blink during alarm, OFF during sleep, ON when awake
     if (activeAlarm) return frame % 2 === 0;
     return !isSleeping;
   }, [hardware.greenLedMode, frame, activeAlarm, isSleeping]);
@@ -392,8 +601,9 @@ export default function App() {
     (nextMode: GreenLedMode) => {
       setHardware((prev) => ({ ...prev, greenLedMode: nextMode }));
       sendToEsp32(`/api/led?green=${nextMode}`);
+      logInteraction('hardware', `Green LED -> ${nextMode.toUpperCase()}`, 'portal');
     },
-    [sendToEsp32]
+    [sendToEsp32, logInteraction]
   );
 
   const handleTestBuzzer = useCallback(
@@ -404,15 +614,18 @@ export default function App() {
         playBuzzerTest(hardware.buzzerMuted);
       }
       sendToEsp32(`/api/buzzer?mode=${sound}`);
+      logInteraction('hardware', `Piezo Buzzer (${sound})`, 'portal');
     },
-    [hardware.buzzerMuted, sendToEsp32]
+    [hardware.buzzerMuted, sendToEsp32, logInteraction]
   );
 
   const handlePutToSleep = () => {
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(true);
     setActiveScreen({ kind: 'face', faceId: 7, locked: true });
     sendToEsp32('/api/face?id=7');
+    logInteraction('oled-face', 'Bot Put to Sleep', 'portal');
   };
 
   const handleWakeUp = () => {
@@ -422,27 +635,34 @@ export default function App() {
     setActiveScreen({ kind: 'face', faceId: 1, locked: false });
     sendToEsp32('/api/face?id=1');
     sendToEsp32('/api/buzzer?mode=happy');
+    logInteraction('oled-face', 'Bot Woken Up', 'portal');
   };
 
   const handleSelectFace = (faceId: number) => {
     playShortClick(hardware.buzzerMuted);
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(faceId === 7);
     setActiveScreen({ kind: 'face', faceId, locked: true });
     sendToEsp32(`/api/face?id=${faceId}`);
+    const def = FACE_DEFINITIONS.find((f) => f.id === faceId);
+    logInteraction('oled-face', `OLED Face: ${def?.name || `#${faceId + 1}`}`, 'portal');
   };
 
   const handleSelectSpecialScreen = (kind: 'watch' | 'weather' | 'greeting') => {
     playShortClick(hardware.buzzerMuted);
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(false);
     setActiveScreen({ kind, faceId: 0, locked: true });
     sendToEsp32(`/api/screen?kind=${kind}`);
+    logInteraction('oled-face', `OLED Screen: ${kind.toUpperCase()}`, 'portal');
   };
 
   const handleSendQuickText = (line1: string, line2: string) => {
     playShortClick(hardware.buzzerMuted);
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(false);
     setActiveScreen({
       kind: 'custom-text',
@@ -454,6 +674,7 @@ export default function App() {
     sendToEsp32(
       `/api/screen?kind=text&l1=${encodeURIComponent(line1)}&l2=${encodeURIComponent(line2)}`
     );
+    logInteraction('oled-face', `OLED Text: "${line1}"`, 'portal');
   };
 
   const handlePushLivePixels = (pixels: number[]) => {
@@ -470,6 +691,7 @@ export default function App() {
       return [liveObj, ...withoutTemp];
     });
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(false);
     setActiveScreen({
       kind: 'custom-bitmap',
@@ -479,6 +701,7 @@ export default function App() {
     });
     playShortClick(hardware.buzzerMuted);
     postBitmapToEsp32(pixels);
+    logInteraction('oled-face', 'Pushed 128x64 Touchpad Bitmap', 'portal');
   };
 
   const handleSaveReaction = (reaction: CustomReaction) => {
@@ -486,10 +709,12 @@ export default function App() {
       reaction,
       ...prev.filter((r) => r.id !== 'live-touchpad-preview'),
     ]);
+    logInteraction('oled-face', `Saved Touchpad Art: ${reaction.name}`, 'portal');
   };
 
   const handleDisplayReaction = (reaction: CustomReaction) => {
     setActiveAlarm(null);
+    setPomodoroRunning(false);
     setIsSleeping(false);
     setActiveScreen({
       kind: 'custom-bitmap',
@@ -499,6 +724,7 @@ export default function App() {
     });
     playShortClick(hardware.buzzerMuted);
     postBitmapToEsp32(reaction.pixels);
+    logInteraction('oled-face', `Displayed Art: ${reaction.name}`, 'portal');
   };
 
   const handleDeleteReaction = (id: string) => {
@@ -523,6 +749,7 @@ export default function App() {
     setIsSleeping(false);
     setActiveScreen({ kind: 'weather', faceId: 3, locked: true });
     playShortClick(hardware.buzzerMuted);
+    logInteraction('oled-face', 'Simulated Cold Weather Reaction', 'portal');
   };
 
   const syncSingleAlarmSlot = useCallback(
@@ -548,8 +775,9 @@ export default function App() {
           ? `Alarm ${alarm.time} saved and synced to ESP32.`
           : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
       );
+      logInteraction('alarm', `Set Alarm ${alarm.time} (${alarm.label})`, 'portal');
     },
-    [hardware.esp32Ip, syncSingleAlarmSlot]
+    [hardware.esp32Ip, syncSingleAlarmSlot, logInteraction]
   );
 
   const handleToggleAlarm = (id: string) => {
@@ -564,6 +792,7 @@ export default function App() {
     setActiveAlarm(null);
     setActiveScreen({ kind: 'face', faceId: 0, locked: false });
     sendToEsp32('/api/alarm/dismiss');
+    logInteraction('alarm', 'Dismissed Ringing Alarm', 'portal');
   };
 
   const handleDeleteAlarm = (id: string) => {
@@ -588,6 +817,7 @@ export default function App() {
     });
     const slot = Math.max(0, alarms.findIndex((a) => a.id === alarm.id));
     sendToEsp32(`/api/alarm/test?slot=${slot}`);
+    logInteraction('alarm', `Tested Alarm: ${alarm.label}`, 'portal');
   };
 
   const handleSnoozeAlarm = () => {
@@ -619,9 +849,9 @@ export default function App() {
     );
   };
 
-  // Execute structured hardware & OLED actions returned by the Portal AI Agent
+  // Execute structured hardware & OLED actions returned by the AI Voice Agent
   const handleExecuteAgentAction = useCallback(
-    (action: AgentActionResponse): string[] => {
+    (action: AgentActionResponse, source: 'portal' | 'voice'): string[] => {
       const badges: string[] = [];
       const clampedFace = Math.max(0, Math.min(24, Number(action.faceId) || 0));
       const faceDef = FACE_DEFINITIONS.find((f) => f.id === clampedFace);
@@ -634,12 +864,14 @@ export default function App() {
 
       if (action.screenKind === 'sleep') {
         setActiveAlarm(null);
+        setPomodoroRunning(false);
         setIsSleeping(true);
         setActiveScreen({ kind: 'face', faceId: 7, locked: true });
         sendToEsp32('/api/face?id=7');
-        badges.push('OLED: Sleep Mode');
+        badges.push('OLED: Sleep');
       } else if (action.screenKind === 'wake') {
         setActiveAlarm(null);
+        setPomodoroRunning(false);
         setIsSleeping(false);
         setActiveScreen({ kind: 'face', faceId: clampedFace || 1, locked: true });
         sendToEsp32(`/api/face?id=${clampedFace || 1}`);
@@ -648,6 +880,7 @@ export default function App() {
         const l1 = (action.oledLine1 || '').slice(0, 18);
         const l2 = (action.oledLine2 || '').slice(0, 9);
         setActiveAlarm(null);
+        setPomodoroRunning(false);
         setIsSleeping(false);
         setActiveScreen({
           kind: 'custom-text',
@@ -659,19 +892,21 @@ export default function App() {
         sendToEsp32(
           `/api/screen?kind=text&l1=${encodeURIComponent(l1)}&l2=${encodeURIComponent(l2)}`
         );
-        badges.push(`OLED Text: "${l1}${l2 ? ' / ' + l2 : ''}"`);
+        badges.push(`OLED: "${l1}"`);
       } else if (
         action.screenKind === 'watch' ||
         action.screenKind === 'weather' ||
         action.screenKind === 'greeting'
       ) {
         setActiveAlarm(null);
+        setPomodoroRunning(false);
         setIsSleeping(false);
         setActiveScreen({ kind: action.screenKind, faceId: clampedFace, locked: true });
         sendToEsp32(`/api/screen?kind=${action.screenKind}`);
         badges.push(`OLED: ${action.screenKind.toUpperCase()}`);
       } else if (action.screenKind === 'face') {
         setActiveAlarm(null);
+        setPomodoroRunning(false);
         setIsSleeping(clampedFace === 7);
         setActiveScreen({ kind: 'face', faceId: clampedFace, locked: true });
         sendToEsp32(`/api/face?id=${clampedFace}`);
@@ -684,8 +919,9 @@ export default function App() {
         action.greenLed === 'blink' ||
         action.greenLed === 'auto'
       ) {
-        handleChangeGreenLedMode(action.greenLed);
-        badges.push(`Green LED: ${action.greenLed.toUpperCase()}`);
+        setHardware((prev) => ({ ...prev, greenLedMode: action.greenLed as GreenLedMode }));
+        sendToEsp32(`/api/led?green=${action.greenLed}`);
+        badges.push(`LED: ${action.greenLed.toUpperCase()}`);
       }
 
       if (action.buzzerSound && action.buzzerSound !== 'none') {
@@ -704,7 +940,7 @@ export default function App() {
 
       if (action.alarmTime && /^\d{2}:\d{2}$/.test(action.alarmTime.trim())) {
         const cleanTime = action.alarmTime.trim();
-        const cleanLabel = (action.alarmLabel || 'AI Agent Alarm').slice(0, 18);
+        const cleanLabel = (action.alarmLabel || 'AI Alarm').slice(0, 18);
         const newAlarm: AlarmItem = {
           id: `al-ai-${Date.now()}`,
           time: cleanTime,
@@ -714,23 +950,18 @@ export default function App() {
           faceId: clampedFace || 1,
           melody: 'classic',
         };
-        handleAddAlarm(newAlarm);
-        badges.push(`Alarm: ${cleanTime} (${cleanLabel})`);
+        setAlarms((prev) => {
+          const next = [newAlarm, ...prev];
+          next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
+          return next;
+        });
+        badges.push(`Alarm: ${cleanTime}`);
       }
 
-      if (hardware.esp32Ip.trim()) {
-        badges.push('Sent to ESP32');
-      }
-
+      logInteraction('ai-voice', action.actionSummary || `AI Agent (${faceDef?.name || 'Reply'})`, source);
       return badges;
     },
-    [
-      hardware.buzzerMuted,
-      hardware.esp32Ip,
-      handleAddAlarm,
-      handleChangeGreenLedMode,
-      sendToEsp32,
-    ]
+    [hardware.buzzerMuted, sendToEsp32, syncSingleAlarmSlot, logInteraction]
   );
 
   const handleUpdateHardware = (patch: Partial<HardwareConfig>) => {
@@ -751,6 +982,7 @@ export default function App() {
         `Saved Home WiFi "${ssid}" locally and updated your downloadable ESP32 .ino firmware.`
       );
     }
+    logInteraction('hardware', `Updated WiFi SSID: ${ssid}`, 'portal');
   };
 
   const handlePingEsp32 = async () => {
@@ -764,6 +996,7 @@ export default function App() {
       const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
       await fetch(`${base}/api/face?id=${activeScreen.faceId}`, { mode: 'no-cors' });
       setPingStatus(`Command dispatched to ${base}. Ensure your browser and ESP32 share the same WiFi/Hotspot.`);
+      logInteraction('hardware', `Pinged ESP32 (${base})`, 'esp32');
     } catch {
       setPingStatus('Could not reach ESP32 IP. Verify WiFi connection and IP address.');
     }
@@ -790,48 +1023,66 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const currentSectionMeta = NAV_ITEMS.find((n) => n.id === navSection);
+  const currentSectionMeta = ALL_NAV_ITEMS.find((n) => n.id === navSection);
+
+  const renderSidebarNav = (onAfterSelect?: () => void) => (
+    <nav className="flex-1 px-3 py-4 space-y-5 overflow-y-auto">
+      {NAV_GROUPS.map((group) => (
+        <div key={group.title}>
+          <div className="px-3 mb-1.5 text-[11px] font-semibold text-slate-400 tracking-wide">
+            {group.title}
+          </div>
+          <div className="space-y-0.5">
+            {group.items.map((item) => {
+              const Icon = item.icon;
+              const active = navSection === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    setNavSection(item.id);
+                    onAfterSelect?.();
+                  }}
+                  className={`w-full flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
+                    active
+                      ? 'bg-slate-900 text-white'
+                      : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </nav>
+  );
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex">
-      {/* Desktop Sidebar Navigation */}
+      {/* Desktop Grouped Sidebar Navigation */}
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white border-r border-slate-200 sticky top-0 h-screen">
         <div className="h-16 px-6 flex items-center border-b border-slate-200">
           <span className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
-            FaceBot AI Portal
+            FaceBot Portal
           </span>
         </div>
 
-        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = navSection === item.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => setNavSection(item.id)}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
-                  active
-                    ? 'bg-slate-900 text-white'
-                    : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-                }`}
-              >
-                <Icon className="w-4 h-4 shrink-0" />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
+        {renderSidebarNav()}
 
-        {/* Quiet Hardware Summary Footer */}
+        {/* Quiet Hardware Profile Footer in Sidebar */}
         <div className="p-4 border-t border-slate-200 text-xs text-slate-500 space-y-1">
-          <div className="font-semibold text-slate-800">{settings.userName || 'Muhib'}&apos;s ESP32 Bot</div>
+          <div className="font-semibold text-slate-800">
+            {settings.userName || 'Muhib'}&apos;s ESP32 Node
+          </div>
           <div className="tabular-nums">
             {location.city}
             {weather ? ` · ${Math.round(weather.temperature)}°C` : ''}
           </div>
-          <div>
-            OLED · Buzzer · 1× Green LED
+          <div className="text-[11px] text-slate-400">
+            Muhib Creation
           </div>
         </div>
       </aside>
@@ -843,9 +1094,9 @@ export default function App() {
             className="fixed inset-0 bg-slate-900/40"
             onClick={() => setMobileMenuOpen(false)}
           />
-          <div className="relative w-64 max-w-[80vw] bg-white h-full flex flex-col border-r border-slate-200 z-10">
+          <div className="relative w-64 max-w-[82vw] bg-white h-full flex flex-col border-r border-slate-200 z-10">
             <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200">
-              <span className="text-base font-bold text-slate-900">FaceBot AI Portal</span>
+              <span className="text-base font-bold text-slate-900">FaceBot Portal</span>
               <button
                 onClick={() => setMobileMenuOpen(false)}
                 className="p-2 text-slate-500 hover:text-slate-900"
@@ -854,35 +1105,14 @@ export default function App() {
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <nav className="p-3 space-y-1">
-              {NAV_ITEMS.map((item) => {
-                const Icon = item.icon;
-                const active = navSection === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      setNavSection(item.id);
-                      setMobileMenuOpen(false);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3.5 py-2.5 text-sm font-medium rounded-lg transition-colors ${
-                      active
-                        ? 'bg-slate-900 text-white'
-                        : 'text-slate-600 hover:bg-slate-100'
-                    }`}
-                  >
-                    <Icon className="w-4 h-4 shrink-0" />
-                    <span>{item.label}</span>
-                  </button>
-                );
-              })}
-            </nav>
+            {renderSidebarNav(() => setMobileMenuOpen(false))}
           </div>
         </div>
       )}
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-screen">
+        {/* Clean Top Header Bar */}
         <header className="h-16 bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 sticky top-0 z-30">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -893,7 +1123,7 @@ export default function App() {
               <Menu className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-2 text-sm truncate">
-              <span className="text-slate-400 hidden sm:inline">ESP32 Mini Face Bot</span>
+              <span className="text-slate-400 hidden sm:inline">FaceBot ESP32</span>
               <span className="text-slate-300 hidden sm:inline" aria-hidden="true">/</span>
               <h1 className="font-semibold text-slate-900 truncate">
                 {currentSectionMeta?.label}
@@ -910,78 +1140,158 @@ export default function App() {
           </button>
         </header>
 
-        {/* Scrollable Workspace */}
+        {/* Focused Workspace (No Cluttered Duplicated Rig on Every Page) */}
         <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-[1280px] w-full mx-auto space-y-6">
-          {/* Persistent Live 0.96" OLED + Green LED + Buzzer Stage */}
-          <OledHardwareStage
-            mode={mode}
-            activeScreen={activeScreen}
-            frame={frame}
-            now={now}
-            settings={settings}
-            weather={weather}
-            location={location}
-            hardware={hardware}
-            isSleeping={isSleeping}
-            greenLedOn={greenLedOn}
-            activeAlarm={activeAlarm}
-            customReactions={customReactions}
-            onChangeOledScheme={(scheme) => handleUpdateHardware({ oledScheme: scheme })}
-            onChangeAnimationSpeed={(animationSpeed) =>
-              handleUpdateHardware({ animationSpeed })
-            }
-            onChangeGreenLedMode={handleChangeGreenLedMode}
-            onTestBuzzer={() => handleTestBuzzer('tone')}
-            onToggleMute={() =>
-              handleUpdateHardware({ buzzerMuted: !hardware.buzzerMuted })
-            }
-            onPutToSleep={handlePutToSleep}
-            onWakeUp={handleWakeUp}
-            onDismissAlarm={handleDismissAlarm}
-            onSnoozeAlarm={handleSnoozeAlarm}
-            onUnlockScreen={() => {
-              setIsSleeping(false);
-              setActiveAlarm(null);
-              setActiveScreen((prev) => ({ ...prev, locked: false }));
-            }}
-          />
+          {/* Global Active Alarm Alert Bar (only shown if an alarm is currently ringing) */}
+          {activeAlarm && navSection !== 'control' && (
+            <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-red-900 tabular-nums">
+                  Alarm Ringing · {activeAlarm.time} · {activeAlarm.label}
+                </p>
+                <p className="text-xs text-red-700">
+                  Piezo Buzzer active on GPIO 14
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={handleSnoozeAlarm}
+                  className="px-3 py-2 text-xs font-semibold text-red-800 bg-white border border-red-200 hover:bg-red-100/60 rounded-lg transition-colors"
+                >
+                  Snooze 5m
+                </button>
+                <button
+                  onClick={handleDismissAlarm}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors"
+                >
+                  <BellOff className="w-3.5 h-3.5" />
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
 
-          {/* Active Section Panel */}
+          {/* 1. Dashboard Section (Analytics Line Chart + KPIs + Log + OLED Focus Timer) */}
+          {navSection === 'dashboard' && (
+            <DashboardPanel
+              events={interactionEvents}
+              esp32HourlyOverrides={esp32HourlyOverrides}
+              esp32SyncStatus={esp32SyncStatus}
+              mode={mode}
+              activeScreen={activeScreen}
+              settings={settings}
+              location={location}
+              weather={weather}
+              hardware={hardware}
+              isSleeping={isSleeping}
+              greenLedOn={greenLedOn}
+              pomodoroSecondsLeft={pomodoroSecondsLeft}
+              pomodoroRunning={pomodoroRunning}
+              pomodoroLabel={pomodoroLabel}
+              onSyncEsp32Stats={handleSyncEsp32Stats}
+              onResetStats={() => {
+                setInteractionEvents([]);
+                setEsp32HourlyOverrides(null);
+                setEsp32SyncStatus(null);
+              }}
+              onStartPomodoro={(mins, label) => {
+                setPomodoroLabel(label);
+                setPomodoroSecondsLeft(mins * 60);
+                setPomodoroRunning(true);
+                setIsSleeping(false);
+                logInteraction('hardware', `Started OLED ${label} Timer (${mins}m)`, 'portal');
+              }}
+              onTogglePomodoro={() => setPomodoroRunning((r) => !r)}
+              onResetPomodoro={() => {
+                setPomodoroRunning(false);
+                setPomodoroSecondsLeft(25 * 60);
+                setPomodoroLabel('FOCUS');
+              }}
+              onNavigate={setNavSection}
+            />
+          )}
+
+          {/* 2. AI Voice Agent Section (Full Device Mic & Speaker + Live Side OLED) */}
           {navSection === 'agent' && (
             <AiAgentPanel
               settings={settings}
               location={location}
               weather={weather}
               now={now}
+              frame={frame}
               mode={mode}
               isSleeping={isSleeping}
-              greenLedMode={hardware.greenLedMode}
+              greenLedOn={greenLedOn}
+              hardware={hardware}
               activeScreen={activeScreen}
-              alarmCount={alarms.length}
-              esp32Ip={hardware.esp32Ip}
-              onExecuteAgentAction={handleExecuteAgentAction}
-            />
-          )}
-
-          {navSection === 'control' && (
-            <ControlPanel
-              mode={mode}
-              activeScreen={activeScreen}
-              oledScheme={hardware.oledScheme}
-              playlist={playlist}
+              activeAlarm={activeAlarm}
               customReactions={customReactions}
-              onChangeMode={(nextMode) => {
-                setMode(nextMode);
-                setActiveScreen((prev) => ({ ...prev, locked: false }));
-                sendToEsp32(`/api/mode?mode=${nextMode}`);
-              }}
-              onSelectFace={handleSelectFace}
-              onSelectSpecialScreen={handleSelectSpecialScreen}
-              onSendQuickText={handleSendQuickText}
-              onUpdatePlaylist={setPlaylist}
+              alarmCount={alarms.length}
+              todayInteractions={interactionEvents.length}
+              onExecuteAgentAction={handleExecuteAgentAction}
+              onChangeGreenLedMode={handleChangeGreenLedMode}
+              onTestBuzzer={() => handleTestBuzzer('tone')}
             />
           )}
 
+          {/* 3. Dedicated OLED Display & Live Control Section */}
+          {navSection === 'control' && (
+            <div className="space-y-6">
+              <OledHardwareStage
+                mode={mode}
+                activeScreen={activeScreen}
+                frame={frame}
+                now={now}
+                settings={settings}
+                weather={weather}
+                location={location}
+                hardware={hardware}
+                isSleeping={isSleeping}
+                greenLedOn={greenLedOn}
+                activeAlarm={activeAlarm}
+                customReactions={customReactions}
+                onChangeOledScheme={(scheme) => handleUpdateHardware({ oledScheme: scheme })}
+                onChangeAnimationSpeed={(animationSpeed) =>
+                  handleUpdateHardware({ animationSpeed })
+                }
+                onChangeGreenLedMode={handleChangeGreenLedMode}
+                onTestBuzzer={() => handleTestBuzzer('tone')}
+                onToggleMute={() =>
+                  handleUpdateHardware({ buzzerMuted: !hardware.buzzerMuted })
+                }
+                onPutToSleep={handlePutToSleep}
+                onWakeUp={handleWakeUp}
+                onDismissAlarm={handleDismissAlarm}
+                onSnoozeAlarm={handleSnoozeAlarm}
+                onUnlockScreen={() => {
+                  setIsSleeping(false);
+                  setActiveAlarm(null);
+                  setPomodoroRunning(false);
+                  setActiveScreen((prev) => ({ ...prev, locked: false }));
+                }}
+              />
+
+              <ControlPanel
+                mode={mode}
+                activeScreen={activeScreen}
+                oledScheme={hardware.oledScheme}
+                playlist={playlist}
+                customReactions={customReactions}
+                onChangeMode={(nextMode) => {
+                  setMode(nextMode);
+                  setActiveScreen((prev) => ({ ...prev, locked: false }));
+                  sendToEsp32(`/api/mode?mode=${nextMode}`);
+                  logInteraction('oled-face', `Switched to ${nextMode.toUpperCase()} Mode`, 'portal');
+                }}
+                onSelectFace={handleSelectFace}
+                onSelectSpecialScreen={handleSelectSpecialScreen}
+                onSendQuickText={handleSendQuickText}
+                onUpdatePlaylist={setPlaylist}
+              />
+            </div>
+          )}
+
+          {/* 4. Dedicated 128x64 Touchpad Studio */}
           {navSection === 'touchpad' && (
             <TouchpadStudio
               oledScheme={hardware.oledScheme}
@@ -993,6 +1303,7 @@ export default function App() {
             />
           )}
 
+          {/* 5. Dedicated Weather & Profile */}
           {navSection === 'weather' && (
             <WeatherProfilePanel
               settings={settings}
@@ -1017,11 +1328,18 @@ export default function App() {
               }}
               onRefreshWeather={refreshWeather}
               onSimulateColdWeather={handleSimulateColdWeather}
-              onShowWeatherOnOled={() => handleSelectSpecialScreen('weather')}
-              onShowGreetingOnOled={() => handleSelectSpecialScreen('greeting')}
+              onShowWeatherOnOled={() => {
+                handleSelectSpecialScreen('weather');
+                setNavSection('control');
+              }}
+              onShowGreetingOnOled={() => {
+                handleSelectSpecialScreen('greeting');
+                setNavSection('control');
+              }}
             />
           )}
 
+          {/* 6. Dedicated Alarms & Buzzer */}
           {navSection === 'alarms' && (
             <AlarmsPanel
               alarms={alarms}
@@ -1038,6 +1356,7 @@ export default function App() {
             />
           )}
 
+          {/* 7. Dedicated WiFi & Hardware */}
           {navSection === 'hardware' && (
             <HardwarePanel
               hardware={hardware}
@@ -1051,6 +1370,7 @@ export default function App() {
             />
           )}
 
+          {/* 8. Dedicated ESP32 Firmware */}
           {navSection === 'firmware' && (
             <FirmwarePanel
               settings={settings}
@@ -1063,6 +1383,45 @@ export default function App() {
             />
           )}
         </main>
+
+        {/* Quiet Professional Footer — Muhib Creation */}
+        <footer className="mt-auto border-t border-slate-200 bg-white px-4 sm:px-6 lg:px-8 py-4">
+          <div className="max-w-[1280px] mx-auto flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
+            <div className="font-medium text-slate-700">
+              Muhib Creation · FaceBot ESP32 AI Portal
+            </div>
+            <div className="flex flex-wrap items-center gap-4">
+              <button
+                type="button"
+                onClick={() => setNavSection('dashboard')}
+                className="hover:text-slate-900 transition-colors"
+              >
+                Dashboard
+              </button>
+              <button
+                type="button"
+                onClick={() => setNavSection('agent')}
+                className="hover:text-slate-900 transition-colors"
+              >
+                AI Voice Agent
+              </button>
+              <button
+                type="button"
+                onClick={() => setNavSection('control')}
+                className="hover:text-slate-900 transition-colors"
+              >
+                OLED Display
+              </button>
+              <button
+                type="button"
+                onClick={() => setNavSection('firmware')}
+                className="hover:text-slate-900 transition-colors"
+              >
+                Firmware
+              </button>
+            </div>
+          </div>
+        </footer>
       </div>
     </div>
   );

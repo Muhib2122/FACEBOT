@@ -1,6 +1,7 @@
 export type BotMode = 'auto' | 'user';
 
 export type NavSection =
+  | 'dashboard'
   | 'agent'
   | 'control'
   | 'touchpad'
@@ -8,6 +9,17 @@ export type NavSection =
   | 'alarms'
   | 'hardware'
   | 'firmware';
+
+export type InteractionCategory = 'ai-voice' | 'oled-face' | 'hardware' | 'alarm';
+
+export interface InteractionEvent {
+  id: string;
+  timestamp: number;
+  hour: number; // 0..23
+  category: InteractionCategory;
+  label: string;
+  source: 'portal' | 'esp32' | 'voice';
+}
 
 export type GreenLedMode = 'auto' | 'on' | 'off' | 'blink';
 

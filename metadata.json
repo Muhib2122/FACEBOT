@@ -1,6 +1,6 @@
 {
   "name": "FaceBot ESP32 Portal",
   "description": "ESP32 Mini Face Bot control portal, 0.96-inch SSD1306 OLED live simulator, pixel touchpad, hardware rig, and Arduino firmware generator.",
-  "requestFramePermissions": ["geolocation"],
+  "requestFramePermissions": ["geolocation", "microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
