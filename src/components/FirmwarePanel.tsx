@@ -34,8 +34,6 @@ const ARDUINO_WIRING_ROWS = [
 const ESP32_WIRING_ROWS = [
   { component: '0.96" OLED (SSD1306 I2C)', pin: 'SDA / SCL / VCC / GND', boardPin: 'GPIO 21 / 22 / 3.3V / GND', notes: 'I2C address 0x3C' },
   { component: 'Piezo Buzzer (Alarm)', pin: 'Positive (+) / Negative (-)', boardPin: 'GPIO 14 / GND', notes: 'Supports Passive & Active' },
-  { component: 'Green Status LED', pin: 'Long Leg (+) / Short Leg (-)', boardPin: 'GPIO 26 (220Ω) / GND', notes: 'Mirrored on onboard GPIO 2' },
-  { component: 'Red Alert LED', pin: 'Long Leg (+) / Short Leg (-)', boardPin: 'GPIO 27 (220Ω) / GND', notes: 'Alert / Cold / Angry' },
   { component: 'Arduino UART2 Link', pin: 'RX2 / TX2 / GND', boardPin: 'GPIO 16 / GPIO 17 / GND', notes: '9600 baud live sync' },
 ];
 
@@ -107,7 +105,7 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
                 Dual-MCU Architecture (Arduino Uno/Nano + ESP32)
               </h3>
               <p className="text-xs text-slate-500">
-                Arduino handles native 5V Servo + HC-SR04 tracking; ESP32 handles OLED + Hotspot Web Portal + LEDs + Buzzer over UART2
+                Arduino handles native 5V Servo + HC-SR04 tracking; ESP32 handles OLED + Hotspot Web Portal + Buzzer over UART2 (no LEDs)
               </p>
             </div>
           </div>
@@ -137,7 +135,7 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
                   : 'text-slate-700 hover:text-slate-900'
               }`}
             >
-              2. ESP32 (OLED + Web + LEDs + Buzzer)
+              2. ESP32 (OLED + Web + Buzzer)
             </button>
           </div>
         </div>
@@ -182,7 +180,7 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
               <h3 className="text-sm font-semibold text-slate-900">
                 {selectedBoard === 'arduino'
                   ? 'Step 1: Arduino Uno/Nano Sketch (.ino) — SG90 Servo + HC-SR04'
-                  : 'Step 2: ESP32 Sketch (.ino) — OLED + Hotspot Portal + LEDs + Buzzer'}
+                  : 'Step 2: ESP32 Sketch (.ino) — OLED + Hotspot Portal + Buzzer'}
               </h3>
               <p className="text-xs text-slate-500">
                 {selectedBoard === 'arduino'

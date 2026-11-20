@@ -137,25 +137,39 @@ bool isExpressiveFace(int f) {
   return (f == 1 || f == 4 || f == 5 || f == 6 || f == 7 || f == 9 || f == 12 || f == 19 || f == 24);
 }
 
-// -------- Native 5V HC-SR04 Ultrasonic Reader (Median-of-3 Filter) --------
+// -------- Native 5V HC-SR04 Reader (60ms+ Datasheet Spacing + Stuck-Echo Auto-Reset) --------
+unsigned long lastEchoUs = 0;
+float distHist[3] = { 999.0, 999.0, 999.0 };
+int   distHistIdx = 0;
+
 float pingOnceCm() {
+  // Auto-unstick cheap HC-SR04 clones if ECHO latches HIGH
+  if (digitalRead(PIN_ECHO) == HIGH) {
+    pinMode(PIN_ECHO, OUTPUT);
+    digitalWrite(PIN_ECHO, LOW);
+    delayMicroseconds(200);
+    pinMode(PIN_ECHO, INPUT);
+    delay(2);
+  }
   digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(3);
+  delayMicroseconds(4);
   digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
-  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 26000UL);
+
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 38000UL);
+  lastEchoUs = dur;
   if (dur == 0) return 999.0;
   float cm = (dur * 0.0343f) / 2.0f;
   if (cm < 2.0f || cm > 400.0f) return 999.0;
   return cm;
 }
 
-float readFilteredDistCm() {
-  float a = pingOnceCm(); delay(10);
-  float b = pingOnceCm(); delay(10);
-  float c = pingOnceCm();
-  // Return median of 3 readings (eliminates single-ping noise spikes)
+float readSmoothedDistCm() {
+  float d = pingOnceCm();
+  distHist[distHistIdx] = d;
+  distHistIdx = (distHistIdx + 1) % 3;
+  float a = distHist[0], b = distHist[1], c = distHist[2];
   if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
   if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
   return c;
@@ -163,10 +177,11 @@ float readFilteredDistCm() {
 
 // -------- Smart User Tracking + Proximity Wake-Up --------
 void updateUltrasonicAndTracking() {
-  if (millis() - lastSensorMs < 130) return;
+  // Datasheet requires >= 60ms between pings; 100ms keeps echo crystal-clean
+  if (millis() - lastSensorMs < 100) return;
   lastSensorMs = millis();
 
-  lastDistCm = readFilteredDistCm();
+  lastDistCm = readSmoothedDistCm();
 
   if (!ultrasonicOn) {
     digitalWrite(LED_BUILTIN, LOW);
@@ -323,8 +338,11 @@ void sendTelemetryToEsp() {
 
   // Also print to Arduino Serial Monitor (115200 baud) for easy hardware verification
   Serial.print("HC-SR04: ");
-  if (lastDistCm > 400) Serial.print("No Object");
-  else { Serial.print(lastDistCm, 1); Serial.print(" cm"); }
+  if (lastDistCm > 400) {
+    Serial.print("No Object (echo="); Serial.print(lastEchoUs); Serial.print("us)");
+  } else {
+    Serial.print(lastDistCm, 1); Serial.print(" cm");
+  }
   Serial.print(" | Locked: "); Serial.print(objectLocked ? "YES" : "NO");
   Serial.print(" | Servo: "); Serial.print(currentAngle);
   Serial.println(servoAttached ? " deg (ON)" : " deg (IDLE OFF)");
@@ -396,7 +414,7 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * FaceBot — ESP32 Main Brain (Dual-Mode Hotspot Portal + OLED + LEDs + Buzzer)
+ * FaceBot — ESP32 Main Brain (Dual-Mode Hotspot Portal + OLED + Buzzer)
  * Generated for: ${safeUser} (${location.city}, ${location.country})
  * Works with: Arduino Uno/Nano Co-Processor over Hardware Serial2 (GPIO 16/17)
  * =========================================================================
@@ -413,11 +431,9 @@ export function generateEsp32Firmware(
  *   2. Adafruit GFX Library
  *   3. ArduinoJson (v7+)
  *
- * ESP32 Pinout Wiring:
+ * ESP32 Pinout Wiring (No external LEDs):
  *   - 0.96" SSD1306 OLED (I2C): SDA -> GPIO 21, SCL -> GPIO 22, VCC -> 3.3V, GND -> GND
  *   - Piezo Buzzer            : (+) -> GPIO 14, (-) -> GND
- *   - Green Status LED        : Long leg (+) -> GPIO 26 (220 ohm), Short leg (-) -> GND
- *   - Red Alert LED           : Long leg (+) -> GPIO 27 (220 ohm), Short leg (-) -> GND
  *   - Arduino UART2 Sync      : ESP32 GPIO 16 (RX2) <- Arduino D11 (TX) [via 1k/2k divider]
  *                               ESP32 GPIO 17 (TX2) -> Arduino D10 (RX) [direct wire]
  *                               ESP32 GND           <-> Arduino GND     [Common GND]
@@ -455,9 +471,6 @@ float  hotThresholdC  = ${settings.hotThresholdC.toFixed(1)};
 #define SCREEN_HEIGHT    64
 #define OLED_RESET       -1
 #define PIN_BUZZER       14
-#define PIN_LED_GREEN    26
-#define PIN_LED_RED      27
-#define PIN_LED_BUILTIN   2   // ESP32 onboard blue LED mirrors Green LED for instant verification
 #define PIN_ARDUINO_RX   16   // ESP32 RX2 <- Arduino D11 (TX)
 #define PIN_ARDUINO_TX   17   // ESP32 TX2 -> Arduino D10 (RX)
 
@@ -491,9 +504,6 @@ int    lastSentFaceToArd  = -1;
 int    frameCount         = 0;
 bool   screenLocked       = false;
 bool   isSleeping         = false;
-bool   manualLed          = false;
-bool   greenLedState      = false;
-bool   redLedState        = false;
 bool   buzzerActiveMode   = false; // false = Passive melody, true = Active DC HIGH
 
 // Live Telemetry received from Arduino Uno/Nano over Serial2
@@ -582,16 +592,8 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
       <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
     </div>
 
-    <span class="lbl" style="margin-top:10px">ESP32 LEDs (GPIO 26 / 27) &amp; Buzzer (GPIO 14)</span>
+    <span class="lbl" style="margin-top:10px">ESP32 Piezo Buzzer (GPIO 14)</span>
     <div class="row">
-      <button class="ok" onclick="cmd('/api/led?green=1','Green LED ON')">Green ON</button>
-      <button class="sec" onclick="cmd('/api/led?green=0','Green LED OFF')">Green OFF</button>
-      <button class="red" onclick="cmd('/api/led?red=1','Red LED ON')">Red ON</button>
-      <button class="sec" onclick="cmd('/api/led?red=0','Red LED OFF')">Red OFF</button>
-      <button class="sec" onclick="cmd('/api/led?test=1','LED Blink Test')">Blink Test</button>
-      <button class="sec" onclick="cmd('/api/led?auto=1','LED Auto Sync ON')">LED Auto</button>
-    </div>
-    <div class="row" style="margin-top:8px">
       <button onclick="cmd('/api/buzzer?mode=tone','Passive Melody Beep')">Beep Melody</button>
       <button class="sec" onclick="cmd('/api/buzzer?mode=dc','Active DC Beep')">Beep DC (Active)</button>
       <button class="sec" onclick="cmd('/api/buzzer?type=passive','Set Passive Buzzer')">Use Passive</button>
@@ -777,7 +779,7 @@ function pollStatus(fillInputs){
     const distTxt = d.dist > 400 ? 'No Object' : (d.dist.toFixed(0)+' cm'+(d.locked?' [LOCKED]':''));
     document.getElementById('hwStat').textContent=
       'Arduino: '+(d.ardOk?'ONLINE':'WAITING')+' | HC-SR04: '+distTxt+
-      ' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | G:'+(d.green?'ON':'OFF')+' R:'+(d.red?'ON':'OFF')+' | Buz:'+d.buz;
+      ' | Servo: '+d.servo+'deg ('+(d.servoOn?'ON':'OFF')+') | Buzzer: '+d.buz;
     if(fillInputs){
       document.getElementById('uName').value=d.user;
       document.getElementById('uCity').value=d.city;
@@ -826,26 +828,6 @@ void playWakeSound() {
   playToneSafe(523, 85); delay(25);
   playToneSafe(659, 85); delay(25);
   playToneSafe(784, 120);
-}
-
-// -------- LED Helpers (GPIO 26 Green + GPIO 27 Red + Onboard GPIO 2 Mirror) --------
-void setLeds(bool greenOn, bool redOn) {
-  greenLedState = greenOn;
-  redLedState = redOn;
-  digitalWrite(PIN_LED_GREEN, greenOn ? HIGH : LOW);
-  digitalWrite(PIN_LED_BUILTIN, greenOn ? HIGH : LOW);
-  digitalWrite(PIN_LED_RED, redOn ? HIGH : LOW);
-}
-
-void updateLedsForFace(int faceType) {
-  if (manualLed || alarmRinging) return;
-  if (faceType == 3 || faceType == 5 || faceType == 16 || faceType == 19) {
-    setLeds(false, true);
-  } else if (ardObjectLocked || faceType == 1 || faceType == 4 || faceType == 12) {
-    setLeds(true, false);
-  } else {
-    setLeds(WiFi.status() == WL_CONNECTED, WiFi.status() != WL_CONNECTED);
-  }
 }
 
 // -------- Hardware Serial2 Bridge to Arduino Uno/Nano --------
@@ -1231,7 +1213,6 @@ void drawAlarmOled(int idx, int frame) {
 void showWakeGreeting() {
   isSleeping = false;
   screenLocked = false;
-  if (!manualLed) setLeds(true, false);
   syncFaceToArduino(1); // Tell Arduino to do Happy head wiggle!
   playWakeSound();
   for (int i = 0; i < 6; i++) {
@@ -1361,8 +1342,6 @@ void setupWebPortalRoutes() {
                   ",\\"locked\\":" + String(ardObjectLocked ? "true" : "false") +
                   ",\\"servo\\":" + String(ardServoAngle) +
                   ",\\"servoOn\\":" + String(ardServoOn ? "true" : "false") +
-                  ",\\"green\\":" + String(greenLedState ? "true" : "false") +
-                  ",\\"red\\":" + String(redLedState ? "true" : "false") +
                   ",\\"buz\\":\\"" + String(buzzerActiveMode ? "Active" : "Passive") + "\\"}";
     server.send(200, "application/json", json);
   });
@@ -1391,7 +1370,6 @@ void setupWebPortalRoutes() {
       isSleeping = (currentFace == 7);
       drawFace(currentFace, frameCount);
       syncFaceToArduino(currentFace);
-      updateLedsForFace(currentFace);
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -1446,27 +1424,6 @@ void setupWebPortalRoutes() {
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
-  // ESP32 Direct LED Controls
-  server.on("/api/led", HTTP_GET, []() {
-    if (server.hasArg("auto") && server.arg("auto") == "1") {
-      manualLed = false;
-      updateLedsForFace(currentFace);
-    } else if (server.hasArg("test")) {
-      manualLed = true;
-      for (int i = 0; i < 3; i++) {
-        setLeds(true, false);  delay(160);
-        setLeds(false, true);  delay(160);
-      }
-      setLeds(true, false);
-    } else {
-      manualLed = true;
-      bool g = server.hasArg("green") ? (server.arg("green") == "1") : greenLedState;
-      bool r = server.hasArg("red")   ? (server.arg("red") == "1")   : redLedState;
-      setLeds(g, r);
-    }
-    server.send(200, "application/json", "{\\"ok\\":true}");
-  });
-
   // ESP32 Direct Buzzer Controls
   server.on("/api/buzzer", HTTP_GET, []() {
     if (server.hasArg("type")) {
@@ -1505,8 +1462,6 @@ void setupWebPortalRoutes() {
     alarmRinging = false;
     ringingAlarmIdx = -1;
     stopBuzzer();
-    manualLed = false;
-    setLeds(true, false);
     syncFaceToArduino(0);
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -1541,18 +1496,10 @@ void setup() {
 
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
-  pinMode(PIN_LED_GREEN, OUTPUT);
-  pinMode(PIN_LED_RED, OUTPUT);
-  pinMode(PIN_LED_BUILTIN, OUTPUT);
-  setLeds(false, false);
 
-  // Boot Self-Test on ESP32: Green LED -> Red LED -> Buzzer Beep!
-  setLeds(true, false);  delay(250);
-  setLeds(false, true);  delay(250);
-  setLeds(true, true);
+  // Boot Self-Test on ESP32: Buzzer Double Beep
   playToneSafe(1047, 100); delay(40);
   playToneSafe(1568, 120);
-  setLeds(false, false);
 
   // Load saved Home WiFi from NVS (default: muhib / 12345678)
   prefs.begin("facebot", true);
@@ -1592,12 +1539,10 @@ ${alarmInitLines.join('\n')}
   setupWebPortalRoutes();
 
   if (WiFi.status() == WL_CONNECTED) {
-    setLeds(true, false);
     configTime(utcOffsetSec, 0, "pool.ntp.org");
     fetchWeatherFromOpenMeteo();
     Serial.println("Home WiFi Connected! IP: " + WiFi.localIP().toString());
   } else {
-    setLeds(false, true);
     Serial.println("Home WiFi offline — Hotspot Portal active at 192.168.4.1");
   }
   Serial.println("Hotspot Portal: http://192.168.4.1 | Arduino UART2: RX=16, TX=17");
@@ -1612,7 +1557,6 @@ void loop() {
   if (alarmRinging && ringingAlarmIdx >= 0) {
     drawAlarmOled(ringingAlarmIdx, frameCount);
     playAlarmBeepTick(alarms[ringingAlarmIdx].melody, frameCount);
-    setLeds(false, (frameCount % 2 == 0));
     frameCount++;
     delay(150);
     return;
@@ -1659,7 +1603,6 @@ void loop() {
       display.setCursor(10, 2);
       display.print("Today is too cold!");
       display.display();
-      if (!manualLed) setLeds(false, true);
     } else {
       drawWeatherOled();
     }
@@ -1677,7 +1620,6 @@ void loop() {
   } else {
     drawFace(currentFace, frameCount);
     syncFaceToArduino(currentFace);
-    updateLedsForFace(currentFace);
   }
 
   frameCount++;
