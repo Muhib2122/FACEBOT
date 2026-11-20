@@ -118,10 +118,10 @@ export const FirmwarePanel: React.FC<FirmwarePanelProps> = ({
             <Code2 className="w-4 h-4 text-slate-600" />
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                Ready-to-Flash ESP32 Arduino Sketch (.ino)
+                Ready-to-Flash ESP32 Dual-Mode Sketch (.ino) · Built-In Hotspot Portal
               </h3>
               <p className="text-xs text-slate-500">
-                Auto-synced with your 25 faces, name ({settings.userName || 'Muhib'}), city ({location.city}), alarms, wake radius ({hardware.wakeDistanceCm}cm), and custom touchpad bitmap
+                Connects to Home WiFi ({hardware.wifiSsid || 'muhib'}) for live weather &amp; time AND creates Hotspot <span className="font-mono text-slate-800">FaceBot-{(settings.userName || 'Muhib').replace(/[^a-zA-Z0-9]/g, '')}</span> (pass: <span className="font-mono text-slate-800">12345678</span>) → open <span className="font-mono text-blue-700">http://192.168.4.1</span> on any phone!
               </p>
             </div>
           </div>

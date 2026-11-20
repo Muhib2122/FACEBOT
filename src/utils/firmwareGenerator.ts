@@ -21,7 +21,7 @@ export function pixelsToCppProgmem(pixels: number[], varName = 'customBitmap'): 
     lines.push('  ' + bytes.slice(i, i + 16).join(', '));
   }
 
-  return `const unsigned char ${varName}[] PROGMEM = {\n${lines.join(',\n')}\n};`;
+  return `unsigned char ${varName}[1024] = {\n${lines.join(',\n')}\n};`;
 }
 
 export function generateEsp32Firmware(
@@ -36,7 +36,7 @@ export function generateEsp32Firmware(
   const latestReaction = customReactions[0];
   const customBitmapBlock = latestReaction
     ? pixelsToCppProgmem(latestReaction.pixels, 'customTouchpadBitmap')
-    : `const unsigned char customTouchpadBitmap[1024] PROGMEM = { 0 };`;
+    : `unsigned char customTouchpadBitmap[1024] = { 0 };`;
 
   const enabledItems = playlist.filter((p) => p.enabled);
   const watchDur = enabledItems.find((p) => p.kind === 'watch')?.durationSec ?? 8;
@@ -45,13 +45,8 @@ export function generateEsp32Firmware(
 
   const safeSsid = (hardware.wifiSsid || 'muhib').replace(/"/g, '');
   const safePass = (hardware.wifiPassword || '12345678').replace(/"/g, '');
-  const safePortalUrl = (hardware.cloudPortalUrl || 'https://your-facebot.vercel.app').replace(/\/$/, '').replace(/"/g, '');
-  const safeDeviceId = (hardware.deviceId || 'muhib-bot-1').replace(/"/g, '');
-  const safeFwVersion = (hardware.firmwareVersion || '1.0.0').replace(/"/g, '');
-  const cloudStateUrl =
-    hardware.cloudBackendType === 'firebase-rtdb' && hardware.firebaseDbUrl.trim()
-      ? hardware.firebaseDbUrl.trim().replace(/"/g, '')
-      : `${safePortalUrl}/api/bot-state?device=${safeDeviceId}`;
+  const safeUser = (settings.userName || 'Muhib').replace(/"/g, '');
+  const safeApName = `FaceBot-${safeUser.replace(/[^a-zA-Z0-9]/g, '') || 'Muhib'}`;
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -62,44 +57,37 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * ESP32 Mini Face Bot — Complete Firmware (Vercel Cloud Sync + GitHub OTA)
- * Generated for: ${settings.userName || 'Muhib'} (${location.city}, ${location.country})
- * Firmware Version: ${safeFwVersion}
+ * ESP32 Mini Face Bot — Dual Mode (Home WiFi + Built-In Hotspot Web Portal)
+ * Generated for: ${safeUser} (${location.city}, ${location.country})
  * =========================================================================
- * Mechanical Design:
- *   - SG90 Servo Motor forms the rotating neck base (0..180 deg, 90 deg = straight).
- *   - HC-SR04 Ultrasonic Sensor is mounted on the servo horn.
- *   - 0.96" SSD1306 OLED Display is mounted directly ABOVE the HC-SR04 so the face
- *     always looks directly at the detected user!
- *   - When NO object is detected in range, the servo smoothly centers to 90 deg
- *     and calls headServo.detach() (powered OFF, zero jitter).
- *
- * Cloud Sync & Over-The-Air (OTA) Updates via GitHub -> Vercel:
- *   - Live Portal Controls: ESP32 polls your Vercel portal JSON every 2.5s over HTTPS.
- *   - C++ Display/Function Updates: Push compiled /public/ota/firmware.bin + version.json
- *     to GitHub -> Vercel deploys -> ESP32 downloads & flashes itself over WiFi!
+ * HOW TO CONNECT (Zero Hassle!):
+ *   1. ESP32 connects to Home WiFi ("${safeSsid}" / "${safePass}") for live Weather & Time.
+ *   2. AT THE SAME TIME, ESP32 creates its own WiFi Hotspot:
+ *        Hotspot Name : ${safeApName}
+ *        Password     : 12345678
+ *   3. Connect your Phone/PC to "${safeApName}" and open:
+ *        http://192.168.4.1
+ *      (Full built-in Web Portal with 25 Faces, Touchpad, Servo, HC-SR04,
+ *       Alarms, Weather, Watch UI, and Home WiFi Admin Settings!)
  *
  * Required Arduino Libraries:
  *   1. Adafruit SSD1306
  *   2. Adafruit GFX Library
  *   3. ESP32Servo (by Kevin Harrington)
  *   4. ArduinoJson (v7+)
- *   (WiFiClientSecure & HTTPUpdate are built into the ESP32 Board package!)
  *
  * Pinout Wiring:
  *   - 0.96" SSD1306 OLED (I2C): SDA -> GPIO 21, SCL -> GPIO 22, VCC -> 3.3V, GND -> GND
  *   - SG90 Servo Motor (Head) : Signal -> GPIO 13, VCC -> 5V (VIN), GND -> GND
  *   - Piezo Buzzer            : (+) -> GPIO 14, (-) -> GND
- *   - HC-SR04 Ultrasonic      : TRIG -> GPIO 5, ECHO -> GPIO 18 (use 1k/2k divider), VCC -> 5V, GND -> GND
- *   - Green Status LED        : Anode -> GPIO 26 (via 220 ohm), Cathode -> GND
- *   - Red Alert LED           : Anode -> GPIO 27 (via 220 ohm), Cathode -> GND
+ *   - HC-SR04 Ultrasonic      : TRIG -> GPIO 5, ECHO -> GPIO 18 (1k/2k divider), VCC -> 5V, GND -> GND
+ *   - Green Status LED        : Anode -> GPIO 26 (220 ohm), Cathode -> GND
+ *   - Red Alert LED           : Anode -> GPIO 27 (220 ohm), Cathode -> GND
  */
 
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
@@ -108,24 +96,16 @@ export function generateEsp32Firmware(
 #include <ESP32Servo.h>
 #include <time.h>
 
-// -------- Default Home WiFi (Editable Live via Admin Panel & Saved in NVS) --------
+// -------- Hotspot (AP) + Home WiFi (STA) Credentials --------
+const char* AP_SSID = "${safeApName}";
+const char* AP_PASS = "12345678";
+
 String wifiSsid     = "${safeSsid}";
 String wifiPassword = "${safePass}";
 Preferences prefs;
 
-// -------- Vercel Cloud Sync & GitHub OTA Firmware Configuration --------
-const char* FIRMWARE_VERSION = "${safeFwVersion}";
-String portalBaseUrl   = "${safePortalUrl}";
-String cloudStateUrl   = "${cloudStateUrl}";
-bool   cloudSyncOn     = ${hardware.cloudSyncEnabled ? 'true' : 'false'};
-bool   otaAutoCheck    = ${hardware.otaAutoCheck ? 'true' : 'false'};
-unsigned long lastCloudSyncMs = 0;
-unsigned long lastOtaCheckMs  = 0;
-int    lastDismissSeq  = 0;
-int    lastOtaSeq      = 0;
-
 // -------- User, Location & Timezone Configuration --------
-String userName       = "${settings.userName || 'Muhib'}";
+String userName       = "${safeUser}";
 String cityName       = "${location.city}";
 float  locLat         = ${location.latitude.toFixed(4)};
 float  locLon         = ${location.longitude.toFixed(4)};
@@ -148,7 +128,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Servo headServo;
 WebServer server(80);
 
-// -------- Multi-Alarm Schedule (up to 8 custom alarms from Web Portal) --------
+// -------- Multi-Alarm Schedule --------
 struct AlarmSlot {
   int    hour;
   int    minute;
@@ -165,13 +145,14 @@ bool      alarmRinging     = false;
 int       ringingAlarmIdx  = -1;
 int       lastTriggeredMin = -1;
 
-// -------- State, Servo Tracking & Idle Power-Off Variables --------
+// -------- Bot State, Auto/User Mode, Servo Tracking & Idle Auto-Off --------
 String botMode            = "auto"; // "auto" or "user"
-String activeScreen       = "face"; // "face", "watch", "weather", "greeting", "text"
-String customLine1        = "";
+String activeScreen       = "face"; // "face", "watch", "weather", "greeting", "text", "bitmap"
+String customLine1        = "Hi ${safeUser}!";
 String customLine2        = "";
 int    currentFace        = 0;
 int    frameCount         = 0;
+bool   screenLocked       = false;
 bool   isSleeping         = false;
 bool   ultrasonicOn       = ${hardware.ultrasonicEnabled ? 'true' : 'false'};
 bool   trackingEnabled    = ${hardware.trackingEnabled ? 'true' : 'false'};
@@ -185,10 +166,12 @@ bool   servoAttached      = false;
 bool   manualServo        = false;
 unsigned long lastObjectSeenMs = 0;
 
-// Screen durations (seconds) customizable via Web Portal
-unsigned long watchDurationMs   = ${watchDur}000;
-unsigned long weatherDurationMs = ${weatherDur}000;
-unsigned long faceDurationMs    = ${faceDur}000;
+// Screen durations (seconds) customizable via Built-in Web Portal
+int watchDurSec   = ${watchDur};
+int weatherDurSec = ${weatherDur};
+int faceDurSec    = ${faceDur};
+unsigned long lastCycleSwitchMs = 0;
+int cycleStep = 0;
 
 // Live Weather Cache
 float  liveTempC      = 24.0;
@@ -197,10 +180,239 @@ float  liveWindKmh    = 6.0;
 String liveCondition  = "Clear";
 unsigned long lastWeatherFetch = 0;
 
-// Custom Touchpad Bitmap (128x64 monochrome)
+// Custom 128x64 Touchpad Bitmap (RAM so phone touchpad updates live!)
 ${customBitmapBlock}
 
-// -------- Servo Safe Power Management (Attach / Smooth Move / Auto-Off at 90 deg) --------
+// =========================================================================
+// BUILT-IN MOBILE WEB PORTAL (Served directly at http://192.168.4.1)
+// =========================================================================
+const char PORTAL_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>FaceBot Portal</title>
+<style>
+  *{box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}
+  body{margin:0;background:#0f172a;color:#f1f5f9;padding:12px 12px 48px}
+  .wrap{max-width:680px;margin:0 auto}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{font-size:12px;color:#94a3b8;margin-bottom:14px}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px;margin-bottom:12px}
+  .card h2{font-size:14px;margin:0 0 10px;color:#e2e8f0}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  button.sec{background:#334155;color:#e2e8f0}
+  button.red{background:#dc2626}
+  button.ok{background:#16a34a}
+  input,select{background:#0f172a;color:#f8fafc;border:1px solid #475569;border-radius:8px;padding:8px 10px;font-size:13px;width:100%}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(98px,1fr));gap:6px}
+  .grid button{padding:8px 6px;font-size:11px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;text-align:center}
+  .grid button:active{background:#2563eb;border-color:#2563eb}
+  .lbl{font-size:11px;color:#94a3b8;margin:6px 0 4px;display:block}
+  canvas{width:100%;max-width:384px;aspect-ratio:2/1;background:#020617;border:2px solid #38bdf8;border-radius:8px;touch-action:none;display:block;margin:8px auto}
+  .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:12px;display:none;z-index:99}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>FaceBot ESP32 Portal</h1>
+  <div class="sub" id="statusLine">Connected to Hotspot (192.168.4.1)</div>
+
+  <!-- Mode & Quick Screens -->
+  <div class="card">
+    <h2>Mode &amp; OLED Screens</h2>
+    <div class="row" style="margin-bottom:8px">
+      <button onclick="cmd('/api/mode?mode=auto','Auto Mode ON')">Auto Mode</button>
+      <button class="sec" onclick="cmd('/api/mode?mode=user','User Mode ON')">User Mode</button>
+      <button class="sec" onclick="cmd('/api/screen?kind=watch','Watch UI')">Watch UI</button>
+      <button class="sec" onclick="cmd('/api/screen?kind=weather','Live Weather')">Weather</button>
+      <button class="sec" onclick="cmd('/api/screen?kind=greeting','Greeting')">Greeting</button>
+      <button class="sec" onclick="cmd('/api/face?id=7','Sleeping...')">Sleep</button>
+    </div>
+    <div class="row">
+      <input id="txt1" placeholder="OLED Line 1 (e.g. Hi Muhib!)" style="flex:1;min-width:140px"/>
+      <input id="txt2" placeholder="Big Line 2" style="flex:1;min-width:110px"/>
+      <button onclick="sendText()">Show Text</button>
+    </div>
+  </div>
+
+  <!-- User Mode Screen Durations -->
+  <div class="card">
+    <h2>Screen Durations (Seconds)</h2>
+    <div class="row">
+      <div style="flex:1"><span class="lbl">Watch (s)</span><input id="dWatch" type="number" value="8" min="2" max="120"/></div>
+      <div style="flex:1"><span class="lbl">Weather (s)</span><input id="dWeather" type="number" value="6" min="2" max="120"/></div>
+      <div style="flex:1"><span class="lbl">Faces (s)</span><input id="dFace" type="number" value="5" min="2" max="120"/></div>
+      <button style="align-self:flex-end" onclick="saveDur()">Save</button>
+    </div>
+  </div>
+
+  <!-- All 25 Face Expressions -->
+  <div class="card">
+    <h2>25 Dynamic Face Reactions</h2>
+    <div class="grid" id="faceGrid"></div>
+  </div>
+
+  <!-- Interactive 128x64 Touchpad -->
+  <div class="card">
+    <h2>128x64 Finger Touchpad (Draw to OLED)</h2>
+    <canvas id="pad" width="128" height="64"></canvas>
+    <div class="row" style="justify-content:center;margin-top:8px">
+      <button class="sec" onclick="pen=1">Draw</button>
+      <button class="sec" onclick="pen=0">Erase</button>
+      <button class="sec" onclick="clearPad()">Clear</button>
+      <button class="ok" onclick="sendBitmap()">Send to OLED</button>
+    </div>
+  </div>
+
+  <!-- Servo & HC-SR04 Controls -->
+  <div class="card">
+    <h2>Servo Head &amp; HC-SR04 Sensor</h2>
+    <span class="lbl">Manual Servo Angle: <b id="angLbl">90</b>&deg;</span>
+    <input type="range" min="15" max="165" value="90" oninput="angLbl.innerText=this.value" onchange="cmd('/api/servo?angle='+this.value,'Servo '+this.value+' deg')"/>
+    <div class="row" style="margin-top:10px">
+      <button class="sec" onclick="cmd('/api/servo?angle=90','Centered 90 deg')">Center 90&deg;</button>
+      <button class="sec" onclick="cmd('/api/servo?auto=1','Auto Head Sync ON')">Auto Sync</button>
+      <button class="sec" onclick="cmd('/api/servo?idleoff=1','Idle Servo OFF enabled')">Idle Off ON</button>
+      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=1&tracking=1','HC-SR04 + Tracking ON')">Sensor ON</button>
+      <button class="sec" onclick="cmd('/api/sensor?ultrasonic=0','HC-SR04 OFF')">Sensor OFF</button>
+    </div>
+  </div>
+
+  <!-- Piezo Buzzer Alarm -->
+  <div class="card">
+    <h2>Piezo Buzzer Alarm</h2>
+    <div class="row">
+      <input id="alTime" type="time" value="07:00" style="width:120px"/>
+      <input id="alLabel" placeholder="Alarm Label" value="Wake Up Muhib" style="flex:1;min-width:130px"/>
+      <button onclick="setAlarm(1)">Set Alarm</button>
+      <button class="sec" onclick="setAlarm(0)">Disable</button>
+      <button class="sec" onclick="cmd('/api/alarm/test?slot=0','Testing Buzzer!')">Test Ring</button>
+      <button class="red" onclick="cmd('/api/alarm/dismiss','Alarm Dismissed')">Dismiss</button>
+    </div>
+  </div>
+
+  <!-- Profile, City & Admin Home WiFi -->
+  <div class="card">
+    <h2>Admin Panel · Home WiFi &amp; Profile</h2>
+    <div class="row" style="margin-bottom:8px">
+      <div style="flex:1;min-width:130px"><span class="lbl">Your Name</span><input id="uName" value="Muhib"/></div>
+      <div style="flex:1;min-width:130px"><span class="lbl">City</span><input id="uCity" value="Dhaka"/></div>
+      <button style="align-self:flex-end" onclick="saveProfile()">Save Profile</button>
+    </div>
+    <div class="row" style="border-top:1px solid #334155;padding-top:10px;margin-top:8px">
+      <div style="flex:1;min-width:130px"><span class="lbl">Home WiFi SSID</span><input id="wSsid" value="muhib"/></div>
+      <div style="flex:1;min-width:130px"><span class="lbl">Home WiFi Password</span><input id="wPass" type="text" value="12345678"/></div>
+      <button class="ok" style="align-self:flex-end" onclick="saveWifi()">Save Home WiFi</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const FACES=[
+  'Normal Blink','Super Happy','Cute Wink','Freezing Cold','In Love',
+  'Angry','Surprised','Sleepy','Cool Shades','Sad Puppy',
+  'Crying','Dizzy','Starry Eyed','Skeptical','Cheeky Tongue',
+  'Kawaii Cat','Knocked Out','Thinking','Shy Blushing','Angry Shout',
+  'Cyclops','Money Eyes','Robot Scan','Smug Proud','Look Around'
+];
+const fg=document.getElementById('faceGrid');
+FACES.forEach((n,i)=>{
+  const b=document.createElement('button');
+  b.textContent=(i+1)+'. '+n;
+  b.onclick=()=>cmd('/api/face?id='+i,n);
+  fg.appendChild(b);
+});
+
+function toast(m){
+  const t=document.getElementById('toast');
+  t.textContent=m;t.style.display='block';
+  clearTimeout(window._tt);
+  window._tt=setTimeout(()=>t.style.display='none',1800);
+}
+function cmd(url,msg){
+  fetch(url).then(()=>toast(msg||'Done')).catch(()=>toast('Check WiFi connection'));
+}
+function sendText(){
+  const l1=encodeURIComponent(document.getElementById('txt1').value);
+  const l2=encodeURIComponent(document.getElementById('txt2').value);
+  cmd('/api/screen?kind=text&l1='+l1+'&l2='+l2,'Text sent to OLED');
+}
+function saveDur(){
+  const w=document.getElementById('dWatch').value;
+  const we=document.getElementById('dWeather').value;
+  const f=document.getElementById('dFace').value;
+  cmd('/api/durations?watch='+w+'&weather='+we+'&face='+f,'Durations saved');
+}
+function setAlarm(on){
+  const t=document.getElementById('alTime').value.split(':');
+  const lbl=encodeURIComponent(document.getElementById('alLabel').value||'Alarm');
+  cmd('/api/alarm/set?slot=0&hour='+parseInt(t[0])+'&min='+parseInt(t[1])+'&on='+on+'&label='+lbl,on?'Alarm Set':'Alarm Disabled');
+}
+function saveProfile(){
+  const n=encodeURIComponent(document.getElementById('uName').value);
+  const c=encodeURIComponent(document.getElementById('uCity').value);
+  cmd('/api/config?name='+n+'&city='+c,'Profile Saved');
+}
+function saveWifi(){
+  const s=encodeURIComponent(document.getElementById('wSsid').value);
+  const p=encodeURIComponent(document.getElementById('wPass').value);
+  cmd('/api/wifi?ssid='+s+'&pass='+p,'WiFi Saved! Rebooting...');
+}
+
+// 128x64 Finger Touchpad
+const cv=document.getElementById('pad'),ctx=cv.getContext('2d');
+let drawing=false,pen=1;
+const px=new Uint8Array(128*64);
+function clearPad(){px.fill(0);ctx.fillStyle='#020617';ctx.fillRect(0,0,128,64);}
+clearPad();
+function drawPt(e){
+  const r=cv.getBoundingClientRect();
+  const x=Math.floor((e.clientX-r.left)/r.width*128);
+  const y=Math.floor((e.clientY-r.top)/r.height*64);
+  for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+    const nx=x+dx,ny=y+dy;
+    if(nx>=0&&nx<128&&ny>=0&&ny<64){
+      px[ny*128+nx]=pen;
+      ctx.fillStyle=pen?'#38bdf8':'#020617';
+      ctx.fillRect(nx,ny,1,1);
+    }
+  }
+}
+cv.onpointerdown=e=>{drawing=true;cv.setPointerCapture(e.pointerId);drawPt(e);};
+cv.onpointermove=e=>{if(drawing)drawPt(e);};
+cv.onpointerup=()=>drawing=false;
+
+function sendBitmap(){
+  let hex='';
+  for(let y=0;y<64;y++){
+    for(let xb=0;xb<16;xb++){
+      let b=0;
+      for(let bit=0;bit<8;bit++) if(px[y*128+xb*8+bit]) b|=(1<<(7-bit));
+      hex+=b.toString(16).padStart(2,'0');
+    }
+  }
+  fetch('/api/bitmap',{method:'POST',body:hex})
+    .then(()=>toast('Drawing shown on OLED!'))
+    .catch(()=>toast('Failed to send'));
+}
+
+fetch('/api/status').then(r=>r.json()).then(d=>{
+  document.getElementById('statusLine').textContent=
+    'Home WiFi: '+(d.wifi?'Connected ('+d.staIp+')':'Offline')+' · Temp: '+d.temp+'C · Mode: '+d.mode;
+  document.getElementById('uName').value=d.user;
+  document.getElementById('uCity').value=d.city;
+  document.getElementById('wSsid').value=d.ssid;
+}).catch(()=>{});
+</script>
+</body>
+</html>
+)rawliteral";
+
+// -------- Servo Safe Power Management (Attach / Move / Auto-Off at 90 deg) --------
 void moveServoSmooth(int targetAngle) {
   targetAngle = constrain(targetAngle, 15, 165);
   if (!servoAttached) {
@@ -214,10 +426,10 @@ void moveServoSmooth(int targetAngle) {
 void parkAndPowerOffServo() {
   if (servoAngle != 90) {
     moveServoSmooth(90);
-    delay(280); // Wait for head to face straight ahead
+    delay(260);
   }
   if (servoOffWhenIdle && servoAttached) {
-    headServo.detach(); // Servo OFF -> zero hum, zero holding current
+    headServo.detach();
     servoAttached = false;
   }
 }
@@ -474,7 +686,7 @@ void drawFace(int type, int frame) {
   display.display();
 }
 
-// -------- Real-Time NTP Watch & Weather OLED Screens --------
+// -------- Watch, Weather, Greeting, Text & Bitmap OLED Screens --------
 void drawWatchOled() {
   struct tm t;
   display.clearDisplay();
@@ -499,6 +711,10 @@ void drawWatchOled() {
     display.setTextSize(1);
     display.setCursor(16, 54);
     display.print(dateBuf);
+  } else {
+    display.setTextSize(1);
+    display.setCursor(18, 28);
+    display.print("Syncing NTP Time");
   }
   display.display();
 }
@@ -521,6 +737,42 @@ void drawWeatherOled() {
   display.drawFastHLine(0, 52, 128, SSD1306_WHITE);
   display.setCursor(10, 55);
   display.print(liveTempC <= coldThresholdC ? "Today is too cold!" : liveCondition);
+  display.display();
+}
+
+void drawGreetingOled() {
+  struct tm t;
+  String greet = "Hello";
+  if (getLocalTime(&t)) {
+    if (t.tm_hour >= 5 && t.tm_hour < 12) greet = "Good Morning";
+    else if (t.tm_hour >= 12 && t.tm_hour < 17) greet = "Good Afternoon";
+    else if (t.tm_hour >= 17 && t.tm_hour < 21) greet = "Good Evening";
+    else greet = "Good Night";
+  }
+  display.clearDisplay();
+  display.drawRoundRect(2, 2, 124, 60, 6, SSD1306_WHITE);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(18, 16);
+  display.print(greet);
+  display.setTextSize(2);
+  display.setCursor(18, 32);
+  display.print(userName);
+  display.display();
+}
+
+void drawCustomTextOled() {
+  display.clearDisplay();
+  display.drawRoundRect(2, 2, 124, 60, 5, SSD1306_WHITE);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 16);
+  display.print(customLine1.substring(0, 18));
+  if (customLine2.length() > 0) {
+    display.setTextSize(2);
+    display.setCursor(10, 32);
+    display.print(customLine2.substring(0, 9));
+  }
   display.display();
 }
 
@@ -562,27 +814,52 @@ float readDistanceCm() {
   return (duration * 0.0343) / 2.0;
 }
 
+void playWakeSound() {
+  tone(PIN_BUZZER, 523, 90); delay(100);
+  tone(PIN_BUZZER, 659, 90); delay(100);
+  tone(PIN_BUZZER, 784, 120); delay(130);
+  noTone(PIN_BUZZER);
+}
+
+void updateServoForFace(int faceType, int frame);
+
+void showWakeGreeting() {
+  digitalWrite(PIN_LED_GREEN, HIGH);
+  digitalWrite(PIN_LED_RED, LOW);
+  playWakeSound();
+  for (int i = 0; i < 6; i++) {
+    drawFace((i % 2 == 0) ? 1 : 4, i);
+    updateServoForFace(1, i);
+    delay(220);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(14, 24);
+  display.print("Hi " + userName + "!");
+  display.display();
+  delay(1800);
+}
+
 // -------- HC-SR04 + OLED Co-Mounted User Tracking & Idle Servo Power-Off --------
 void updateUltrasonicTracking() {
   if (!ultrasonicOn || manualServo) return;
 
   float dist = readDistanceCm();
-
-  // Case 1: Object is right in front of the current OLED/HC-SR04 angle!
   if (dist > 2.0 && dist <= trackRangeCm) {
     objectLocked = true;
     trackedUserAngle = servoAngle;
     lastObjectSeenMs = millis();
 
-    // If sleeping and user approaches within wakeDistCm (25cm), wake up!
     if (isSleeping && dist <= wakeDistCm) {
       isSleeping = false;
+      screenLocked = false;
       showWakeGreeting();
     }
     return;
   }
 
-  // Case 2: User moved slightly left/right while locked -> quick neighbor check (+/- 20 deg)
+  // Follow user slightly left/right when previously locked
   if (trackingEnabled && objectLocked && (millis() - lastObjectSeenMs < 2500)) {
     int checkAngles[2] = {
       constrain(trackedUserAngle - 20, 35, 145),
@@ -595,12 +872,12 @@ void updateUltrasonicTracking() {
       if (d > 2.0 && d <= trackRangeCm) {
         trackedUserAngle = checkAngles[i];
         lastObjectSeenMs = millis();
-        return; // Keep facing the user!
+        return;
       }
     }
   }
 
-  // Case 3: No object found for 3+ seconds -> face straight ahead (90 deg) and turn Servo OFF
+  // No object found -> look straight (90 deg) and turn Servo OFF
   if (millis() - lastObjectSeenMs > 3000) {
     objectLocked = false;
     trackedUserAngle = 90;
@@ -608,14 +885,12 @@ void updateUltrasonicTracking() {
   }
 }
 
-// -------- Expressive Servo Head Motion (Anchored Around Tracked User Angle) --------
 void updateServoForFace(int faceType, int frame) {
   if (manualServo) {
     moveServoSmooth(servoAngle);
     return;
   }
 
-  // If no object is detected and not actively emoting/alarming, keep servo OFF at 90 deg
   if (!objectLocked && !alarmRinging && faceType == 0) {
     parkAndPowerOffServo();
     return;
@@ -623,33 +898,21 @@ void updateServoForFace(int faceType, int frame) {
 
   int base = objectLocked ? trackedUserAngle : 90;
   if (faceType == 1 || faceType == 4 || faceType == 12) {
-    // Happy / In Love / Excited: Sway +/- 20 deg (70 <-> 110 around center)
     moveServoSmooth((frame % 4 < 2) ? base - 20 : base + 20);
   } else if (faceType == 6) {
-    // Surprised: Quick tilt to side
     moveServoSmooth(base + 26);
   } else if (faceType == 5 || faceType == 19) {
-    // Angry: Rapid head shake
     moveServoSmooth((frame % 2 == 0) ? base - 18 : base + 18);
   } else if (faceType == 7 || faceType == 9) {
-    // Sleepy / Sad: Gentle side droop then detach if idle
     moveServoSmooth(base + 16);
   } else if (faceType == 24) {
     int offset[3] = {-25, 0, 25};
     moveServoSmooth(base + offset[(frame / 3) % 3]);
   } else if (objectLocked) {
-    // Face directly toward the detected user
     moveServoSmooth(trackedUserAngle);
   } else {
     parkAndPowerOffServo();
   }
-}
-
-void playWakeSound() {
-  tone(PIN_BUZZER, 523, 90); delay(100);
-  tone(PIN_BUZZER, 659, 90); delay(100);
-  tone(PIN_BUZZER, 784, 120); delay(130);
-  noTone(PIN_BUZZER);
 }
 
 void playAlarmBeepTick(int melody, int frame) {
@@ -684,7 +947,7 @@ void checkScheduledAlarms() {
 void fetchWeatherFromOpenMeteo() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(locLat, 4) +
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(locLat, 4) +
                "&longitude=" + String(locLon, 4) +
                "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code";
   http.begin(url);
@@ -700,133 +963,26 @@ void fetchWeatherFromOpenMeteo() {
   http.end();
 }
 
-// -------- GitHub -> Vercel Over-The-Air (OTA) Firmware Auto-Updater --------
-void checkOtaFirmwareUpdate() {
-  if (WiFi.status() != WL_CONNECTED || portalBaseUrl.length() < 8) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  String manifestUrl = portalBaseUrl + "/ota/version.json";
-  http.begin(client, manifestUrl);
-  int code = http.GET();
-  if (code == 200) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      String remoteVer = doc["version"] | "";
-      String binPath   = doc["binUrl"]  | "/ota/firmware.bin";
-      if (remoteVer.length() > 0 && remoteVer != String(FIRMWARE_VERSION)) {
-        String fullBinUrl = binPath.startsWith("http") ? binPath : (portalBaseUrl + binPath);
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(10, 18);
-        display.print("OTA UPDATE FOUND!");
-        display.setCursor(10, 34);
-        display.print("v" + String(FIRMWARE_VERSION) + " -> v" + remoteVer);
-        display.setCursor(10, 48);
-        display.print("Downloading...");
-        display.display();
-
-        t_httpUpdate_return ret = httpUpdate.update(client, fullBinUrl);
-        if (ret == HTTP_UPDATE_FAILED) {
-          Serial.printf("OTA Error (%d): %s\\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-        }
-      }
-    }
-  }
-  http.end();
-}
-
-// -------- Real-Time Cloud State Sync from Published Vercel Portal --------
-void syncStateFromCloudPortal() {
-  if (!cloudSyncOn || WiFi.status() != WL_CONNECTED || cloudStateUrl.length() < 8) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(2500);
-  http.begin(client, cloudStateUrl);
-  int code = http.GET();
-  if (code == 200) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      if (doc["mode"].is<const char*>())         botMode         = String(doc["mode"].as<const char*>());
-      if (doc["screen"].is<const char*>())       activeScreen    = String(doc["screen"].as<const char*>());
-      if (doc["faceId"].is<int>())               currentFace     = constrain(doc["faceId"].as<int>(), 0, 24);
-      if (doc["userName"].is<const char*>())     userName        = String(doc["userName"].as<const char*>());
-      if (doc["city"].is<const char*>())         cityName        = String(doc["city"].as<const char*>());
-      if (doc["textLine1"].is<const char*>())    customLine1     = String(doc["textLine1"].as<const char*>());
-      if (doc["textLine2"].is<const char*>())    customLine2     = String(doc["textLine2"].as<const char*>());
-      if (doc["manualServo"].is<bool>())         manualServo     = doc["manualServo"].as<bool>();
-      if (doc["servoAngle"].is<int>() && manualServo) moveServoSmooth(doc["servoAngle"].as<int>());
-      if (doc["ultrasonicOn"].is<bool>())        ultrasonicOn    = doc["ultrasonicOn"].as<bool>();
-      if (doc["trackingOn"].is<bool>())          trackingEnabled = doc["trackingOn"].as<bool>();
-      if (doc["servoIdleOff"].is<bool>())        servoOffWhenIdle = doc["servoIdleOff"].as<bool>();
-
-      // Sync Alarms array from Vercel Portal
-      if (doc["alarms"].is<JsonArray>()) {
-        JsonArray arr = doc["alarms"].as<JsonArray>();
-        int idx = 0;
-        for (JsonObject al : arr) {
-          if (idx >= MAX_ALARMS) break;
-          alarms[idx].hour    = al["hour"] | 7;
-          alarms[idx].minute  = al["min"] | 0;
-          alarms[idx].enabled = al["on"] | false;
-          alarms[idx].faceId  = al["face"] | 1;
-          alarms[idx].melody  = al["melody"] | 0;
-          alarms[idx].label   = String(al["label"] | "Alarm");
-          idx++;
-        }
-        alarmCount = idx;
-      }
-
-      // Remote Alarm Dismiss from Portal
-      int dismissSeq = doc["alarmDismissSeq"] | 0;
-      if (dismissSeq > lastDismissSeq) {
-        lastDismissSeq = dismissSeq;
-        alarmRinging = false;
-        ringingAlarmIdx = -1;
-        noTone(PIN_BUZZER);
-        digitalWrite(PIN_LED_RED, LOW);
-      }
-
-      // Remote OTA Update Trigger from Admin Panel
-      int otaSeq = doc["otaTriggerSeq"] | 0;
-      if (otaSeq > lastOtaSeq) {
-        lastOtaSeq = otaSeq;
-        http.end();
-        checkOtaFirmwareUpdate();
-        return;
-      }
-    }
-  }
-  http.end();
-}
-
-void showWakeGreeting() {
-  digitalWrite(PIN_LED_GREEN, HIGH);
-  digitalWrite(PIN_LED_RED, LOW);
-  playWakeSound();
-  for (int i = 0; i < 6; i++) {
-    drawFace((i % 2 == 0) ? 1 : 4, i);
-    updateServoForFace(1, i);
-    delay(240);
-  }
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(14, 24);
-  display.print("Hi " + userName + "!");
-  display.display();
-  delay(2000);
-}
-
-// -------- Real-Time Web Portal & Admin Panel HTTP Endpoints --------
+// -------- Built-In Web Portal + REST API Routes --------
 void setupWebPortalRoutes() {
   server.enableCORS(true);
 
-  // Admin Panel: Save Home WiFi SSID & Password to ESP32 Flash (NVS) & Reconnect
+  // Serve full interactive Web Portal directly at http://192.168.4.1
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", PORTAL_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, []() {
+    String json = "{\\"wifi\\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
+                  ",\\"staIp\\":\\"" + WiFi.localIP().toString() +
+                  "\\",\\"temp\\":" + String(liveTempC, 1) +
+                  ",\\"mode\\":\\"" + botMode +
+                  "\\",\\"user\\":\\"" + userName +
+                  "\\",\\"city\\":\\"" + cityName +
+                  "\\",\\"ssid\\":\\"" + wifiSsid + "\\"}";
+    server.send(200, "application/json", json);
+  });
+
   server.on("/api/wifi", HTTP_GET, []() {
     if (server.hasArg("ssid") && server.hasArg("pass")) {
       wifiSsid = server.arg("ssid");
@@ -835,7 +991,7 @@ void setupWebPortalRoutes() {
       prefs.putString("ssid", wifiSsid);
       prefs.putString("pass", wifiPassword);
       prefs.end();
-      server.send(200, "application/json", "{\\"ok\\":true,\\"rebooting\\":true}");
+      server.send(200, "application/json", "{\\"ok\\":true}");
       delay(400);
       ESP.restart();
       return;
@@ -847,6 +1003,7 @@ void setupWebPortalRoutes() {
     if (server.hasArg("id")) {
       currentFace = constrain(server.arg("id").toInt(), 0, 24);
       activeScreen = "face";
+      screenLocked = true;
       isSleeping = (currentFace == 7);
       drawFace(currentFace, frameCount);
     }
@@ -856,10 +1013,33 @@ void setupWebPortalRoutes() {
   server.on("/api/screen", HTTP_GET, []() {
     if (server.hasArg("kind")) {
       activeScreen = server.arg("kind");
+      screenLocked = true;
       isSleeping = false;
     }
     if (server.hasArg("l1")) customLine1 = server.arg("l1");
     if (server.hasArg("l2")) customLine2 = server.arg("l2");
+    server.send(200, "application/json", "{\\"ok\\":true}");
+  });
+
+  // Receive 128x64 Touchpad Bitmap (2048 hex chars = 1024 bytes) directly from phone!
+  server.on("/api/bitmap", HTTP_POST, []() {
+    String hex = server.arg("plain");
+    if (hex.length() >= 2048) {
+      for (int i = 0; i < 1024; i++) {
+        char buf[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+        customTouchpadBitmap[i] = (unsigned char)strtol(buf, NULL, 16);
+      }
+      activeScreen = "bitmap";
+      screenLocked = true;
+      isSleeping = false;
+    }
+    server.send(200, "application/json", "{\\"ok\\":true}");
+  });
+
+  server.on("/api/durations", HTTP_GET, []() {
+    if (server.hasArg("watch"))   watchDurSec   = constrain(server.arg("watch").toInt(), 2, 120);
+    if (server.hasArg("weather")) weatherDurSec = constrain(server.arg("weather").toInt(), 2, 120);
+    if (server.hasArg("face"))    faceDurSec    = constrain(server.arg("face").toInt(), 2, 120);
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
@@ -868,28 +1048,22 @@ void setupWebPortalRoutes() {
       manualServo = true;
       moveServoSmooth(server.arg("angle").toInt());
     }
-    if (server.hasArg("auto")) {
-      manualServo = (server.arg("auto") == "0");
-    }
-    if (server.hasArg("idleoff")) {
-      servoOffWhenIdle = (server.arg("idleoff") == "1");
-    }
+    if (server.hasArg("auto"))    manualServo = (server.arg("auto") == "0");
+    if (server.hasArg("idleoff")) servoOffWhenIdle = (server.arg("idleoff") == "1");
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
   server.on("/api/sensor", HTTP_GET, []() {
-    if (server.hasArg("ultrasonic")) {
-      ultrasonicOn = (server.arg("ultrasonic") == "1");
-    }
-    if (server.hasArg("tracking")) {
-      trackingEnabled = (server.arg("tracking") == "1");
-    }
+    if (server.hasArg("ultrasonic")) ultrasonicOn = (server.arg("ultrasonic") == "1");
+    if (server.hasArg("tracking"))   trackingEnabled = (server.arg("tracking") == "1");
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
   server.on("/api/mode", HTTP_GET, []() {
     if (server.hasArg("mode")) {
       botMode = server.arg("mode");
+      screenLocked = false;
+      isSleeping = false;
     }
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -912,17 +1086,16 @@ void setupWebPortalRoutes() {
     noTone(PIN_BUZZER);
     digitalWrite(PIN_LED_RED, LOW);
     digitalWrite(PIN_LED_GREEN, HIGH);
-    server.send(200, "application/json", "{\\"ok\\":true,\\"dismissed\\":true}");
+    server.send(200, "application/json", "{\\"ok\\":true}");
   });
 
   server.on("/api/alarm/test", HTTP_GET, []() {
-    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, max(0, alarmCount - 1)) : 0;
     if (alarmCount == 0) {
       alarms[0] = { 7, 0, true, 1, 0, "Test Alarm" };
       alarmCount = 1;
     }
     alarmRinging = true;
-    ringingAlarmIdx = slot;
+    ringingAlarmIdx = 0;
     isSleeping = false;
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -932,10 +1105,6 @@ void setupWebPortalRoutes() {
     if (server.hasArg("city")) cityName = server.arg("city");
     if (server.hasArg("lat"))  locLat = server.arg("lat").toFloat();
     if (server.hasArg("lon"))  locLon = server.arg("lon").toFloat();
-    if (server.hasArg("tz")) {
-      utcOffsetSec = server.arg("tz").toInt();
-      configTime(utcOffsetSec, 0, "pool.ntp.org");
-    }
     fetchWeatherFromOpenMeteo();
     server.send(200, "application/json", "{\\"ok\\":true}");
   });
@@ -951,15 +1120,15 @@ void setup() {
   pinMode(PIN_LED_GREEN, OUTPUT);
   pinMode(PIN_LED_RED, OUTPUT);
 
-  // Load saved Home WiFi credentials from NVS (falls back to muhib / 12345678)
+  // Load saved Home WiFi from NVS (default: muhib / 12345678)
   prefs.begin("facebot", true);
   wifiSsid     = prefs.getString("ssid", wifiSsid);
   wifiPassword = prefs.getString("pass", wifiPassword);
   prefs.end();
 
-  // Center head straight ahead (90 deg), then detach servo if idle
+  // Center head straight ahead (90 deg), then detach if idle
   moveServoSmooth(90);
-  delay(350);
+  delay(300);
   if (servoOffWhenIdle) {
     headServo.detach();
     servoAttached = false;
@@ -971,52 +1140,48 @@ ${alarmInitLines.join('\n')}
     Serial.println("SSD1306 OLED not found!");
     for (;;);
   }
+
+  // Dual Mode: Broadcast ESP32 Hotspot + Connect to Home WiFi simultaneously!
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+
+  // Show Hotspot Info directly on 0.96" OLED
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10, 24);
-  display.print("WiFi: " + wifiSsid);
+  display.setCursor(0, 4);  display.print("Hotspot:");
+  display.setCursor(0, 15); display.print(AP_SSID);
+  display.setCursor(0, 28); display.print("Pass: 12345678");
+  display.setCursor(0, 41); display.print("Open: 192.168.4.1");
+  display.setCursor(0, 54); display.print("Home WiFi...");
   display.display();
 
-  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 25) {
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(400);
     tries++;
   }
+
+  setupWebPortalRoutes();
 
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(PIN_LED_GREEN, HIGH);
     configTime(utcOffsetSec, 0, "pool.ntp.org");
     fetchWeatherFromOpenMeteo();
-    setupWebPortalRoutes();
-    if (otaAutoCheck) {
-      checkOtaFirmwareUpdate(); // Auto-check GitHub/Vercel OTA on boot
-    }
-    Serial.print("Portal IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("Home WiFi Connected! IP: " + WiFi.localIP().toString());
   } else {
     digitalWrite(PIN_LED_RED, HIGH);
+    Serial.println("Home WiFi offline — Hotspot Portal active at 192.168.4.1");
   }
+  Serial.println("Hotspot Portal: http://192.168.4.1");
 }
 
 void loop() {
   server.handleClient();
   checkScheduledAlarms();
 
-  // Poll published Vercel Cloud Portal every 2.5 seconds for live updates
-  if (cloudSyncOn && (millis() - lastCloudSyncMs > 2500)) {
-    syncStateFromCloudPortal();
-    lastCloudSyncMs = millis();
-  }
-
-  // Periodically check GitHub/Vercel OTA manifest every 30 minutes
-  if (otaAutoCheck && (millis() - lastOtaCheckMs > 1800000)) {
-    checkOtaFirmwareUpdate();
-    lastOtaCheckMs = millis();
-  }
-
-  // Active Alarm Ringing State (Buzzer + Red LED + OLED Alert)
+  // Active Alarm Ringing
   if (alarmRinging && ringingAlarmIdx >= 0) {
     drawAlarmOled(ringingAlarmIdx, frameCount);
     playAlarmBeepTick(alarms[ringingAlarmIdx].melody, frameCount);
@@ -1037,21 +1202,52 @@ void loop() {
     lastWeatherFetch = millis();
   }
 
-  // Render active OLED screen
+  // Auto/User Mode Automatic Screen Cycling (unless locked from portal)
+  if (!isSleeping && !screenLocked) {
+    unsigned long holdMs = (activeScreen == "watch") ? (watchDurSec * 1000UL)
+                         : (activeScreen == "weather") ? (weatherDurSec * 1000UL)
+                         : (faceDurSec * 1000UL);
+    if (millis() - lastCycleSwitchMs > holdMs) {
+      lastCycleSwitchMs = millis();
+      cycleStep++;
+      if (cycleStep % 5 == 0)      activeScreen = "watch";
+      else if (cycleStep % 5 == 1) activeScreen = "weather";
+      else if (cycleStep % 5 == 2) activeScreen = "greeting";
+      else {
+        activeScreen = "face";
+        currentFace = (currentFace + 1) % 25;
+        if (currentFace == 7) currentFace = 8; // skip Sleepy while awake
+      }
+    }
+  }
+
+  // Render Active Screen on 0.96" OLED
   if (isSleeping) {
     drawFace(7, frameCount);
     if (!objectLocked) parkAndPowerOffServo();
   } else if (activeScreen == "watch") {
     drawWatchOled();
   } else if (activeScreen == "weather") {
-    drawWeatherOled();
-  } else if (botMode == "auto" && liveTempC <= coldThresholdC && frameCount % 30 < 10) {
-    drawFace(3, frameCount);
-    display.setTextSize(1);
-    display.setCursor(10, 2);
-    display.print("Today is too cold!");
+    if (liveTempC <= coldThresholdC && frameCount % 8 >= 4) {
+      drawFace(3, frameCount);
+      display.fillRect(0, 0, 128, 12, SSD1306_BLACK);
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(10, 2);
+      display.print("Today is too cold!");
+      display.display();
+      digitalWrite(PIN_LED_RED, HIGH);
+    } else {
+      drawWeatherOled();
+    }
+  } else if (activeScreen == "greeting") {
+    drawGreetingOled();
+  } else if (activeScreen == "text") {
+    drawCustomTextOled();
+  } else if (activeScreen == "bitmap") {
+    display.clearDisplay();
+    display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
     display.display();
-    digitalWrite(PIN_LED_RED, HIGH);
   } else {
     drawFace(currentFace, frameCount);
     updateServoForFace(currentFace, frameCount);
