@@ -1445,6 +1445,29 @@ export default function App() {
     }
   };
 
+  const handleUpdateAlarmTime = useCallback(
+    (id: string, newTime: string) => {
+      const target = alarms.find((a) => a.id === id);
+      if (!target || target.time === newTime) return;
+      const committed: AlarmItem = { ...target, time: newTime };
+      setAlarms((prev) => {
+        const next = prev.map((a) => (a.id === id ? { ...a, time: newTime } : a));
+        next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
+        return next;
+      });
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        saveAlarmToFirestore(fbUser.uid, committed).catch((err) => {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        });
+      }
+      setAlarmSyncMessage(
+        `Re-timed "${committed.label}" to ${newTime} — auto-syncing to ESP32 via Vercel Cloud.`
+      );
+      logInteraction('alarm', `Re-timed Alarm "${committed.label}" to ${newTime}`, 'portal');
+    },
+    [alarms, fbUser, fbWorkspaceReady, syncSingleAlarmSlot, logInteraction]
+  );
+
   const handleDismissAlarm = () => {
     stopBuzzerAudio();
     setActiveAlarm(null);
@@ -2104,12 +2127,14 @@ export default function App() {
             <AlarmsPanel
               alarms={alarms}
               activeAlarm={activeAlarm}
+              now={now}
               esp32Ip={hardware.esp32Ip}
               cloudSyncEnabled={hardware.cloudSyncEnabled}
               buzzerMuted={hardware.buzzerMuted}
               alarmSyncMessage={alarmSyncMessage}
               onAddAlarm={handleAddAlarm}
               onToggleAlarm={handleToggleAlarm}
+              onUpdateAlarmTime={handleUpdateAlarmTime}
               onDeleteAlarm={handleDeleteAlarm}
               onTestAlarm={handleTestAlarm}
               onTestBuzzerBeep={() => {

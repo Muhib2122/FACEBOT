@@ -1,16 +1,19 @@
 import React, { useState } from 'react';
 import { Bell, BellOff, BellRing, Plus, RefreshCw, Trash2, Volume2 } from 'lucide-react';
 import { AlarmItem, FACE_DEFINITIONS } from '../types';
+import { AlarmTimeline24h } from './AlarmTimeline24h';
 
 interface AlarmsPanelProps {
   alarms: AlarmItem[];
   activeAlarm: AlarmItem | null;
+  now: Date;
   esp32Ip: string;
   cloudSyncEnabled: boolean;
   buzzerMuted: boolean;
   alarmSyncMessage: string | null;
   onAddAlarm: (alarm: AlarmItem) => void;
   onToggleAlarm: (id: string) => void;
+  onUpdateAlarmTime: (id: string, newTime: string) => void;
   onDeleteAlarm: (id: string) => void;
   onTestAlarm: (alarm: AlarmItem) => void;
   onTestBuzzerBeep: () => void;
@@ -24,12 +27,14 @@ const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
   alarms,
   activeAlarm,
+  now,
   esp32Ip,
   cloudSyncEnabled,
   buzzerMuted,
   alarmSyncMessage,
   onAddAlarm,
   onToggleAlarm,
+  onUpdateAlarmTime,
   onDeleteAlarm,
   onTestAlarm,
   onTestBuzzerBeep,
@@ -95,6 +100,14 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
           </div>
         </div>
       )}
+
+      {/* Interactive 24-Hour Visual Alarm Timeline (Drag & Drop Re-Timing) */}
+      <AlarmTimeline24h
+        alarms={alarms}
+        activeAlarm={activeAlarm}
+        now={now}
+        onUpdateAlarmTime={onUpdateAlarmTime}
+      />
 
       {/* Add New Alarm Form */}
       <div className="bg-white border border-slate-200 rounded-xl p-5">
