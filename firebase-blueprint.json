@@ -406,6 +406,58 @@
         "capturedAtMs",
         "createdAt"
       ]
+    },
+    "GifRecord": {
+      "title": "Animated OLED GIF Record",
+      "description": "Permanently stored 128x64 monochrome animated GIF decoded via omggif and packed into 1024-byte (2048-char hex) frames per frame in Firestore.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "frameDelayMs": {
+          "type": "number"
+        },
+        "framesHex": {
+          "type": "array"
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "inverted": {
+          "type": "boolean"
+        },
+        "createdAtMs": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "frameDelayMs",
+        "framesHex",
+        "threshold",
+        "inverted",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -432,6 +484,10 @@
     "/users/{userId}/gallery/{shotId}": {
       "schema": { "$ref": "#/entities/GalleryRecord" },
       "description": "Owner-only captured 128x64 OLED display screenshots."
+    },
+    "/users/{userId}/gifs/{gifId}": {
+      "schema": { "$ref": "#/entities/GifRecord" },
+      "description": "Owner-only permanently stored animated 128x64 OLED GIFs (uploaded individually or extracted from ZIP packs)."
     }
   }
 }

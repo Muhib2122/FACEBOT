@@ -22,6 +22,7 @@ import {
   LocationConfig,
   OledScreenshot,
   PlaylistItem,
+  SavedGifItem,
 } from '../types';
 
 const ID_SAFE_REGEX = /[^a-zA-Z0-9_-]/g;
@@ -421,6 +422,80 @@ export async function deleteGalleryShotFromFirestore(
   const path = `users/${uid}/gallery/${shotId}`;
   try {
     await deleteDoc(doc(db, 'users', uid, 'gallery', shotId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export async function saveGifToFirestore(uid: string, gif: SavedGifItem): Promise<void> {
+  const gifId = sanitizeFirestoreId(gif.id, 'gif');
+  const path = `users/${uid}/gifs/${gifId}`;
+  const ref = doc(db, 'users', uid, 'gifs', gifId);
+
+  const safeFrames = (Array.isArray(gif.framesHex) ? gif.framesHex : [])
+    .filter((f): f is string => typeof f === 'string' && f.length > 0)
+    .slice(0, 30)
+    .map((f) => f.padEnd(2048, '0').slice(0, 2048));
+
+  if (safeFrames.length === 0) {
+    throw new Error('Cannot save GIF to Firestore: no valid 1024-byte frames.');
+  }
+
+  const safeName = cleanStr(gif.name, 24, 'facebot_gif');
+  const safeDelay = Math.round(clampNum(gif.frameDelayMs, 30, 1000, 100));
+  const safeThreshold = Math.round(clampNum(gif.threshold ?? 128, 10, 245, 128));
+  const safeInverted = Boolean(gif.inverted);
+  const safeCreatedAtMs = clampNum(gif.createdAt, 1, Number.MAX_SAFE_INTEGER, Date.now());
+
+  try {
+    const snap = await getDoc(ref);
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        ownerId: uid,
+        name: safeName,
+        frameDelayMs: safeDelay,
+        framesHex: safeFrames,
+        threshold: safeThreshold,
+        inverted: safeInverted,
+        createdAtMs: safeCreatedAtMs,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        name: safeName,
+        frameDelayMs: safeDelay,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function updateGifSpeedInFirestore(
+  uid: string,
+  gifIdRaw: string,
+  frameDelayMs: number
+): Promise<void> {
+  const gifId = sanitizeFirestoreId(gifIdRaw, 'gif');
+  const path = `users/${uid}/gifs/${gifId}`;
+  const safeDelay = Math.round(clampNum(frameDelayMs, 30, 1000, 100));
+  try {
+    await updateDoc(doc(db, 'users', uid, 'gifs', gifId), {
+      frameDelayMs: safeDelay,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function deleteGifFromFirestore(uid: string, gifIdRaw: string): Promise<void> {
+  const gifId = sanitizeFirestoreId(gifIdRaw, 'gif');
+  const path = `users/${uid}/gifs/${gifId}`;
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'gifs', gifId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }

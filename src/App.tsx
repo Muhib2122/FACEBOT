@@ -23,16 +23,19 @@ import {
   clearTodayInteractionsInFirestore,
   deleteAlarmFromFirestore,
   deleteGalleryShotFromFirestore,
+  deleteGifFromFirestore,
   deleteReactionFromFirestore,
   hex2048ToPixels,
   pixelsToHex2048,
   saveAlarmToFirestore,
   saveGalleryShotToFirestore,
+  saveGifToFirestore,
   saveInteractionToFirestore,
   savePlaylistToFirestore,
   saveReactionToFirestore,
   saveWorkspaceToFirestore,
   toggleAlarmInFirestore,
+  updateGifSpeedInFirestore,
 } from './utils/firestoreSync';
 import {
   ActiveScreenState,
@@ -739,6 +742,65 @@ export default function App() {
             (err) => {
               try {
                 handleFirestoreError(err, OperationType.LIST, `users/${uid}/gallery`);
+              } catch (e) {
+                setFbFatalError(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          )
+        );
+
+        // 7. Live Permanent Animated GIFs Listener (Stored in Google Firestore, NOT on ESP32)
+        const gifsQ = query(
+          collection(db, 'users', uid, 'gifs'),
+          where('ownerId', '==', uid)
+        );
+        let didInitialGifsHydrate = false;
+        unsubs.push(
+          onSnapshot(
+            gifsQ,
+            (snap) => {
+              const loaded: SavedGifItem[] = snap.docs
+                .map((d) => {
+                  const v = d.data();
+                  const frames = Array.isArray(v.framesHex)
+                    ? v.framesHex.filter((f): f is string => typeof f === 'string' && f.length >= 2048)
+                    : [];
+                  return {
+                    id: d.id,
+                    name: String(v.name || 'facebot_gif'),
+                    frameDelayMs: typeof v.frameDelayMs === 'number' ? v.frameDelayMs : 100,
+                    framesHex: frames,
+                    threshold: typeof v.threshold === 'number' ? v.threshold : 128,
+                    inverted: Boolean(v.inverted),
+                    createdAt:
+                      typeof v.createdAtMs === 'number'
+                        ? v.createdAtMs
+                        : v.createdAt?.toMillis?.() ?? Date.now(),
+                  };
+                })
+                .filter((g) => g.framesHex.length > 0);
+              loaded.sort((a, b) => b.createdAt - a.createdAt);
+
+              if (!didInitialGifsHydrate && loaded.length === 0) {
+                didInitialGifsHydrate = true;
+                // First-time Firestore hydration: preserve any local GIFs permanently into Firestore
+                const localGifs = loadSavedGifs();
+                if (localGifs.length > 0) {
+                  setSavedGifs(localGifs);
+                  Promise.all(localGifs.slice(0, 15).map((g) => saveGifToFirestore(uid, g))).catch(
+                    (err) => {
+                      console.warn('Initial GIF Firestore seed warning:', err);
+                    }
+                  );
+                  return;
+                }
+              }
+              didInitialGifsHydrate = true;
+              setSavedGifs(loaded);
+            },
+            (err) => {
+              try {
+                handleFirestoreError(err, OperationType.LIST, `users/${uid}/gifs`);
               } catch (e) {
                 setFbFatalError(e instanceof Error ? e : new Error(String(e)));
               }
@@ -1873,14 +1935,44 @@ export default function App() {
     hardware.cloudSyncEnabled,
   ]);
 
-  // Animated GIF Studio Handlers
+  // Animated GIF Studio Handlers (Permanently persisted in Google Firestore)
   const handleSaveGif = useCallback(
-    (gif: SavedGifItem) => {
-      setSavedGifs((prev) => [gif, ...prev.filter((g) => g.id !== gif.id)].slice(0, 30));
+    async (gif: SavedGifItem) => {
+      setSavedGifs((prev) => [gif, ...prev.filter((g) => g.id !== gif.id)].slice(0, 60));
       playShortClick(hardware.buzzerMuted);
-      logInteraction('oled-face', `Saved GIF: ${gif.name} (${gif.framesHex.length} frames)`, 'portal');
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        try {
+          await saveGifToFirestore(fbUser.uid, gif);
+        } catch (err) {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+      logInteraction('oled-face', `Saved GIF to Firestore: ${gif.name} (${gif.framesHex.length} frames)`, 'portal');
     },
-    [hardware.buzzerMuted, logInteraction]
+    [fbUser, fbWorkspaceReady, hardware.buzzerMuted, logInteraction]
+  );
+
+  const handleSaveMultipleGifs = useCallback(
+    async (gifs: SavedGifItem[]) => {
+      if (gifs.length === 0) return;
+      setSavedGifs((prev) => {
+        const incomingIds = new Set(gifs.map((g) => g.id));
+        return [...gifs, ...prev.filter((g) => !incomingIds.has(g.id))].slice(0, 60);
+      });
+      playShortClick(hardware.buzzerMuted);
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        for (const gif of gifs) {
+          try {
+            await saveGifToFirestore(fbUser.uid, gif);
+          } catch (err) {
+            setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+            break;
+          }
+        }
+      }
+      logInteraction('oled-face', `Saved ZIP Pack (${gifs.length} GIFs) to Firestore`, 'portal');
+    },
+    [fbUser, fbWorkspaceReady, hardware.buzzerMuted, logInteraction]
   );
 
   const handleDeleteGif = useCallback(
@@ -1891,9 +1983,14 @@ export default function App() {
           ? { kind: 'face', faceId: 0, locked: false }
           : prev
       );
-      logInteraction('oled-face', 'Deleted GIF from Gallery', 'portal');
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        deleteGifFromFirestore(fbUser.uid, id).catch((err) => {
+          setFbFatalError(err instanceof Error ? err : new Error(String(err)));
+        });
+      }
+      logInteraction('oled-face', 'Deleted GIF permanently from Firestore', 'portal');
     },
-    [logInteraction]
+    [fbUser, fbWorkspaceReady, logInteraction]
   );
 
   const handlePlayGif = useCallback(
@@ -1925,12 +2022,20 @@ export default function App() {
     playShortClick(hardware.buzzerMuted);
   }, [hardware.buzzerMuted, sendToEsp32]);
 
-  const handleUpdateGifSpeed = useCallback((id: string, frameDelayMs: number) => {
-    const clamped = Math.max(30, Math.min(1000, Math.round(frameDelayMs)));
-    setSavedGifs((prev) =>
-      prev.map((g) => (g.id === id ? { ...g, frameDelayMs: clamped } : g))
-    );
-  }, []);
+  const handleUpdateGifSpeed = useCallback(
+    (id: string, frameDelayMs: number) => {
+      const clamped = Math.max(30, Math.min(1000, Math.round(frameDelayMs)));
+      setSavedGifs((prev) =>
+        prev.map((g) => (g.id === id ? { ...g, frameDelayMs: clamped } : g))
+      );
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        updateGifSpeedInFirestore(fbUser.uid, id, clamped).catch((err) => {
+          console.warn('Could not persist GIF speed to Firestore:', err);
+        });
+      }
+    },
+    [fbUser, fbWorkspaceReady]
+  );
 
   // Export all saved settings, alarms, custom reactions, playlist & gallery as a portable local JSON backup
   const handleExportBackup = useCallback((): string => {
@@ -2172,6 +2277,9 @@ export default function App() {
           await savePlaylistToFirestore(fbUser.uid, nextPlaylist);
           for (const shot of nextGallery.slice(0, 20)) {
             await saveGalleryShotToFirestore(fbUser.uid, shot);
+          }
+          for (const gif of nextGifs.slice(0, 30)) {
+            await saveGifToFirestore(fbUser.uid, gif);
           }
         } catch (err) {
           console.warn('Partial Firestore sync after backup restore:', err);
@@ -2580,7 +2688,7 @@ export default function App() {
             />
           )}
 
-          {/* 4a. Dedicated Animated GIF Studio (128x64 OLED Monochrome + Gallery) */}
+          {/* 4a. Dedicated Animated GIF Studio (GIF/ZIP Upload + Real-Time 128x64 Preview + Firestore Storage) */}
           {navSection === 'gifs' && (
             <GifStudioPanel
               oledScheme={hardware.oledScheme}
@@ -2589,8 +2697,10 @@ export default function App() {
                 activeScreen.kind === 'custom-gif' ? activeScreen.activeGifId ?? null : null
               }
               cloudSyncEnabled={hardware.cloudSyncEnabled}
-              esp32Ip={hardware.esp32Ip}
+              isSignedIn={Boolean(fbUser && fbUser.emailVerified)}
+              onSignIn={handleGoogleSignIn}
               onSaveGif={handleSaveGif}
+              onSaveMultipleGifs={handleSaveMultipleGifs}
               onDeleteGif={handleDeleteGif}
               onPlayGif={handlePlayGif}
               onStopGif={handleStopGif}

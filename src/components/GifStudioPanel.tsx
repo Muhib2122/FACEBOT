@@ -1,13 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
+import JSZip from 'jszip';
 import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Cpu,
+  Cloud,
   Download,
+  FileArchive,
   FileCode2,
   Film,
   Images,
+  Loader2,
+  LogIn,
   Pause,
   Play,
   Sliders,
@@ -31,8 +35,10 @@ interface GifStudioPanelProps {
   savedGifs: SavedGifItem[];
   activeGifId: string | null;
   cloudSyncEnabled: boolean;
-  esp32Ip: string;
-  onSaveGif: (gif: SavedGifItem) => void;
+  isSignedIn: boolean;
+  onSignIn: () => void;
+  onSaveGif: (gif: SavedGifItem) => Promise<void> | void;
+  onSaveMultipleGifs: (gifs: SavedGifItem[]) => Promise<void> | void;
   onDeleteGif: (id: string) => void;
   onPlayGif: (gif: SavedGifItem, speedOverrideMs?: number) => void;
   onStopGif: () => void;
@@ -41,25 +47,48 @@ interface GifStudioPanelProps {
 
 type GifSubPanelTab = 'upload' | 'gallery';
 
-const MAX_SAVED_GIFS = 30;
+interface QueuedGifSource {
+  id: string;
+  fileName: string;
+  cleanName: string;
+  sizeBytes: number;
+  buffer: ArrayBuffer;
+  defaultDelayMs: number;
+  width: number;
+  height: number;
+  originalFrames: number;
+  packedFrames: Uint8Array[];
+  framesHex: string[];
+}
+
+const MAX_SAVED_GIFS = 60;
+
+function sanitizeGifLabel(fileName: string, fallbackIndex: number): string {
+  const base = fileName.split('/').pop() || fileName;
+  const cleaned = base
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 20);
+  return cleaned || `gif_${fallbackIndex}`;
+}
 
 export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
   oledScheme,
   savedGifs,
   activeGifId,
   cloudSyncEnabled,
-  esp32Ip,
+  isSignedIn,
+  onSignIn,
   onSaveGif,
+  onSaveMultipleGifs,
   onDeleteGif,
   onPlayGif,
   onStopGif,
   onUpdateGifSpeed,
 }) => {
   const [activeSubPanel, setActiveSubPanel] = useState<GifSubPanelTab>('upload');
-  const [galleryStatusMsg, setGalleryStatusMsg] = useState<{ ok: boolean; text: string } | null>(
-    null
-  );
-  const [uploadingToEspId, setUploadingToEspId] = useState<string | null>(null);
 
   const handleDownloadBin = (name: string, framesHex: string[]) => {
     if (framesHex.length === 0) return;
@@ -72,45 +101,6 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  };
-
-  // Optional direct LittleFS upload compatible with ESP32 /upload_gif + /play_gif routes
-  const handlePushBinToEsp32LittleFs = async (gif: SavedGifItem) => {
-    const ip = esp32Ip.trim();
-    if (!ip) {
-      setGalleryStatusMsg({
-        ok: false,
-        text: 'Add your ESP32 Local IP in WiFi & Hardware to upload .bin directly to LittleFS, or use Play on Bot for Vercel Cloud streaming.',
-      });
-      return;
-    }
-    setUploadingToEspId(gif.id);
-    try {
-      const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
-      const blob = framesHexToBinaryBlob(gif.framesHex);
-      const formData = new FormData();
-      formData.append('file', blob, `${gif.name}.bin`);
-      await fetch(`${base}/upload_gif`, {
-        method: 'POST',
-        mode: 'no-cors',
-        body: formData,
-      });
-      await fetch(
-        `${base}/play_gif?name=${encodeURIComponent(`${gif.name}.bin`)}&speed=${gif.frameDelayMs}`,
-        { mode: 'no-cors' }
-      );
-      setGalleryStatusMsg({
-        ok: true,
-        text: `Dispatched "${gif.name}.bin" (${gif.framesHex.length * 1024} bytes) to ESP32 LittleFS at ${base}.`,
-      });
-    } catch {
-      setGalleryStatusMsg({
-        ok: false,
-        text: `Could not reach ${ip}/upload_gif. Ensure your browser and ESP32 share the same WiFi.`,
-      });
-    } finally {
-      setUploadingToEspId(null);
-    }
   };
 
   return (
@@ -126,9 +116,9 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
               128×64 OLED Animated GIF Studio
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Decode <span className="font-mono text-slate-700">.gif</span> files with{' '}
-              <span className="font-mono text-slate-700">omggif</span>, pack into 1024-byte ESP32
-              frames, and manage your bot gallery
+              Upload <span className="font-mono text-slate-700">.gif</span> or{' '}
+              <span className="font-mono text-slate-700">.zip</span> packs — permanently stored in{' '}
+              <span className="font-medium text-slate-700">Google Firestore</span> (not on ESP32 flash)
             </p>
           </div>
         </div>
@@ -165,7 +155,7 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
               }`}
             >
               <Images className="w-3.5 h-3.5" />
-              Saved Gallery
+              Firestore Gallery
               <span className="font-mono text-[11px] text-slate-500 tabular-nums">
                 ({savedGifs.length})
               </span>
@@ -185,32 +175,68 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
         </div>
       </div>
 
-      {/* Sub-Panel 1: Dedicated GIF Upload & 1024-Byte Packer */}
+      {/* Firestore Permanent Storage Banner */}
+      {isSignedIn ? (
+        <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-900">
+          <div className="flex items-center gap-2">
+            <Cloud className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>
+              <strong>Google Firestore Permanent Storage Active:</strong> All uploaded{' '}
+              <span className="font-mono">.gif</span> &amp; <span className="font-mono">.zip</span>{' '}
+              animations are saved permanently in your Firestore cloud account (zero ESP32 flash
+              used) and can be deleted anytime.
+            </span>
+          </div>
+          <span className="font-mono text-[11px] text-emerald-700 shrink-0 tabular-nums">
+            {savedGifs.length} / {MAX_SAVED_GIFS} stored
+          </span>
+        </div>
+      ) : (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-900">
+          <div className="flex items-center gap-2">
+            <Cloud className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              Sign in with Google so your uploaded <span className="font-mono">.gif</span> and{' '}
+              <span className="font-mono">.zip</span> files are stored permanently in{' '}
+              <strong>Google Firestore</strong> across all devices.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onSignIn}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0"
+          >
+            <LogIn className="w-3.5 h-3.5" />
+            Sign in with Google
+          </button>
+        </div>
+      )}
+
+      {/* Sub-Panel 1: Dedicated GIF & ZIP Upload + Real-Time 128x64 Preview & 1024-Byte Packer */}
       {activeSubPanel === 'upload' && (
         <GifUploadSubPanel
           oledScheme={oledScheme}
           savedCount={savedGifs.length}
-          esp32Ip={esp32Ip}
+          isSignedIn={isSignedIn}
           onSaveGif={onSaveGif}
+          onSaveMultipleGifs={onSaveMultipleGifs}
           onPlayGif={onPlayGif}
           onOpenGallery={() => setActiveSubPanel('gallery')}
         />
       )}
 
-      {/* Sub-Panel 2: Saved GIF Gallery (Max 30) */}
+      {/* Sub-Panel 2: Permanent Firestore GIF Gallery */}
       {activeSubPanel === 'gallery' && (
         <section className="bg-white border border-slate-200 rounded-xl p-5 lg:p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
             <div>
               <h3 className="text-sm font-semibold text-slate-900">
-                Saved GIF Gallery ({savedGifs.length} / {MAX_SAVED_GIFS})
+                Permanent Firestore GIF Gallery ({savedGifs.length} / {MAX_SAVED_GIFS})
               </h3>
               <p className="text-xs text-slate-500 mt-0.5">
                 {cloudSyncEnabled
-                  ? 'Press Play on Bot to animate on the OLED and auto-stream frames to your ESP32 via Vercel Cloud'
-                  : esp32Ip.trim()
-                    ? `Ready to stream frames or push .bin files directly to ESP32 (${esp32Ip.trim()})`
-                    : 'Press Play on Bot to animate on the Live OLED Display'}
+                  ? 'Stored permanently in Google Firestore — press Play on Bot to stream live frames to your ESP32 via Vercel Cloud, or delete anytime.'
+                  : 'Stored permanently in Google Firestore — press Play on Bot to preview on the Live OLED Display, or delete anytime.'}
               </p>
             </div>
             <button
@@ -219,27 +245,16 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap"
             >
               <Upload className="w-3.5 h-3.5" />
-              Upload New .GIF
+              Upload .GIF / .ZIP
             </button>
           </div>
 
-          {galleryStatusMsg && (
-            <div
-              className={`mt-4 px-3 py-2 rounded-lg border text-xs flex items-center gap-2 ${
-                galleryStatusMsg.ok
-                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                  : 'bg-red-50 border-red-200 text-red-700'
-              }`}
-            >
-              {galleryStatusMsg.ok && <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />}
-              <span>{galleryStatusMsg.text}</span>
-            </div>
-          )}
-
           {savedGifs.length === 0 ? (
             <div className="py-12 text-center text-xs text-slate-500 mt-4 border border-dashed border-slate-200 rounded-lg">
-              No GIFs saved yet. Open the <span className="font-semibold text-slate-700">GIF Upload</span>{' '}
-              sub-panel to decode and save a <span className="font-mono">.gif</span> animation.
+              No GIFs saved in Firestore yet. Open the{' '}
+              <span className="font-semibold text-slate-700">GIF Upload</span> sub-panel to upload a{' '}
+              <span className="font-mono">.gif</span> or <span className="font-mono">.zip</span>{' '}
+              pack.
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
@@ -249,13 +264,10 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
                   gif={gif}
                   scheme={oledScheme}
                   isPlayingOnBot={activeGifId === gif.id}
-                  hasLocalIp={Boolean(esp32Ip.trim())}
-                  isUploadingEsp={uploadingToEspId === gif.id}
                   onPlay={() => onPlayGif(gif)}
                   onStop={onStopGif}
                   onChangeSpeed={(ms) => onUpdateGifSpeed(gif.id, ms)}
                   onDownloadBin={() => handleDownloadBin(gif.name, gif.framesHex)}
-                  onPushLittleFs={() => void handlePushBinToEsp32LittleFs(gif)}
                   onDelete={() => onDeleteGif(gif.id)}
                 />
               ))}
@@ -270,8 +282,9 @@ export const GifStudioPanel: React.FC<GifStudioPanelProps> = ({
 interface GifUploadSubPanelProps {
   oledScheme: OledColorScheme;
   savedCount: number;
-  esp32Ip: string;
-  onSaveGif: (gif: SavedGifItem) => void;
+  isSignedIn: boolean;
+  onSaveGif: (gif: SavedGifItem) => Promise<void> | void;
+  onSaveMultipleGifs: (gifs: SavedGifItem[]) => Promise<void> | void;
   onPlayGif: (gif: SavedGifItem, speedOverrideMs?: number) => void;
   onOpenGallery: () => void;
 }
@@ -279,15 +292,18 @@ interface GifUploadSubPanelProps {
 const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
   oledScheme,
   savedCount,
-  esp32Ip,
+  isSignedIn,
   onSaveGif,
+  onSaveMultipleGifs,
   onPlayGif,
   onOpenGallery,
 }) => {
-  const [rawBuffer, setRawBuffer] = useState<ArrayBuffer | null>(null);
-  const [sourceFileName, setSourceFileName] = useState<string>('');
-  const [sourceFileBytes, setSourceFileBytes] = useState<number>(0);
+  const [queue, setQueue] = useState<QueuedGifSource[]>([]);
+  const [selectedQueueId, setSelectedQueueId] = useState<string | null>(null);
+  const [zipArchiveName, setZipArchiveName] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   const [gifName, setGifName] = useState('');
   const [threshold, setThreshold] = useState(128);
@@ -298,239 +314,373 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
 
   const [previewPlaying, setPreviewPlaying] = useState(true);
   const [previewFrameIdx, setPreviewFrameIdx] = useState(0);
-  const [packedFrames, setPackedFrames] = useState<Uint8Array[]>([]);
-  const [extractedFramesHex, setExtractedFramesHex] = useState<string[]>([]);
-  const [sourceMeta, setSourceMeta] = useState<{
-    originalFrames: number;
-    width: number;
-    height: number;
-  } | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const [uploadingDirect, setUploadingDirect] = useState(false);
 
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewBufRef = useRef<SSD1306Buffer>(new SSD1306Buffer());
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const gifFileInputRef = useRef<HTMLInputElement | null>(null);
+  const zipFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Decode via omggif, resize to 128x64, and pack into 1024-byte frames whenever source or parameters change
-  useEffect(() => {
-    if (!rawBuffer) return;
-    try {
-      const decoded = decodeGifToOledFrames(rawBuffer, {
-        threshold,
-        invert,
-        fitMode,
-        maxFrames,
-      });
-      setPackedFrames(decoded.packedFrames);
-      setExtractedFramesHex(decoded.framesHex);
-      setSourceMeta({
-        originalFrames: decoded.originalFrameCount,
-        width: decoded.width,
-        height: decoded.height,
-      });
-      setPreviewFrameIdx(0);
-      setStatusMsg({
-        ok: true,
-        text: `Decoded ${decoded.packedFrames.length} frame(s) via omggif → resized to 128×64 and packed into ${(decoded.packedFrames.length * 1024).toLocaleString()} bytes (1,024 B/frame).`,
-      });
-    } catch (err) {
-      setPackedFrames([]);
-      setExtractedFramesHex([]);
-      setStatusMsg({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Could not decode GIF file.',
-      });
-    }
-  }, [rawBuffer, threshold, invert, fitMode, maxFrames]);
+  const activeItem =
+    queue.find((item) => item.id === selectedQueueId) ?? queue[0] ?? null;
 
-  // Animate preview canvas frames at selected speed
+  // Re-decode all queued GIF buffers via omggif whenever packing options change
   useEffect(() => {
-    if (packedFrames.length <= 1 || !previewPlaying) return;
+    if (queue.length === 0) return;
+    setQueue((prev) =>
+      prev.map((item) => {
+        try {
+          const decoded = decodeGifToOledFrames(item.buffer, {
+            threshold,
+            invert,
+            fitMode,
+            maxFrames,
+          });
+          return {
+            ...item,
+            width: decoded.width,
+            height: decoded.height,
+            originalFrames: decoded.originalFrameCount,
+            packedFrames: decoded.packedFrames,
+            framesHex: decoded.framesHex,
+          };
+        } catch {
+          return item;
+        }
+      })
+    );
+    setPreviewFrameIdx(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threshold, invert, fitMode, maxFrames]);
+
+  // Keep name & speed input synced when user switches between items in a ZIP pack
+  useEffect(() => {
+    if (!activeItem) return;
+    setGifName(activeItem.cleanName);
+    setSpeedMs(activeItem.defaultDelayMs);
+    setPreviewFrameIdx(0);
+  }, [activeItem?.id]);
+
+  // Real-time playback animation for the active preview item
+  const activePackedFrames = activeItem?.packedFrames ?? [];
+  useEffect(() => {
+    if (activePackedFrames.length <= 1 || !previewPlaying) return;
     const delay = Math.max(30, Math.min(1000, speedMs));
     const timer = window.setInterval(() => {
-      setPreviewFrameIdx((idx) => (idx + 1) % packedFrames.length);
+      setPreviewFrameIdx((idx) => (idx + 1) % activePackedFrames.length);
     }, delay);
     return () => window.clearInterval(timer);
-  }, [packedFrames.length, previewPlaying, speedMs]);
+  }, [activePackedFrames.length, previewPlaying, speedMs]);
 
-  // Paint current 1024-byte packed Uint8Array directly onto the 128x64 OLED preview canvas
+  // Render the exact 1024-byte packed Uint8Array onto the real-time 128x64 OLED preview canvas
   useEffect(() => {
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const buf = previewBufRef.current;
-    if (packedFrames.length > 0) {
-      const safeIdx = previewFrameIdx % packedFrames.length;
-      writePackedBytesToBuffer(packedFrames[safeIdx], buf);
+    if (activePackedFrames.length > 0) {
+      const safeIdx = previewFrameIdx % activePackedFrames.length;
+      writePackedBytesToBuffer(activePackedFrames[safeIdx], buf);
     } else {
       buf.clearDisplay();
-      buf.printCentered('GIF UPLOAD', 18, 1, 1);
-      buf.printCentered('DROP OR CHOOSE .GIF', 32, 1, 1);
-      buf.printCentered('128x64 · 1024B/FRAME', 46, 1, 1);
+      buf.printCentered('GIF / ZIP UPLOAD', 18, 1, 1);
+      buf.printCentered('128x64 REAL-TIME', 32, 1, 1);
+      buf.printCentered('1024-BYTE PACKER', 46, 1, 1);
     }
     paintBufferToCanvas(ctx, buf, oledScheme, 3, true);
-  }, [packedFrames, previewFrameIdx, oledScheme]);
+  }, [activePackedFrames, previewFrameIdx, oledScheme]);
 
-  const loadGifFile = async (file: File) => {
+  const decodeSingleBuffer = (
+    buffer: ArrayBuffer,
+    fileName: string,
+    sizeBytes: number,
+    index: number
+  ): QueuedGifSource => {
+    const decoded = decodeGifToOledFrames(buffer, {
+      threshold,
+      invert,
+      fitMode,
+      maxFrames,
+    });
+    return {
+      id: `q-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`,
+      fileName,
+      cleanName: sanitizeGifLabel(fileName, index + 1),
+      sizeBytes,
+      buffer,
+      defaultDelayMs: decoded.recommendedDelayMs,
+      width: decoded.width,
+      height: decoded.height,
+      originalFrames: decoded.originalFrameCount,
+      packedFrames: decoded.packedFrames,
+      framesHex: decoded.framesHex,
+    };
+  };
+
+  const handleLoadSingleGif = async (file: File) => {
     if (!file.type.includes('gif') && !file.name.toLowerCase().endsWith('.gif')) {
-      setStatusMsg({ ok: false, text: 'Please select a valid animated .gif image file.' });
+      setStatusMsg({ ok: false, text: 'Please select a valid .gif file (or use Upload .ZIP Pack).' });
       return;
     }
-
+    setIsProcessing(true);
+    setZipArchiveName(null);
     try {
       const ab = await file.arrayBuffer();
-      const cleanName = file.name
-        .replace(/\.[^/.]+$/, '')
-        .replace(/[^a-zA-Z0-9_]/g, '_')
-        .replace(/_+/g, '_')
-        .replace(/^_|_$/g, '')
-        .slice(0, 15);
-      setSourceFileName(file.name);
-      setSourceFileBytes(file.size);
-      setGifName(cleanName || `gif_${Date.now().toString().slice(-4)}`);
-
-      // Quick pass to pick the GIF's native frame speed
-      const quickDecode = decodeGifToOledFrames(ab, {
-        threshold,
-        invert,
-        fitMode,
-        maxFrames,
-      });
-      setSpeedMs(quickDecode.recommendedDelayMs);
-      setRawBuffer(ab);
+      const item = decodeSingleBuffer(ab, file.name, file.size, 0);
+      setQueue([item]);
+      setSelectedQueueId(item.id);
+      setGifName(item.cleanName);
+      setSpeedMs(item.defaultDelayMs);
       setPreviewPlaying(true);
+      setStatusMsg({
+        ok: true,
+        text: `Decoded "${file.name}" via omggif → ${item.packedFrames.length} frame(s) packed into ${(item.packedFrames.length * 1024).toLocaleString()} bytes (1,024 B/frame).`,
+      });
     } catch (err) {
       setStatusMsg({
         ok: false,
-        text: err instanceof Error ? err.message : 'Failed to read selected GIF file.',
+        text: err instanceof Error ? err.message : 'Failed to decode GIF file.',
       });
+    } finally {
+      setIsProcessing(false);
     }
   };
 
-  const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleLoadZipFile = async (file: File) => {
+    if (
+      !file.name.toLowerCase().endsWith('.zip') &&
+      !file.type.includes('zip')
+    ) {
+      setStatusMsg({ ok: false, text: 'Please select a valid .zip archive containing .gif files.' });
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const ab = await file.arrayBuffer();
+      const zip = await JSZip.loadAsync(ab);
+      const gifEntries = Object.values(zip.files).filter((entry) => {
+        if (entry.dir) return false;
+        const lower = entry.name.toLowerCase();
+        if (lower.startsWith('__macosx/') || lower.includes('/__macosx/')) return false;
+        const baseName = entry.name.split('/').pop() || '';
+        if (baseName.startsWith('.')) return false;
+        return lower.endsWith('.gif');
+      });
+
+      if (gifEntries.length === 0) {
+        setStatusMsg({
+          ok: false,
+          text: `No .gif files found inside "${file.name}". Please upload a .zip containing animated .gif images.`,
+        });
+        return;
+      }
+
+      const limit = Math.min(gifEntries.length, 30);
+      const decodedItems: QueuedGifSource[] = [];
+      let failedCount = 0;
+
+      for (let i = 0; i < limit; i++) {
+        const entry = gifEntries[i];
+        try {
+          const entryBuf = await entry.async('arraybuffer');
+          const item = decodeSingleBuffer(entryBuf, entry.name, entryBuf.byteLength, i);
+          decodedItems.push(item);
+        } catch {
+          failedCount += 1;
+        }
+      }
+
+      if (decodedItems.length === 0) {
+        setStatusMsg({
+          ok: false,
+          text: `Could not decode any .gif files inside "${file.name}".`,
+        });
+        return;
+      }
+
+      setZipArchiveName(file.name);
+      setQueue(decodedItems);
+      setSelectedQueueId(decodedItems[0].id);
+      setGifName(decodedItems[0].cleanName);
+      setSpeedMs(decodedItems[0].defaultDelayMs);
+      setPreviewPlaying(true);
+
+      const totalBytes = decodedItems.reduce((sum, g) => sum + g.packedFrames.length * 1024, 0);
+      setStatusMsg({
+        ok: true,
+        text: `Extracted ${decodedItems.length} GIF(s) from "${file.name}" (${totalBytes.toLocaleString()} B packed)${failedCount > 0 ? ` · ${failedCount} skipped` : ''}. Click any item to preview or save all to Firestore.`,
+      });
+    } catch (err) {
+      setStatusMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Failed to extract .zip archive.',
+      });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleGifInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (file) {
-      await loadGifFile(file);
-    }
+    if (file) await handleLoadSingleGif(file);
+  };
+
+  const handleZipInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (file) await handleLoadZipFile(file);
   };
 
   const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file) {
-      await loadGifFile(file);
+    if (!file) return;
+    if (file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip')) {
+      await handleLoadZipFile(file);
+    } else {
+      await handleLoadSingleGif(file);
     }
   };
 
-  const handleClearFile = () => {
-    setRawBuffer(null);
-    setSourceFileName('');
-    setSourceFileBytes(0);
+  const handleClearQueue = () => {
+    setQueue([]);
+    setSelectedQueueId(null);
+    setZipArchiveName(null);
     setGifName('');
-    setPackedFrames([]);
-    setExtractedFramesHex([]);
-    setSourceMeta(null);
     setPreviewFrameIdx(0);
     setStatusMsg(null);
   };
 
-  const handleSaveAndPlay = () => {
-    if (extractedFramesHex.length === 0) {
-      setStatusMsg({ ok: false, text: 'Upload a .gif file first before saving.' });
+  const handleRemoveFromQueue = (id: string) => {
+    setQueue((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      if (selectedQueueId === id) {
+        setSelectedQueueId(next[0]?.id ?? null);
+      }
+      if (next.length === 0) {
+        setZipArchiveName(null);
+        setGifName('');
+      }
+      return next;
+    });
+  };
+
+  const handleSaveCurrentToFirestore = async () => {
+    if (!activeItem || activeItem.framesHex.length === 0) {
+      setStatusMsg({ ok: false, text: 'Upload a .gif or .zip file first before saving.' });
       return;
     }
     if (savedCount >= MAX_SAVED_GIFS) {
       setStatusMsg({
         ok: false,
-        text: `Gallery limit reached (${MAX_SAVED_GIFS} GIFs). Delete an older GIF in Saved Gallery first.`,
+        text: `Gallery limit reached (${MAX_SAVED_GIFS} GIFs). Delete an older GIF in Firestore Gallery first.`,
       });
       return;
     }
+
     const cleanName =
       gifName
         .trim()
         .replace(/[^a-zA-Z0-9_]/g, '_')
-        .slice(0, 15) || `gif_${savedCount + 1}`;
+        .slice(0, 20) || activeItem.cleanName;
 
     const newItem: SavedGifItem = {
-      id: `gif-${Date.now()}`,
+      id: `gif-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
       name: cleanName,
       frameDelayMs: Math.max(30, Math.min(1000, speedMs)),
-      framesHex: extractedFramesHex,
+      framesHex: activeItem.framesHex,
       threshold,
       inverted: invert,
       createdAt: Date.now(),
     };
-    onSaveGif(newItem);
-    onPlayGif(newItem, newItem.frameDelayMs);
-    setStatusMsg({
-      ok: true,
-      text: `Saved "${cleanName}" (${newItem.framesHex.length} × 1,024 B) to Gallery and started live OLED playback!`,
-    });
+
+    setIsSaving(true);
+    try {
+      await onSaveGif(newItem);
+      onPlayGif(newItem, newItem.frameDelayMs);
+      setStatusMsg({
+        ok: true,
+        text: isSignedIn
+          ? `Saved "${cleanName}" (${newItem.framesHex.length} × 1,024 B) permanently to Google Firestore and started live OLED playback!`
+          : `Saved "${cleanName}" locally and started playback. Sign in with Google to persist permanently in Firestore.`,
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleSaveAllZipToFirestore = async () => {
+    if (queue.length === 0) return;
+    const remainingSlots = Math.max(0, MAX_SAVED_GIFS - savedCount);
+    if (remainingSlots === 0) {
+      setStatusMsg({
+        ok: false,
+        text: `Gallery limit reached (${MAX_SAVED_GIFS} GIFs). Delete older GIFs first.`,
+      });
+      return;
+    }
+
+    const batch = queue.slice(0, remainingSlots);
+    const nowMs = Date.now();
+    const itemsToSave: SavedGifItem[] = batch.map((item, idx) => ({
+      id: `gif-${nowMs + idx}-${Math.random().toString(36).slice(2, 5)}`,
+      name:
+        item.id === activeItem?.id && gifName.trim()
+          ? gifName.trim().replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20)
+          : item.cleanName,
+      frameDelayMs:
+        item.id === activeItem?.id
+          ? Math.max(30, Math.min(1000, speedMs))
+          : Math.max(30, Math.min(1000, item.defaultDelayMs)),
+      framesHex: item.framesHex,
+      threshold,
+      inverted: invert,
+      createdAt: nowMs + idx,
+    }));
+
+    setIsSaving(true);
+    try {
+      await onSaveMultipleGifs(itemsToSave);
+      if (itemsToSave[0]) {
+        onPlayGif(itemsToSave[0], itemsToSave[0].frameDelayMs);
+      }
+      setStatusMsg({
+        ok: true,
+        text: isSignedIn
+          ? `Saved all ${itemsToSave.length} GIF(s) permanently to Google Firestore! You can play or delete any of them anytime.`
+          : `Saved ${itemsToSave.length} GIF(s) locally. Sign in with Google to sync them permanently to Firestore.`,
+      });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleDownloadPackedBin = () => {
-    if (packedFrames.length === 0) return;
-    const blob = packedFramesToBinaryBlob(packedFrames);
+    if (!activeItem || activeItem.packedFrames.length === 0) return;
+    const blob = packedFramesToBinaryBlob(activeItem.packedFrames);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${(gifName || 'facebot').replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`;
+    a.download = `${(gifName || activeItem.cleanName || 'facebot').replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  const handleDirectEsp32Upload = async () => {
-    const ip = esp32Ip.trim();
-    if (!ip || packedFrames.length === 0) return;
-    const cleanName =
-      gifName
-        .trim()
-        .replace(/[^a-zA-Z0-9_]/g, '_')
-        .slice(0, 15) || 'facebot_gif';
-    setUploadingDirect(true);
-    try {
-      const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
-      const blob = packedFramesToBinaryBlob(packedFrames);
-      const formData = new FormData();
-      formData.append('file', blob, `${cleanName}.bin`);
-      await fetch(`${base}/upload_gif`, {
-        method: 'POST',
-        mode: 'no-cors',
-        body: formData,
-      });
-      await fetch(
-        `${base}/play_gif?name=${encodeURIComponent(`${cleanName}.bin`)}&speed=${speedMs}`,
-        { mode: 'no-cors' }
-      );
-      setStatusMsg({
-        ok: true,
-        text: `Uploaded "${cleanName}.bin" (${(packedFrames.length * 1024).toLocaleString()} bytes) directly to ESP32 at ${base}.`,
-      });
-    } catch {
-      setStatusMsg({
-        ok: false,
-        text: `Could not reach ${ip}/upload_gif. Check local WiFi or use Save & Play on Bot for Vercel Cloud sync.`,
-      });
-    } finally {
-      setUploadingDirect(false);
-    }
-  };
-
-  const safeFrameIdx = packedFrames.length > 0 ? previewFrameIdx % packedFrames.length : 0;
-  const activePackedFrame = packedFrames[safeFrameIdx] ?? null;
-  const activeFrameHexPreview = activePackedFrame
-    ? Array.from(activePackedFrame.slice(0, 10))
+  const safeFrameIdx =
+    activePackedFrames.length > 0 ? previewFrameIdx % activePackedFrames.length : 0;
+  const activeFrameBytes = activePackedFrames[safeFrameIdx] ?? null;
+  const activeFrameHexPreview = activeFrameBytes
+    ? Array.from(activeFrameBytes.slice(0, 10))
         .map((b) => `0x${b.toString(16).padStart(2, '0').toUpperCase()}`)
         .join(' ')
     : '';
-  const totalPackedBytes = packedFrames.length * 1024;
+  const totalPackedBytes = activePackedFrames.length * 1024;
 
   return (
     <section
@@ -542,17 +692,19 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
         <div>
           <h3 className="text-sm font-semibold text-slate-900">GIF Upload</h3>
           <p className="text-xs text-slate-500 mt-0.5">
-            Upload a <span className="font-mono text-slate-700">.gif</span> file to decode frames
-            with <span className="font-mono text-slate-700">omggif</span>, resize to{' '}
-            <span className="font-mono text-slate-700">128×64</span>, and pack into{' '}
-            <span className="font-mono text-slate-700">1,024-byte</span> ESP32 OLED frames
+            Upload a single <span className="font-mono text-slate-700">.gif</span> or a{' '}
+            <span className="font-mono text-slate-700">.zip</span> archive — decoded via{' '}
+            <span className="font-mono text-slate-700">omggif</span>, resized to{' '}
+            <span className="font-mono text-slate-700">128×64</span>, packed into{' '}
+            <span className="font-mono text-slate-700">1,024-byte</span> frames &amp; stored in
+            Firestore
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {rawBuffer && (
+        <div className="flex flex-wrap items-center gap-2">
+          {queue.length > 0 && (
             <button
               type="button"
-              onClick={handleClearFile}
+              onClick={handleClearQueue}
               className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-600 border border-slate-200 hover:bg-slate-50 rounded-lg"
             >
               <X className="w-3.5 h-3.5" />
@@ -561,25 +713,44 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
           )}
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap"
+            disabled={isProcessing}
+            onClick={() => gifFileInputRef.current?.click()}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
           >
             <Upload className="w-3.5 h-3.5" />
-            {rawBuffer ? 'Replace .GIF' : 'Select .GIF File'}
+            Select .GIF
+          </button>
+          <button
+            type="button"
+            disabled={isProcessing}
+            onClick={() => zipFileInputRef.current?.click()}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200/80 border border-slate-200 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
+          >
+            <FileArchive className="w-3.5 h-3.5 text-blue-600" />
+            Upload .ZIP Pack
           </button>
         </div>
       </div>
 
-      {/* Hidden File Input + Drag-and-Drop Upload Zone */}
+      {/* Explicit <input type="file" accept=".gif"> + <input type="file" accept=".zip"> */}
       <input
-        ref={fileInputRef}
+        ref={gifFileInputRef}
         id="gif-upload-file-input"
         type="file"
-        accept="image/gif,.gif"
-        onChange={handleFileInputChange}
+        accept=".gif"
+        onChange={handleGifInputChange}
+        className="hidden"
+      />
+      <input
+        ref={zipFileInputRef}
+        id="zip-upload-file-input"
+        type="file"
+        accept=".zip,application/zip"
+        onChange={handleZipInputChange}
         className="hidden"
       />
 
+      {/* Drag & Drop Upload Zone for both .gif and .zip */}
       <div
         onDragOver={(e) => {
           e.preventDefault();
@@ -587,19 +758,19 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
         }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => gifFileInputRef.current?.click()}
         role="button"
         tabIndex={0}
         onKeyDown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            fileInputRef.current?.click();
+            gifFileInputRef.current?.click();
           }
         }}
         className={`border-2 border-dashed rounded-xl px-4 py-4 transition-colors cursor-pointer flex flex-wrap items-center justify-between gap-3 ${
           isDragging
             ? 'border-blue-500 bg-blue-50/70'
-            : rawBuffer
+            : queue.length > 0
               ? 'border-emerald-200 bg-emerald-50/40 hover:border-emerald-300'
               : 'border-slate-200 bg-slate-50/70 hover:border-slate-300 hover:bg-slate-50'
         }`}
@@ -607,37 +778,114 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
         <div className="flex items-center gap-3 min-w-0">
           <div
             className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
-              rawBuffer ? 'bg-emerald-100 text-emerald-700' : 'bg-white border border-slate-200 text-slate-600'
+              queue.length > 0
+                ? 'bg-emerald-100 text-emerald-700'
+                : 'bg-white border border-slate-200 text-slate-600'
             }`}
           >
-            <Upload className="w-4 h-4" />
+            {isProcessing ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : zipArchiveName ? (
+              <FileArchive className="w-4 h-4" />
+            ) : (
+              <Upload className="w-4 h-4" />
+            )}
           </div>
           <div className="min-w-0">
             <div className="text-xs font-semibold text-slate-900 truncate">
-              {sourceFileName || 'Drop an animated .gif file here, or click to browse'}
+              {isProcessing
+                ? 'Decoding & packing 128×64 frames…'
+                : zipArchiveName
+                  ? `${zipArchiveName} · ${queue.length} GIF(s) extracted`
+                  : activeItem
+                    ? activeItem.fileName
+                    : 'Drop a .gif or .zip pack here, or click to select a .gif file'}
             </div>
             <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-              {sourceMeta
-                ? `${(sourceFileBytes / 1024).toFixed(1)} KB source · ${sourceMeta.width}×${sourceMeta.height} (${sourceMeta.originalFrames} frames) → ${packedFrames.length} × 1,024 B packed`
-                : 'Supports animated .gif · Auto-resized to 128×64 monochrome (1024 bytes per frame)'}
+              {activeItem
+                ? `${(activeItem.sizeBytes / 1024).toFixed(1)} KB source · ${activeItem.width}×${activeItem.height} (${activeItem.originalFrames}f) → ${activeItem.packedFrames.length} × 1,024 B packed`
+                : 'Accepts .gif (single) or .zip (batch GIF pack) · Stored permanently in Google Firestore'}
             </div>
           </div>
         </div>
         <span className="text-[11px] font-semibold text-blue-600 shrink-0">
-          {rawBuffer ? 'Change file' : 'Browse .gif'}
+          {queue.length > 0 ? 'Replace file' : 'Browse .gif'}
         </span>
       </div>
 
+      {/* ZIP Pack Batch Queue Selector (shown when multiple GIFs are extracted from a .zip) */}
+      {queue.length > 1 && (
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
+              <FileArchive className="w-4 h-4 text-blue-600" />
+              <span>
+                Extracted GIFs from ZIP ({queue.length} ready for Firestore)
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={isSaving}
+              onClick={() => void handleSaveAllZipToFirestore()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {isSaving ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Cloud className="w-3.5 h-3.5" />
+              )}
+              Save All {queue.length} to Firestore
+            </button>
+          </div>
+
+          <div className="flex flex-wrap gap-2 max-h-36 overflow-y-auto pt-1">
+            {queue.map((item) => {
+              const selected = item.id === activeItem?.id;
+              return (
+                <div
+                  key={item.id}
+                  className={`inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded-lg border text-xs transition-colors ${
+                    selected
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSelectedQueueId(item.id)}
+                    className="font-mono text-[11px] truncate max-w-[140px]"
+                  >
+                    {item.cleanName} ({item.packedFrames.length}f)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveFromQueue(item.id)}
+                    title={`Remove ${item.cleanName}`}
+                    className={`p-0.5 rounded ${
+                      selected
+                        ? 'text-slate-300 hover:text-white'
+                        : 'text-slate-400 hover:text-red-600'
+                    }`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Main Two-Column Preview + 1024-Byte Packer Workspace */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left: Live 128x64 OLED Preview Canvas & Frame Inspector */}
+        {/* Left: Real-Time 128x64 OLED Preview Canvas & Frame Inspector */}
         <div className="lg:col-span-6 space-y-3">
           <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
             <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 mb-2.5">
               <span>128×64 OLED PREVIEW (1024B PACKED)</span>
               <span className="tabular-nums">
-                {packedFrames.length > 0
-                  ? `FRAME ${safeFrameIdx + 1}/${packedFrames.length} · ${packedFrames.length} KB`
+                {activePackedFrames.length > 0
+                  ? `FRAME ${safeFrameIdx + 1}/${activePackedFrames.length} · ${activePackedFrames.length} KB`
                   : 'NO GIF LOADED'}
               </span>
             </div>
@@ -651,7 +899,7 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
             </div>
 
             {/* Frame Scrubber & Transport Controls */}
-            {packedFrames.length > 0 && (
+            {activePackedFrames.length > 0 && (
               <div className="mt-3 pt-3 border-t border-slate-800 space-y-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5">
@@ -676,8 +924,8 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
                       type="button"
                       onClick={() => {
                         setPreviewPlaying(false);
-                        setPreviewFrameIdx((idx) =>
-                          (idx - 1 + packedFrames.length) % packedFrames.length
+                        setPreviewFrameIdx(
+                          (idx) => (idx - 1 + activePackedFrames.length) % activePackedFrames.length
                         );
                       }}
                       title="Previous frame"
@@ -689,7 +937,7 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
                       type="button"
                       onClick={() => {
                         setPreviewPlaying(false);
-                        setPreviewFrameIdx((idx) => (idx + 1) % packedFrames.length);
+                        setPreviewFrameIdx((idx) => (idx + 1) % activePackedFrames.length);
                       }}
                       title="Next frame"
                       className="p-1.5 text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-md"
@@ -702,11 +950,11 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
                   </span>
                 </div>
 
-                {packedFrames.length > 1 && (
+                {activePackedFrames.length > 1 && (
                   <input
                     type="range"
                     min={0}
-                    max={packedFrames.length - 1}
+                    max={activePackedFrames.length - 1}
                     value={safeFrameIdx}
                     onChange={(e) => {
                       setPreviewPlaying(false);
@@ -720,28 +968,28 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
             )}
           </div>
 
-          {/* 1024-Byte ESP32 Firmware Format Verification Strip */}
+          {/* 1024-Byte Packed Buffer Verification Strip */}
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
             <div className="flex items-center justify-between text-[11px]">
               <span className="inline-flex items-center gap-1.5 font-semibold text-slate-700">
                 <FileCode2 className="w-3.5 h-3.5 text-blue-600" />
-                ESP32 1024-Byte Firmware Payload
+                1024-Byte Packed Frame Buffer
               </span>
               <span className="font-mono text-slate-500 tabular-nums">
-                SSD1306 1-bit MSB
+                Stored in Firestore
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2 text-center">
               <div className="bg-white border border-slate-200 rounded-lg py-1.5 px-2">
                 <div className="text-[10px] text-slate-400">Bytes / Frame</div>
                 <div className="text-xs font-mono font-semibold text-slate-900 tabular-nums">
-                  {activePackedFrame ? activePackedFrame.byteLength.toLocaleString() : '1,024'} B
+                  {activeFrameBytes ? activeFrameBytes.byteLength.toLocaleString() : '1,024'} B
                 </div>
               </div>
               <div className="bg-white border border-slate-200 rounded-lg py-1.5 px-2">
                 <div className="text-[10px] text-slate-400">Packed Frames</div>
                 <div className="text-xs font-mono font-semibold text-slate-900 tabular-nums">
-                  {packedFrames.length}
+                  {activePackedFrames.length}
                 </div>
               </div>
               <div className="bg-white border border-slate-200 rounded-lg py-1.5 px-2">
@@ -753,13 +1001,13 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
             </div>
             {activeFrameHexPreview && (
               <div className="text-[10px] font-mono text-slate-500 bg-white border border-slate-200 rounded-md px-2.5 py-1.5 truncate">
-                Frame #{safeFrameIdx + 1} header bytes: {activeFrameHexPreview} …
+                Frame #{safeFrameIdx + 1} bytes: {activeFrameHexPreview} …
               </div>
             )}
           </div>
         </div>
 
-        {/* Right: Packing Options & Upload Actions */}
+        {/* Right: Packing Controls & Permanent Firestore Save Actions */}
         <div className="lg:col-span-6 space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
@@ -767,12 +1015,12 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
                 htmlFor="gif-upload-name"
                 className="block text-[11px] font-medium text-slate-600 mb-1"
               >
-                GIF Name (max 15 chars)
+                GIF Name (max 20 chars)
               </label>
               <input
                 id="gif-upload-name"
                 type="text"
-                maxLength={15}
+                maxLength={20}
                 value={gifName}
                 onChange={(e) => setGifName(e.target.value)}
                 placeholder="e.g. cute_cat"
@@ -826,7 +1074,7 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
 
             <div>
               <div className="flex items-center justify-between text-xs mb-1">
-                <span className="font-medium text-slate-700">Max Frames (ESP32 Memory Cap)</span>
+                <span className="font-medium text-slate-700">Max Frames per GIF</span>
                 <span className="font-mono font-semibold text-slate-800 tabular-nums">
                   {maxFrames} frames ({maxFrames} KB)
                 </span>
@@ -880,35 +1128,27 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
           <div className="flex flex-wrap items-center gap-2 pt-3 border-t border-slate-100">
             <button
               type="button"
-              disabled={packedFrames.length === 0}
-              onClick={handleSaveAndPlay}
+              disabled={activePackedFrames.length === 0 || isSaving}
+              onClick={() => void handleSaveCurrentToFirestore()}
               className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
             >
-              <Play className="w-3.5 h-3.5" />
-              Save &amp; Play on Bot
+              {isSaving ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Cloud className="w-3.5 h-3.5" />
+              )}
+              Save to Firestore &amp; Play
             </button>
             <button
               type="button"
-              disabled={packedFrames.length === 0}
+              disabled={activePackedFrames.length === 0}
               onClick={handleDownloadPackedBin}
               className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
-              title="Download packed 1024-byte/frame .bin file for ESP32 firmware"
+              title="Download packed 1024-byte/frame .bin file"
             >
               <Download className="w-3.5 h-3.5" />
               Download .bin
             </button>
-            {esp32Ip.trim() && (
-              <button
-                type="button"
-                disabled={packedFrames.length === 0 || uploadingDirect}
-                onClick={() => void handleDirectEsp32Upload()}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 hover:bg-blue-100/70 disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
-                title="Upload packed 1024-byte/frame .bin directly to ESP32 LittleFS (/upload_gif)"
-              >
-                <Cpu className="w-3.5 h-3.5" />
-                {uploadingDirect ? 'Uploading…' : 'Push to ESP32'}
-              </button>
-            )}
           </div>
 
           {statusMsg && (
@@ -929,7 +1169,7 @@ const GifUploadSubPanel: React.FC<GifUploadSubPanelProps> = ({
                   onClick={onOpenGallery}
                   className="text-emerald-900 font-semibold underline shrink-0"
                 >
-                  View Gallery
+                  Open Gallery
                 </button>
               )}
             </div>
@@ -944,13 +1184,10 @@ interface GifGalleryCardProps {
   gif: SavedGifItem;
   scheme: OledColorScheme;
   isPlayingOnBot: boolean;
-  hasLocalIp: boolean;
-  isUploadingEsp: boolean;
   onPlay: () => void;
   onStop: () => void;
   onChangeSpeed: (ms: number) => void;
   onDownloadBin: () => void;
-  onPushLittleFs: () => void;
   onDelete: () => void;
 }
 
@@ -958,13 +1195,10 @@ const GifGalleryCard: React.FC<GifGalleryCardProps> = ({
   gif,
   scheme,
   isPlayingOnBot,
-  hasLocalIp,
-  isUploadingEsp,
   onPlay,
   onStop,
   onChangeSpeed,
   onDownloadBin,
-  onPushLittleFs,
   onDelete,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1069,22 +1303,10 @@ const GifGalleryCard: React.FC<GifGalleryCardProps> = ({
           <Download className="w-3.5 h-3.5" />
         </button>
 
-        {hasLocalIp && (
-          <button
-            type="button"
-            disabled={isUploadingEsp}
-            onClick={onPushLittleFs}
-            title="Upload .bin directly to ESP32 LittleFS (/upload_gif)"
-            className="p-1.5 text-blue-600 border border-blue-200 hover:bg-blue-50 disabled:opacity-50 rounded-lg"
-          >
-            <Cpu className="w-3.5 h-3.5" />
-          </button>
-        )}
-
         <button
           type="button"
           onClick={onDelete}
-          title="Delete GIF"
+          title="Delete permanently from Firestore"
           className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg"
         >
           <Trash2 className="w-3.5 h-3.5" />
