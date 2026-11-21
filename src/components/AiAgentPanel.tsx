@@ -44,6 +44,7 @@ interface AiAgentPanelProps {
   mode: BotMode;
   isSleeping: boolean;
   greenLedOn: boolean;
+  esp32Online: boolean;
   hardware: HardwareConfig;
   activeScreen: ActiveScreenState;
   activeAlarm: { id: string; time: string; label: string } | null;
@@ -153,6 +154,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   mode,
   isSleeping,
   greenLedOn,
+  esp32Online,
   hardware,
   activeScreen,
   activeAlarm,
@@ -657,7 +659,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                 activeFaceId: activeScreen.faceId,
                 alarmCount,
                 todayInteractions,
-                esp32Connected: Boolean(hardware.cloudSyncEnabled || hardware.esp32Ip.trim()),
+                esp32Connected: esp32Online,
               },
             }),
           });
@@ -1608,9 +1610,9 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
           <div className="pt-2 border-t border-slate-100 text-xs text-slate-500 space-y-1">
             <div>
-              Cloud Bridge:{' '}
-              <span className="font-mono text-slate-800">
-                {hardware.cloudSyncEnabled ? 'Vercel Anywhere Sync ON' : hardware.esp32Ip.trim() || 'Local Only'}
+              ESP32 Bot:{' '}
+              <span className={`font-mono font-semibold ${esp32Online ? 'text-emerald-700' : 'text-amber-700'}`}>
+                {esp32Online ? 'Online (WiFi Connected)' : 'Offline (Waiting for ESP32)'}
               </span>
             </div>
             <div>

@@ -373,6 +373,7 @@ export default function App() {
   const [pomodoroTotalSec, setPomodoroTotalSec] = useState(25 * 60);
   const [pomodoroRunning, setPomodoroRunning] = useState(false);
   const [pomodoroLabel, setPomodoroLabel] = useState('FOCUS');
+  const [pomodoroEndAtMs, setPomodoroEndAtMs] = useState<number>(0);
   const pomodoroEndAtMsRef = useRef<number>(0);
   const pomodoroSecondsLeftRef = useRef<number>(25 * 60);
   pomodoroSecondsLeftRef.current = pomodoroSecondsLeft;
@@ -387,6 +388,11 @@ export default function App() {
   );
   const isOnlineRef = useRef<boolean>(isOnline);
   isOnlineRef.current = isOnline;
+  // Real Physical ESP32 Bot WiFi Online / Offline State (from live /api/bot-state polling heartbeat)
+  const [esp32Online, setEsp32Online] = useState<boolean>(false);
+  const [esp32LastSeenAt, setEsp32LastSeenAt] = useState<number>(0);
+  const esp32OnlineRef = useRef<boolean>(false);
+  const esp32StatusInitializedRef = useRef<boolean>(false);
   const [wifiOverlay, setWifiOverlay] = useState<{ connected: boolean; secondsLeft: number } | null>(null);
   const wifiOverlayIntervalRef = useRef<number | null>(null);
   const [globalSyncing, setGlobalSyncing] = useState(false);
@@ -1071,6 +1077,7 @@ export default function App() {
       otaTriggerSeq: otaTriggerSeqRef.current,
       timerActive: pomodoroRunning,
       timerLabel: pomodoroLabel,
+      timerEndAtMs: pomodoroRunning ? pomodoroEndAtMsRef.current : 0,
       timerEndEpochSec: pomodoroRunning ? Math.round(pomodoroEndAtMsRef.current / 1000) : 0,
       timerDurationSec: pomodoroTotalSec,
       wifiOfflineAuto: true,
@@ -1089,12 +1096,23 @@ export default function App() {
     pomodoroTotalSec,
   ]);
 
+  const getBotStateEndpoint = useCallback(
+    (extraQuery = '') => {
+      const deviceId = encodeURIComponent((hardware.deviceId || 'muhib-bot-1').trim());
+      const base = hardware.cloudPortalUrl.trim().replace(/\/$/, '');
+      const qs = `device=${deviceId}${extraQuery ? `&${extraQuery}` : ''}`;
+      return base && typeof window !== 'undefined' && base !== window.location.origin
+        ? `${base}/api/bot-state?${qs}`
+        : `/api/bot-state?${qs}`;
+    },
+    [hardware.deviceId, hardware.cloudPortalUrl]
+  );
+
   const pushStateToCloud = useCallback(
     async (silent = false) => {
       if (!hardware.cloudSyncEnabled && silent) return;
 
       const payload = buildCloudPayload();
-      const deviceId = encodeURIComponent(payload.deviceId || 'muhib-bot-1');
 
       try {
         if (hardware.cloudBackendType === 'firebase-rtdb') {
@@ -1115,11 +1133,7 @@ export default function App() {
             );
           }
         } else {
-          const base = hardware.cloudPortalUrl.trim().replace(/\/$/, '');
-          const endpoint =
-            base && typeof window !== 'undefined' && base !== window.location.origin
-              ? `${base}/api/bot-state?device=${deviceId}`
-              : `/api/bot-state?device=${deviceId}`;
+          const endpoint = getBotStateEndpoint();
 
           const res = await fetch(endpoint, {
             method: 'POST',
@@ -1127,6 +1141,14 @@ export default function App() {
             body: JSON.stringify(payload),
           });
           if (!res.ok) throw new Error(`Cloud bridge responded ${res.status}`);
+          try {
+            const data = await res.json();
+            if (typeof data?.esp32LastSeenAt === 'number' && data.esp32LastSeenAt > 0) {
+              setEsp32LastSeenAt(data.esp32LastSeenAt);
+            }
+          } catch {
+            // Ignore non-JSON body
+          }
           if (!silent) {
             setCloudSyncStatus(
               `Synced live state to Vercel Cloud (${payload.deviceId}) at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. ESP32 updates within ~1.2s.`
@@ -1145,7 +1167,7 @@ export default function App() {
       hardware.cloudSyncEnabled,
       hardware.cloudBackendType,
       hardware.firebaseDbUrl,
-      hardware.cloudPortalUrl,
+      getBotStateEndpoint,
       buildCloudPayload,
     ]
   );
@@ -1320,56 +1342,106 @@ export default function App() {
     );
   }, []);
 
-  // Automatic Real-Time WiFi Online / Offline Detection (Browser events + Real /api/health heartbeat probe)
-  useEffect(() => {
-    const handleOnline = () => {
-      if (!isOnlineRef.current) {
-        isOnlineRef.current = true;
-        setIsOnline(true);
-        triggerWifiStatusScreen(true);
+  // Apply REAL ESP32 Bot Online / Offline State Transition (triggers 10s WiFi Emoji on real ESP32 connect/disconnect!)
+  const applyEsp32OnlineState = useCallback(
+    (nextOnline: boolean, lastSeenAt?: number) => {
+      if (typeof lastSeenAt === 'number' && lastSeenAt > 0) {
+        setEsp32LastSeenAt(lastSeenAt);
       }
-    };
-    const handleOffline = () => {
-      if (isOnlineRef.current) {
-        isOnlineRef.current = false;
-        setIsOnline(false);
-        triggerWifiStatusScreen(false);
-      }
-    };
+      const prevOnline = esp32OnlineRef.current;
+      esp32OnlineRef.current = nextOnline;
+      setEsp32Online(nextOnline);
 
-    const probeConnectivity = async () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        handleOffline();
+      if (!esp32StatusInitializedRef.current) {
+        esp32StatusInitializedRef.current = true;
         return;
       }
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 3000);
-      try {
-        const res = await fetch('/api/health', {
-          method: 'GET',
-          cache: 'no-store',
-          signal: controller.signal,
-        });
-        window.clearTimeout(timeoutId);
-        if (res.ok) {
-          handleOnline();
-        }
-      } catch {
-        window.clearTimeout(timeoutId);
-        handleOffline();
+
+      if (prevOnline !== nextOnline) {
+        triggerWifiStatusScreen(nextOnline);
       }
+    },
+    [triggerWifiStatusScreen]
+  );
+
+  // Poll Real ESP32 Bot Heartbeat from /api/bot-state?source=portal (Online when ESP32 polled within 10s, Offline when WiFi drops)
+  const pollEsp32Heartbeat = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      isOnlineRef.current = false;
+      setIsOnline(false);
+      applyEsp32OnlineState(false);
+      return false;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 3500);
+    try {
+      const endpoint = getBotStateEndpoint('source=portal');
+      const res = await fetch(endpoint, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      window.clearTimeout(timeoutId);
+      if (res.ok) {
+        if (!isOnlineRef.current) {
+          isOnlineRef.current = true;
+          setIsOnline(true);
+        }
+        const data = await res.json();
+        const online = Boolean(data?.esp32Online);
+        const lastSeen = typeof data?.esp32LastSeenAt === 'number' ? data.esp32LastSeenAt : 0;
+        applyEsp32OnlineState(online, lastSeen);
+        return online;
+      }
+    } catch {
+      window.clearTimeout(timeoutId);
+      // Fallback: check local ESP32 LAN IP directly if user is on local WiFi without internet
+      const ip = hardware.esp32Ip.trim();
+      if (ip) {
+        try {
+          const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
+          const lanRes = await fetch(`${base}/api/stats`, { cache: 'no-store' });
+          if (lanRes.ok) {
+            applyEsp32OnlineState(true, Date.now());
+            return true;
+          }
+        } catch {
+          // LAN also unreachable
+        }
+      }
+      isOnlineRef.current = false;
+      setIsOnline(false);
+      applyEsp32OnlineState(false);
+    }
+    return false;
+  }, [getBotStateEndpoint, hardware.esp32Ip, applyEsp32OnlineState]);
+
+  // Automatic Real-Time ESP32 Bot WiFi Online / Offline Monitor (2.5s heartbeat + browser online/offline listeners)
+  useEffect(() => {
+    const handleBrowserOnline = () => {
+      isOnlineRef.current = true;
+      setIsOnline(true);
+      void pollEsp32Heartbeat();
+    };
+    const handleBrowserOffline = () => {
+      isOnlineRef.current = false;
+      setIsOnline(false);
+      applyEsp32OnlineState(false);
     };
 
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleBrowserOnline);
+    window.addEventListener('offline', handleBrowserOffline);
+    void pollEsp32Heartbeat();
+
     const heartbeatId = window.setInterval(() => {
-      void probeConnectivity();
-    }, 6000);
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void pollEsp32Heartbeat();
+    }, 2500);
 
     return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleBrowserOnline);
+      window.removeEventListener('offline', handleBrowserOffline);
       window.clearInterval(heartbeatId);
       if (wifiStatusTimerRef.current) {
         window.clearTimeout(wifiStatusTimerRef.current);
@@ -1378,9 +1450,9 @@ export default function App() {
         window.clearInterval(wifiOverlayIntervalRef.current);
       }
     };
-  }, [triggerWifiStatusScreen]);
+  }, [pollEsp32Heartbeat, applyEsp32OnlineState]);
 
-  // Global Sync Handler (available on EVERY page in the top header bar)
+  // Global Full-System Sync Handler (available on EVERY page in the top header bar)
   const handleGlobalSync = useCallback(async () => {
     if (globalSyncing) return;
     setGlobalSyncing(true);
@@ -1388,6 +1460,7 @@ export default function App() {
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setIsOnline(false);
+      applyEsp32OnlineState(false);
       triggerWifiStatusScreen(false);
       setGlobalSyncFeedback('Offline · Auto Mode');
       setGlobalSyncing(false);
@@ -1396,15 +1469,31 @@ export default function App() {
     }
 
     try {
-      await Promise.allSettled([
+      const tasks: Promise<unknown>[] = [
         pushStateToCloud(false),
         refreshWeather(),
+        pollEsp32Heartbeat(),
         hardware.esp32Ip.trim() ? handleSyncEsp32Stats() : Promise.resolve(),
-      ]);
+      ];
+
+      if (fbUser && fbUser.emailVerified) {
+        tasks.push(
+          saveWorkspaceToFirestore(fbUser.uid, {
+            mode,
+            settings,
+            location,
+            hardware,
+            activeFaceId: activeScreen.faceId,
+          }),
+          savePlaylistToFirestore(fbUser.uid, playlist)
+        );
+      }
+
+      await Promise.allSettled(tasks);
       sendToEsp32(`/api/mode?mode=${mode}`);
       playShortClick(hardware.buzzerMuted);
       setGlobalSyncFeedback('Synced');
-      logInteraction('hardware', `Manual Sync (${mode.toUpperCase()} mode)`, 'portal');
+      logInteraction('hardware', `Full System Sync (${mode.toUpperCase()} mode)`, 'portal');
     } catch {
       setGlobalSyncFeedback('Sync Failed');
     } finally {
@@ -1413,14 +1502,20 @@ export default function App() {
     }
   }, [
     globalSyncing,
+    applyEsp32OnlineState,
     triggerWifiStatusScreen,
     pushStateToCloud,
     refreshWeather,
-    hardware.esp32Ip,
-    hardware.buzzerMuted,
+    pollEsp32Heartbeat,
+    hardware,
+    fbUser,
+    mode,
+    settings,
+    location,
+    activeScreen.faceId,
+    playlist,
     handleSyncEsp32Stats,
     sendToEsp32,
-    mode,
     logInteraction,
   ]);
 
@@ -1490,20 +1585,23 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [alarms, logInteraction]);
 
-  // Smooth Wall-Clock Focus Timer (Exact 1.000s ticks on portal OLED + clean ESP32 sync without screen mutation)
+  // Smooth Wall-Clock Focus Timer (24-FPS portal OLED + server-computed ESP32 cloud countdown + 1s LAN push)
   useEffect(() => {
     if (!pomodoroRunning) {
       lastSyncedTimerSecRef.current = -1;
       return;
     }
     if (!pomodoroEndAtMsRef.current || pomodoroEndAtMsRef.current <= Date.now()) {
-      pomodoroEndAtMsRef.current = Date.now() + Math.max(1, pomodoroSecondsLeftRef.current) * 1000;
+      const nextEnd = Date.now() + Math.max(1, pomodoroSecondsLeftRef.current) * 1000;
+      pomodoroEndAtMsRef.current = nextEnd;
+      setPomodoroEndAtMs(nextEnd);
     }
 
     const tickTimer = () => {
       const remaining = Math.max(0, Math.ceil((pomodoroEndAtMsRef.current - Date.now()) / 1000));
       setPomodoroSecondsLeft((prev) => (prev === remaining ? prev : remaining));
 
+      // Push exact 1s update over local LAN only if esp32Ip is configured (cloud server computes MM:SS automatically!)
       if (remaining > 0 && remaining !== lastSyncedTimerSecRef.current) {
         lastSyncedTimerSecRef.current = remaining;
         const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
@@ -1511,15 +1609,13 @@ export default function App() {
         sendToEsp32(
           `/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} TIMER`)}&l2=${encodeURIComponent(`${mm}:${ss}`)}`
         );
-        if (hardware.cloudSyncEnabled && isOnlineRef.current) {
-          void pushStateToCloud(true);
-        }
       }
 
       if (remaining <= 0) {
         lastSyncedTimerSecRef.current = 0;
         setPomodoroRunning(false);
         pomodoroEndAtMsRef.current = 0;
+        setPomodoroEndAtMs(0);
         playWakeChime(hardware.buzzerMuted);
         lastBuzzerModeRef.current = 'happy';
         buzzerSeqRef.current += 1;
@@ -1540,15 +1636,13 @@ export default function App() {
     };
 
     tickTimer();
-    const id = window.setInterval(tickTimer, 200);
+    const id = window.setInterval(tickTimer, 100);
     return () => window.clearInterval(id);
   }, [
     pomodoroRunning,
     pomodoroLabel,
     hardware.buzzerMuted,
-    hardware.cloudSyncEnabled,
     sendToEsp32,
-    pushStateToCloud,
     logInteraction,
   ]);
 
@@ -1557,6 +1651,7 @@ export default function App() {
       const safeSec = Math.max(5, Math.round(totalSeconds));
       const endAtMs = Date.now() + safeSec * 1000;
       pomodoroEndAtMsRef.current = endAtMs;
+      setPomodoroEndAtMs(endAtMs);
       lastSyncedTimerSecRef.current = safeSec;
       setPomodoroLabel(label);
       setPomodoroTotalSec(safeSec);
@@ -1591,6 +1686,7 @@ export default function App() {
           ? Math.max(0, Math.ceil((pomodoroEndAtMsRef.current - Date.now()) / 1000))
           : pomodoroSecondsLeftRef.current;
       pomodoroEndAtMsRef.current = 0;
+      setPomodoroEndAtMs(0);
       setPomodoroRunning(false);
       setPomodoroSecondsLeft(left);
       setActiveScreen({
@@ -1605,6 +1701,7 @@ export default function App() {
       const resumeSec = pomodoroSecondsLeftRef.current > 0 ? pomodoroSecondsLeftRef.current : pomodoroTotalSec || 25 * 60;
       const endAtMs = Date.now() + resumeSec * 1000;
       pomodoroEndAtMsRef.current = endAtMs;
+      setPomodoroEndAtMs(endAtMs);
       lastSyncedTimerSecRef.current = -1;
       setPomodoroSecondsLeft(resumeSec);
       setIsSleeping(false);
@@ -1623,6 +1720,7 @@ export default function App() {
 
   const handleResetPomodoro = useCallback(() => {
     pomodoroEndAtMsRef.current = 0;
+    setPomodoroEndAtMs(0);
     lastSyncedTimerSecRef.current = -1;
     setPomodoroRunning(false);
     setPomodoroTotalSec(25 * 60);
@@ -2865,29 +2963,42 @@ export default function App() {
 
           {/* Global Bot Control Strip — ALWAYS visible on EVERY page */}
           <div className="px-4 sm:px-6 lg:px-8 py-2 bg-slate-50/90 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
-            {/* Left: Live Device Online / Offline Status + WiFi Emoji Quick Trigger */}
+            {/* Left: Real Physical ESP32 Bot WiFi Online / Offline Status + WiFi Emoji Quick Trigger */}
             <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
-                onClick={() => triggerWifiStatusScreen(isOnline)}
-                title="Click to display 10-second WiFi status emoji on OLED"
+                onClick={() => {
+                  void pollEsp32Heartbeat().then((liveOnline) => {
+                    triggerWifiStatusScreen(liveOnline);
+                  });
+                }}
+                title={
+                  esp32Online
+                    ? 'ESP32 Bot is connected to WiFi & syncing live. Click to show 10s WiFi Connected OLED emoji.'
+                    : 'ESP32 Bot WiFi is offline (not polling cloud). Click to re-check & show 10s WiFi OFF OLED emoji.'
+                }
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap ${
-                  isOnline
+                  esp32Online
                     ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
                     : 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
                 }`}
               >
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    isOnline ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'
+                    esp32Online ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
                   }`}
                 />
-                {isOnline ? (
+                {esp32Online ? (
                   <Wifi className="w-3.5 h-3.5 text-emerald-600" />
                 ) : (
                   <WifiOff className="w-3.5 h-3.5 text-amber-600" />
                 )}
-                <span>{isOnline ? 'Device Online' : 'Device Offline'}</span>
+                <span>{esp32Online ? 'ESP32 Online' : 'ESP32 Offline'}</span>
+                {esp32Online && esp32LastSeenAt > 0 && (
+                  <span className="hidden sm:inline text-[10px] font-normal text-emerald-700/80">
+                    · WiFi Live
+                  </span>
+                )}
               </button>
 
               {/* Live Focus Timer Indicator across EVERY page when active */}
@@ -2979,12 +3090,14 @@ export default function App() {
           </div>
         )}
 
-        {!isOnline && (
+        {(!esp32Online || !isOnline) && (
           <div className="bg-slate-900 text-slate-100 border-b border-slate-800 px-4 sm:px-6 lg:px-8 py-2 text-xs flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span>
-                WiFi Offline — Bot switched to <strong>Auto Mode</strong> with cached weather &amp; active alarms. Will auto-reconnect when WiFi returns.
+                {!isOnline
+                  ? 'Portal WiFi Offline — Bot running in Auto Mode with cached weather & alarms.'
+                  : 'ESP32 Bot Offline — Waiting for ESP32 WiFi connection. Bot runs offline Auto Mode with cached weather & alarms until WiFi reconnects.'}
               </span>
             </div>
             <button
@@ -3043,11 +3156,13 @@ export default function App() {
               hardware={hardware}
               isSleeping={isSleeping}
               greenLedOn={greenLedOn}
+              esp32Online={esp32Online}
               frame={frame}
               pomodoroSecondsLeft={pomodoroSecondsLeft}
               pomodoroTotalSec={pomodoroTotalSec}
               pomodoroRunning={pomodoroRunning}
               pomodoroLabel={pomodoroLabel}
+              pomodoroEndAtMs={pomodoroEndAtMs}
               onSyncEsp32Stats={handleSyncEsp32Stats}
               onResetStats={() => {
                 setInteractionEvents([]);
@@ -3077,6 +3192,7 @@ export default function App() {
               mode={mode}
               isSleeping={isSleeping}
               greenLedOn={greenLedOn}
+              esp32Online={esp32Online}
               hardware={hardware}
               activeScreen={activeScreen}
               activeAlarm={activeAlarm}

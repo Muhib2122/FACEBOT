@@ -1096,7 +1096,8 @@ export function drawTimerScreen(
   remainingSec: number,
   totalSec: number,
   isPaused: boolean,
-  frame: number
+  frame: number,
+  remainingFloatSec?: number
 ) {
   display.clearDisplay();
   display.drawRoundRect(1, 1, 126, 62, 5, WHITE);
@@ -1116,13 +1117,14 @@ export function drawTimerScreen(
   // Large smooth countdown digits (size 3 = 18x21 per char -> 5 chars = 90px centered cleanly)
   display.printCentered(clockStr, 23, 3, WHITE);
 
-  // Smooth bottom progress bar
+  // Silky-smooth 24-FPS bottom progress bar using sub-second precision
   const barX = 12;
   const barY = 50;
   const barW = 104;
   const barH = 7;
   display.drawRoundRect(barX, barY, barW, barH, 2, WHITE);
-  const progress = Math.max(0, Math.min(1, safeRem / safeTotal));
+  const smoothRem = remainingFloatSec !== undefined ? Math.max(0, remainingFloatSec) : safeRem;
+  const progress = Math.max(0, Math.min(1, smoothRem / safeTotal));
   const fillW = Math.max(0, Math.round((barW - 4) * progress));
   if (fillW > 0) {
     display.fillRect(barX + 2, barY + 2, fillW, barH - 4, WHITE);
@@ -1155,18 +1157,20 @@ export function renderScreenToBuffer(
       break;
     case 'timer': {
       const isPaused = screen.timerPausedSec !== undefined;
-      const remSec = isPaused
+      const exactRemFloat = isPaused
         ? Math.max(0, screen.timerPausedSec ?? 0)
         : screen.timerEndAtMs
-          ? Math.max(0, Math.ceil((screen.timerEndAtMs - Date.now()) / 1000))
+          ? Math.max(0, (screen.timerEndAtMs - Date.now()) / 1000)
           : 0;
+      const remSec = isPaused ? Math.max(0, screen.timerPausedSec ?? 0) : Math.ceil(exactRemFloat);
       drawTimerScreen(
         buffer,
         screen.timerLabel || 'FOCUS',
         remSec,
         screen.timerTotalSec || Math.max(1, remSec),
         isPaused,
-        frame
+        frame,
+        exactRemFloat
       );
       break;
     }

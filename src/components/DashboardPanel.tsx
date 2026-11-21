@@ -47,11 +47,13 @@ interface DashboardPanelProps {
   hardware: HardwareConfig;
   isSleeping: boolean;
   greenLedOn: boolean;
+  esp32Online: boolean;
   frame: number;
   pomodoroSecondsLeft: number;
   pomodoroTotalSec: number;
   pomodoroRunning: boolean;
   pomodoroLabel: string;
+  pomodoroEndAtMs: number;
   onSyncEsp32Stats: () => Promise<void>;
   onResetStats: () => void;
   onStartPomodoro: (totalSeconds: number, label: string) => void;
@@ -91,11 +93,13 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
   hardware,
   isSleeping,
   greenLedOn,
+  esp32Online,
   frame,
   pomodoroSecondsLeft,
   pomodoroTotalSec,
   pomodoroRunning,
   pomodoroLabel,
+  pomodoroEndAtMs,
   onSyncEsp32Stats,
   onResetStats,
   onStartPomodoro,
@@ -116,13 +120,22 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const smoothRemFloat =
+      pomodoroRunning && pomodoroEndAtMs > 0
+        ? Math.max(0, (pomodoroEndAtMs - Date.now()) / 1000)
+        : pomodoroSecondsLeft;
+    const displayRemSec =
+      pomodoroRunning && pomodoroEndAtMs > 0
+        ? Math.ceil(smoothRemFloat)
+        : pomodoroSecondsLeft;
     drawTimerScreen(
       timerBufferRef.current,
       pomodoroLabel,
-      pomodoroSecondsLeft,
+      displayRemSec,
       Math.max(1, pomodoroTotalSec),
       !pomodoroRunning,
-      frame
+      frame,
+      smoothRemFloat
     );
     paintBufferToCanvas(ctx, timerBufferRef.current, hardware.oledScheme, 2, true);
   }, [
@@ -130,6 +143,7 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     pomodoroSecondsLeft,
     pomodoroTotalSec,
     pomodoroRunning,
+    pomodoroEndAtMs,
     frame,
     hardware.oledScheme,
   ]);
@@ -285,11 +299,13 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
             {weather ? `${weather.temperature.toFixed(1)}°C` : '--°C'} · {location.city}
           </div>
           <div className="text-xs text-slate-500 mt-1 truncate">
-            {hardware.cloudSyncEnabled
-              ? `Vercel Cloud Sync (${hardware.deviceId || 'muhib-bot-1'})`
-              : hardware.esp32Ip.trim()
-                ? `ESP32 Bridge: ${hardware.esp32Ip.trim()}`
-                : `${settings.userName}'s Local Simulator`}
+            {esp32Online
+              ? `ESP32 Online · ${hardware.deviceId || 'muhib-bot-1'}`
+              : hardware.cloudSyncEnabled
+                ? `ESP32 Offline · Waiting for ${hardware.deviceId || 'muhib-bot-1'}`
+                : hardware.esp32Ip.trim()
+                  ? `ESP32 Bridge: ${hardware.esp32Ip.trim()}`
+                  : `${settings.userName}'s Local Simulator`}
           </div>
         </div>
       </section>

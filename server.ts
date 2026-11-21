@@ -172,11 +172,10 @@ app.options('/api/bot-state', (_req, res) => {
   res.status(200).end();
 });
 
-app.get('/api/bot-state', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store, max-age=0');
-  const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
-  const existing = deviceStore.get(deviceId) || {
+const ESP32_OFFLINE_THRESHOLD_MS = 10000;
+
+function createDefaultDeviceState(deviceId: string): Record<string, unknown> {
+  return {
     deviceId,
     mode: 'auto',
     screen: 'face',
@@ -197,27 +196,107 @@ app.get('/api/bot-state', (req, res) => {
     otaTriggerSeq: 0,
     timerActive: false,
     timerLabel: 'FOCUS',
+    timerEndAtMs: 0,
     timerEndEpochSec: 0,
     timerDurationSec: 0,
     wifiOfflineAuto: true,
+    esp32LastSeenAt: 0,
+    esp32PollCount: 0,
     updatedAt: 0,
   };
-  res.json(existing);
+}
+
+function resolveLiveTimerState(state: Record<string, unknown>, nowMs: number): Record<string, unknown> {
+  const timerActive = Boolean(state.timerActive);
+  const timerEndAtMs = Number(state.timerEndAtMs) || 0;
+  if (!timerActive || !timerEndAtMs) {
+    return state;
+  }
+
+  const remainingSec = Math.max(0, Math.ceil((timerEndAtMs - nowMs) / 1000));
+  const label = String(state.timerLabel || 'FOCUS').toUpperCase().slice(0, 10);
+
+  if (remainingSec > 0) {
+    const mm = String(Math.floor(remainingSec / 60)).padStart(2, '0');
+    const ss = String(remainingSec % 60).padStart(2, '0');
+    return {
+      ...state,
+      screen: 'text',
+      textLine1: `${label} TIMER`,
+      textLine2: `${mm}:${ss}`,
+      updatedAt: Math.max(Number(state.updatedAt) || 0, Math.floor(nowMs / 1000) * 1000),
+    };
+  }
+
+  state.timerActive = false;
+  state.timerEndAtMs = 0;
+  state.timerEndEpochSec = 0;
+  state.screen = 'text';
+  state.textLine1 = `${label} DONE!`;
+  state.textLine2 = 'NICE JOB!';
+  state.buzzerSeq = (Number(state.buzzerSeq) || 0) + 1;
+  state.buzzerMode = 'happy';
+  state.updatedAt = nowMs;
+  return state;
+}
+
+app.get('/api/bot-state', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  const nowMs = Date.now();
+  const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
+  const isPortalStatusCheck = String(req.query.source || '').toLowerCase() === 'portal';
+
+  let existing = deviceStore.get(deviceId);
+  if (!existing) {
+    existing = createDefaultDeviceState(deviceId);
+    deviceStore.set(deviceId, existing);
+  }
+
+  if (!isPortalStatusCheck) {
+    existing.esp32LastSeenAt = nowMs;
+    existing.esp32PollCount = (Number(existing.esp32PollCount) || 0) + 1;
+    deviceStore.set(deviceId, existing);
+  }
+
+  const resolved = resolveLiveTimerState(existing, nowMs);
+  const esp32LastSeenAt = Number(existing.esp32LastSeenAt) || 0;
+  const esp32AgoMs = esp32LastSeenAt > 0 ? Math.max(0, nowMs - esp32LastSeenAt) : -1;
+  const esp32Online = esp32LastSeenAt > 0 && esp32AgoMs < ESP32_OFFLINE_THRESHOLD_MS;
+
+  res.json({
+    ...resolved,
+    esp32Online,
+    esp32LastSeenAt,
+    esp32AgoSec: esp32AgoMs >= 0 ? Math.floor(esp32AgoMs / 1000) : null,
+    serverTimeMs: nowMs,
+  });
 });
 
 app.post('/api/bot-state', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  const nowMs = Date.now();
   const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
   const body = (req.body || {}) as Record<string, unknown>;
-  const prev = deviceStore.get(deviceId) || {};
+  const prev = deviceStore.get(deviceId) || createDefaultDeviceState(deviceId);
   const payload = {
     ...prev,
     ...body,
     deviceId,
-    updatedAt: Date.now(),
+    esp32LastSeenAt: Number(prev.esp32LastSeenAt) || 0,
+    esp32PollCount: Number(prev.esp32PollCount) || 0,
+    updatedAt: nowMs,
   };
   deviceStore.set(deviceId, payload);
-  res.json({ ok: true, updatedAt: payload.updatedAt });
+  const esp32LastSeenAt = Number(payload.esp32LastSeenAt) || 0;
+  const esp32Online = esp32LastSeenAt > 0 && nowMs - esp32LastSeenAt < ESP32_OFFLINE_THRESHOLD_MS;
+  res.json({
+    ok: true,
+    updatedAt: payload.updatedAt,
+    esp32Online,
+    esp32LastSeenAt,
+    serverTimeMs: nowMs,
+  });
 });
 
 app.get('/api/health', (_req, res) => {
