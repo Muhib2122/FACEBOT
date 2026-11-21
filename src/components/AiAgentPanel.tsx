@@ -545,7 +545,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
       const controller = new AbortController();
       activeFetchAbortRef.current = controller;
-      const timeoutId = window.setTimeout(() => controller.abort(), 18000);
+      const timeoutId = window.setTimeout(() => controller.abort(), 28000);
 
       const parseResponseSafe = async (res: Response) => {
         const rawText = await res.text();

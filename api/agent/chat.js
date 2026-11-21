@@ -138,7 +138,7 @@ Faces: ${FACE_CATALOG}`;
 
     const contents = buildCleanContents(body.history, message);
 
-    const callModel = async (modelName, thinkingLevel) => {
+    const callModel = async (modelName, thinkingLevel, timeoutMs = 8500) => {
       const config = {
         systemInstruction,
         responseMimeType: 'application/json',
@@ -147,25 +147,40 @@ Faces: ${FACE_CATALOG}`;
       if (thinkingLevel) {
         config.thinkingConfig = { thinkingLevel };
       }
-      const resp = await ai.models.generateContent({
-        model: modelName,
-        contents,
-        config,
-      });
+      const resp = await Promise.race([
+        ai.models.generateContent({
+          model: modelName,
+          contents,
+          config,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Model timeout (${timeoutMs}ms)`)), timeoutMs)
+        ),
+      ]);
       if (!resp.text) throw new Error('Empty AI response.');
       return parseJsonSafe(resp.text);
     };
 
-    try {
-      // gemini-4-hydrogen supports ThinkingLevel.LOW (NOT MINIMAL!)
-      const parsed = await callModel('gemini-4-hydrogen', ThinkingLevel.LOW);
-      return res.status(200).json(parsed);
-    } catch (primaryErr) {
-      console.warn('Primary gemini-4-hydrogen failed, trying gemini-3.1-flash-lite:', primaryErr?.message);
-      await wait(500);
-      const fallbackParsed = await callModel('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
-      return res.status(200).json(fallbackParsed);
+    const attempts = [
+      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 7500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 9500 },
+      { model: 'gemini-2.5-flash', thinking: undefined, timeout: 9500 },
+    ];
+
+    let lastErr = null;
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i];
+      try {
+        const parsed = await callModel(attempt.model, attempt.thinking, attempt.timeout);
+        return res.status(200).json(parsed);
+      } catch (err) {
+        lastErr = err;
+        console.warn(`Chat attempt ${attempt.model} failed:`, err?.message);
+        if (i < attempts.length - 1) await wait(200);
+      }
     }
+
+    throw lastErr || new Error('All AI models failed.');
   } catch (err) {
     console.error('Chat API error:', err);
     const friendly = formatFriendlyError(err);

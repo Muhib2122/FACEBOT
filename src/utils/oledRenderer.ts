@@ -938,6 +938,72 @@ export function drawCustomTextScreen(
   }
 }
 
+/**
+ * Draw Muhib Creation's signature 128x64 OLED Boot Logo (5s startup / new-day splash)
+ * Mirrors the official FaceBot logo: bezel frame, clock, cloud, happy arched eyes, smile, AI waves & "muhib creation"
+ */
+export function drawBootLogoScreen(display: SSD1306Buffer, frame: number) {
+  display.clearDisplay();
+  const bounce = Math.round(Math.sin(frame * 0.28) * 1.4);
+
+  // Outer sleek rounded screen bezel
+  display.drawRoundRect(2, 1, 124, 51, 8, WHITE);
+
+  // Top-left mini clock icon
+  display.drawCircle(13, 10, 4, WHITE);
+  display.drawLine(13, 10, 13, 8, WHITE);
+  display.drawLine(13, 10, 15, 11, WHITE);
+
+  // Top-right mini cloud icon
+  display.drawCircle(112, 10, 3, WHITE);
+  display.drawCircle(116, 9, 3, WHITE);
+  display.drawFastHLine(110, 13, 8, WHITE);
+
+  // Happy arched eyes (matches FaceBot logo)
+  const drawArch = (cx: number, cy: number, r: number) => {
+    for (let deg = 205; deg <= 335; deg += 4) {
+      const rad = (deg * Math.PI) / 180;
+      const x = Math.round(cx + Math.cos(rad) * r);
+      const y = Math.round(cy + Math.sin(rad) * r);
+      display.fillCircle(x, y, 1, WHITE);
+    }
+  };
+  drawArch(44, 29 + bounce, 10);
+  drawArch(84, 29 + bounce, 10);
+
+  // Cute pixel blush dots
+  display.drawPixel(27, 32 + bounce, WHITE);
+  display.drawPixel(29, 32 + bounce, WHITE);
+  display.drawPixel(99, 32 + bounce, WHITE);
+  display.drawPixel(101, 32 + bounce, WHITE);
+
+  // Smooth happy smile arc
+  for (let deg = 25; deg <= 155; deg += 4) {
+    const rad = (deg * Math.PI) / 180;
+    const x = Math.round(64 + Math.cos(rad) * 11);
+    const y = Math.round(33 + bounce + Math.sin(rad) * 7);
+    display.fillCircle(x, y, 1, WHITE);
+  }
+
+  // Bottom-right mini "AI||" audio wave mark
+  const waveH = 2 + (frame % 3);
+  display.drawFastVLine(109, 41 - waveH, waveH * 2, WHITE);
+  display.drawFastVLine(112, 39, 5, WHITE);
+  display.drawFastVLine(115, 41 - (3 - (frame % 3)), (3 - (frame % 3)) * 2, WHITE);
+
+  // Signature brand caption underneath bezel
+  display.printCentered('muhib creation', 55, 1, WHITE);
+}
+
+/**
+ * Generate a 128x64 static pixel array of the Boot Logo to push to ESP32 over Vercel Cloud
+ */
+export function generateBootLogoPixels(): number[] {
+  const buf = new SSD1306Buffer();
+  drawBootLogoScreen(buf, 0);
+  return Array.from(buf.pixels);
+}
+
 export function renderScreenToBuffer(
   buffer: SSD1306Buffer,
   screen: ActiveScreenState,
@@ -955,6 +1021,9 @@ export function renderScreenToBuffer(
   }
 
   switch (screen.kind) {
+    case 'boot-logo':
+      drawBootLogoScreen(buffer, frame);
+      break;
     case 'watch':
       drawWatchScreen(buffer, now, settings, weather, location, frame);
       break;

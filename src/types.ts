@@ -30,6 +30,7 @@ export type ScreenKind =
   | 'watch'
   | 'weather'
   | 'greeting'
+  | 'boot-logo'
   | 'custom-bitmap'
   | 'custom-text'
   | 'proximity-wake'

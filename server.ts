@@ -59,6 +59,14 @@ function createAiClient() {
 
 const ALLOWED_TTS_VOICES = new Set(['Kore', 'Zephyr', 'Puck', 'Charon', 'Fenrir']);
 const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+function withTimeoutMs<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Model timeout (${ms}ms)`)), ms)
+    ),
+  ]);
+}
 
 function formatFriendlyGeminiError(err: unknown, fallbackMsg: string): { status: number; message: string } {
   const raw = err instanceof Error ? err.message : String(err || '');
@@ -301,17 +309,24 @@ Hardware Control Rules:
       ],
     };
 
-    const runChatModel = async (model: string, thinkingLevel?: ThinkingLevel) => {
-      const resp = await ai.models.generateContent({
-        model,
-        contents: cleanedContents,
-        config: {
-          systemInstruction,
-          ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
-          responseMimeType: 'application/json',
-          responseSchema,
-        },
-      });
+    const runChatModel = async (
+      model: string,
+      thinkingLevel?: ThinkingLevel,
+      timeout = 8500
+    ) => {
+      const resp = await withTimeoutMs(
+        ai.models.generateContent({
+          model,
+          contents: cleanedContents,
+          config: {
+            systemInstruction,
+            ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
+            responseMimeType: 'application/json',
+            responseSchema,
+          },
+        }),
+        timeout
+      );
       const txt = (resp.text || '')
         .trim()
         .replace(/^```(?:json)?\s*/i, '')
@@ -321,16 +336,26 @@ Hardware Control Rules:
       return JSON.parse(txt);
     };
 
-    try {
-      // gemini-4-hydrogen supports ThinkingLevel.LOW (MINIMAL is invalid on Gemini 4)
-      const parsed = await runChatModel('gemini-4-hydrogen', ThinkingLevel.LOW);
-      res.json(parsed);
-    } catch (primaryErr) {
-      console.warn('Primary chat failed, falling back to gemini-3.1-flash-lite:', primaryErr);
-      await waitMs(450);
-      const fallback = await runChatModel('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
-      res.json(fallback);
+    const chatAttempts: { model: string; thinking?: ThinkingLevel; timeout: number }[] = [
+      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 7500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 9500 },
+      { model: 'gemini-2.5-flash', thinking: undefined, timeout: 9500 },
+    ];
+
+    let lastChatErr: unknown = null;
+    for (let i = 0; i < chatAttempts.length; i++) {
+      const attempt = chatAttempts[i];
+      try {
+        const parsed = await runChatModel(attempt.model, attempt.thinking, attempt.timeout);
+        res.json(parsed);
+        return;
+      } catch (err) {
+        lastChatErr = err;
+        console.warn(`Chat attempt ${attempt.model} failed:`, err);
+        if (i < chatAttempts.length - 1) await waitMs(200);
+      }
     }
+    throw lastChatErr || new Error('All AI models failed.');
   } catch (err) {
     console.error('AI Agent error:', err);
     const friendly = formatFriendlyGeminiError(err, 'AI server e ektu busy lagche, abr try koro.');
@@ -365,42 +390,49 @@ If not found, output:
 BANGLISH: Sorry ${userName}, eta khuje pai ni.
 BANGLA: সরি মুহিব, এটা খুঁজে পাইনি।`;
 
+    const searchAttempts: {
+      model: string;
+      useSearchTool: boolean;
+      thinking?: ThinkingLevel;
+      fallback: boolean;
+      timeout: number;
+    }[] = [
+      { model: 'gemini-3.1-flash-lite', useSearchTool: true, fallback: false, timeout: 8000 },
+      { model: 'gemini-4-hydrogen', useSearchTool: true, thinking: ThinkingLevel.LOW, fallback: false, timeout: 9500 },
+      { model: 'gemini-2.5-flash', useSearchTool: true, fallback: false, timeout: 9500 },
+      { model: 'gemini-3.1-flash-lite', useSearchTool: false, thinking: ThinkingLevel.MINIMAL, fallback: true, timeout: 7500 },
+      { model: 'gemini-2.5-flash', useSearchTool: false, fallback: true, timeout: 7500 },
+    ];
+
     let response;
     let searchFallback = false;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: query,
-        config: {
-          systemInstruction: searchInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          tools: [{ googleSearch: {} }],
-        },
-      });
-    } catch {
-      await waitMs(400);
+    let lastSearchErr: unknown = null;
+
+    for (let i = 0; i < searchAttempts.length; i++) {
+      const a = searchAttempts[i];
       try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: query,
-          config: {
-            systemInstruction: searchInstruction,
-            tools: [{ googleSearch: {} }],
-          },
-        });
-      } catch {
-        await waitMs(400);
-        searchFallback = true;
-        response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: query,
-          config: {
-            systemInstruction: searchInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        });
+        response = await withTimeoutMs(
+          ai.models.generateContent({
+            model: a.model,
+            contents: query,
+            config: {
+              systemInstruction: searchInstruction,
+              ...(a.thinking ? { thinkingConfig: { thinkingLevel: a.thinking } } : {}),
+              ...(a.useSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
+            },
+          }),
+          a.timeout
+        );
+        searchFallback = a.fallback;
+        break;
+      } catch (err) {
+        lastSearchErr = err;
+        console.warn(`Search attempt ${a.model} failed:`, err);
+        if (i < searchAttempts.length - 1) await waitMs(200);
       }
     }
+
+    if (!response) throw lastSearchErr || new Error('All search attempts failed.');
 
     const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sources = rawChunks

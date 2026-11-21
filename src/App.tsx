@@ -69,6 +69,10 @@ import { GalleryPanel } from './components/GalleryPanel';
 import { WeatherProfilePanel } from './components/WeatherProfilePanel';
 import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
+import { IntroSplashScreen } from './components/IntroSplashScreen';
+import { generateBootLogoPixels } from './utils/oledRenderer';
+
+const BRAND_LOGO_URL = '/assets/aistudio/image_d35aba0a.png';
 
 const STORAGE_KEY = 'facebot_esp32_portal_v1';
 const INTERACTIONS_STORAGE_KEY = 'facebot_daily_interactions_v1';
@@ -333,11 +337,14 @@ export default function App() {
   const [fbAuthError, setFbAuthError] = useState<string | null>(null);
   const [fbFatalError, setFbFatalError] = useState<Error | null>(null);
 
+  const [showIntroSplash, setShowIntroSplash] = useState(true);
   const [activeScreen, setActiveScreen] = useState<ActiveScreenState>({
-    kind: 'face',
-    faceId: 0,
-    locked: false,
+    kind: 'boot-logo',
+    faceId: 1,
+    locked: true,
   });
+  const bootLogoTimerRef = useRef<number | null>(null);
+  const bootDayKeyRef = useRef<string>(getTodayKey());
 
   const [activeAlarm, setActiveAlarm] = useState<AlarmItem | null>(null);
   const lastAlarmMinuteRef = useRef<string>('');
@@ -863,7 +870,8 @@ export default function App() {
     let screenName = 'auto';
     if (activeScreen.locked) {
       if (activeScreen.kind === 'custom-text') screenName = 'text';
-      else if (activeScreen.kind === 'custom-bitmap') screenName = 'bitmap';
+      else if (activeScreen.kind === 'custom-bitmap' || activeScreen.kind === 'boot-logo')
+        screenName = 'bitmap';
       else screenName = activeScreen.kind;
     }
 
@@ -1256,14 +1264,52 @@ export default function App() {
     logInteraction('oled-face', 'Bot Put to Sleep', 'portal');
   };
 
-  const handleWakeUp = () => {
+  const triggerFiveSecBootLogo = useCallback(() => {
+    if (bootLogoTimerRef.current) {
+      window.clearTimeout(bootLogoTimerRef.current);
+      bootLogoTimerRef.current = null;
+    }
     setIsSleeping(false);
     setActiveAlarm(null);
+    setActiveScreen({ kind: 'boot-logo', faceId: 1, locked: true });
+    // Push 128x64 monochrome Muhib Creation logo bitmap to already-flashed ESP32 via Vercel Cloud!
+    postBitmapToEsp32(generateBootLogoPixels());
+
+    bootLogoTimerRef.current = window.setTimeout(() => {
+      bootLogoTimerRef.current = null;
+      setActiveScreen((prev) =>
+        prev.kind === 'boot-logo' ? { kind: 'face', faceId: 0, locked: false } : prev
+      );
+    }, 5000);
+  }, [postBitmapToEsp32]);
+
+  // Trigger 5-second OLED & ESP32 Boot Logo on fresh system start
+  const initialBootFiredRef = useRef(false);
+  useEffect(() => {
+    if (initialBootFiredRef.current) return;
+    initialBootFiredRef.current = true;
+    triggerFiveSecBootLogo();
+    return () => {
+      if (bootLogoTimerRef.current) {
+        window.clearTimeout(bootLogoTimerRef.current);
+      }
+    };
+  }, [triggerFiveSecBootLogo]);
+
+  // Also trigger 5-second Boot Logo automatically at the start of every new day (midnight rollover)
+  useEffect(() => {
+    const todayKey = getTodayKey();
+    if (todayKey !== bootDayKeyRef.current) {
+      bootDayKeyRef.current = todayKey;
+      triggerFiveSecBootLogo();
+    }
+  }, [now, triggerFiveSecBootLogo]);
+
+  const handleWakeUp = () => {
     playWakeChime(hardware.buzzerMuted);
-    setActiveScreen({ kind: 'face', faceId: 1, locked: false });
-    sendToEsp32('/api/face?id=1');
     sendToEsp32('/api/buzzer?mode=happy');
-    logInteraction('oled-face', 'Bot Woken Up', 'portal');
+    triggerFiveSecBootLogo();
+    logInteraction('oled-face', 'Bot Booted / Woken Up (5s Logo)', 'portal');
   };
 
   const handleSelectFace = (faceId: number) => {
@@ -1757,9 +1803,26 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex">
+      {/* Full-Screen 5-Second Animated Startup Intro Splash with Bottom Skip Option */}
+      {showIntroSplash && (
+        <IntroSplashScreen
+          durationSec={5}
+          onFinish={() => {
+            setShowIntroSplash(false);
+            triggerFiveSecBootLogo();
+          }}
+        />
+      )}
+
       {/* Desktop Grouped Sidebar Navigation */}
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white border-r border-slate-200 sticky top-0 h-screen">
-        <div className="h-16 px-6 flex items-center border-b border-slate-200">
+        <div className="h-16 px-5 flex items-center gap-3 border-b border-slate-200">
+          <img
+            src={BRAND_LOGO_URL}
+            alt="Muhib Creation FaceBot Logo"
+            className="w-9 h-9 rounded-lg object-contain shrink-0"
+            referrerPolicy="no-referrer"
+          />
           <span className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
             FaceBot Portal
           </span>
@@ -1791,7 +1854,15 @@ export default function App() {
           />
           <div className="relative w-64 max-w-[82vw] bg-white h-full flex flex-col border-r border-slate-200 z-10">
             <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200">
-              <span className="text-base font-bold text-slate-900">FaceBot Portal</span>
+              <div className="flex items-center gap-2.5">
+                <img
+                  src={BRAND_LOGO_URL}
+                  alt="FaceBot Logo"
+                  className="w-7 h-7 rounded-md object-contain shrink-0"
+                  referrerPolicy="no-referrer"
+                />
+                <span className="text-base font-bold text-slate-900">FaceBot Portal</span>
+              </div>
               <button
                 onClick={() => setMobileMenuOpen(false)}
                 className="p-2 text-slate-500 hover:text-slate-900"
@@ -1817,6 +1888,12 @@ export default function App() {
             >
               <Menu className="w-5 h-5" />
             </button>
+            <img
+              src={BRAND_LOGO_URL}
+              alt="FaceBot Logo"
+              className="w-7 h-7 rounded-md object-contain shrink-0 lg:hidden"
+              referrerPolicy="no-referrer"
+            />
             <div className="flex items-center gap-2 text-sm truncate">
               <span className="text-slate-400 hidden sm:inline">FaceBot ESP32</span>
               <span className="text-slate-300 hidden sm:inline" aria-hidden="true">/</span>
@@ -2171,8 +2248,14 @@ export default function App() {
         {/* Quiet Professional Footer — Muhib Creation */}
         <footer className="mt-auto border-t border-slate-200 bg-white px-4 sm:px-6 lg:px-8 py-4">
           <div className="max-w-[1280px] mx-auto flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
-            <div className="font-medium text-slate-700">
-              Muhib Creation · FaceBot ESP32 AI Portal
+            <div className="flex items-center gap-2 font-medium text-slate-700">
+              <img
+                src={BRAND_LOGO_URL}
+                alt="Muhib Creation Logo"
+                className="w-5 h-5 rounded object-contain shrink-0"
+                referrerPolicy="no-referrer"
+              />
+              <span>Muhib Creation · FaceBot ESP32 AI Portal</span>
             </div>
             <div className="flex flex-wrap items-center gap-4">
               <button
@@ -2202,6 +2285,13 @@ export default function App() {
                 className="hover:text-slate-900 transition-colors"
               >
                 Gallery
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowIntroSplash(true)}
+                className="hover:text-slate-900 transition-colors"
+              >
+                Replay Intro
               </button>
             </div>
           </div>

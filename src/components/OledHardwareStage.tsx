@@ -117,6 +117,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
   const activeFaceDef = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
   const screenTitle = (() => {
     if (activeScreen.kind === 'alarm') return `Alarm · ${activeAlarm?.label || 'Ringing'}`;
+    if (activeScreen.kind === 'boot-logo') return 'Muhib Creation · Startup Logo (5s)';
     if (activeScreen.kind === 'watch') return 'Watch UI';
     if (activeScreen.kind === 'weather') return `Live Weather · ${location.city}`;
     if (activeScreen.kind === 'greeting') return `Greeting · ${settings.userName}`;

@@ -45,6 +45,15 @@ function formatFriendlyError(err) {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Search timeout (${ms}ms)`)), ms)
+    ),
+  ]);
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -76,50 +85,38 @@ If not found, output:
 BANGLISH: Sorry ${userName}, eta khuje pai ni.
 BANGLA: সরি মুহিব, এটা খুঁজে পাইনি।`;
 
+    const attempts = [
+      { model: 'gemini-3.1-flash-lite', tools: [{ googleSearch: {} }], thinking: undefined, fallback: false, timeout: 8000 },
+      { model: 'gemini-4-hydrogen', tools: [{ googleSearch: {} }], thinking: ThinkingLevel.LOW, fallback: false, timeout: 9500 },
+      { model: 'gemini-2.5-flash', tools: [{ googleSearch: {} }], thinking: undefined, fallback: false, timeout: 9500 },
+      { model: 'gemini-3.1-flash-lite', tools: undefined, thinking: ThinkingLevel.MINIMAL, fallback: true, timeout: 7500 },
+      { model: 'gemini-2.5-flash', tools: undefined, thinking: undefined, fallback: true, timeout: 7500 },
+    ];
+
     let response = null;
     let searchFallback = false;
+    let lastErr = null;
 
-    // 1. Primary: gemini-4-hydrogen with ThinkingLevel.LOW + Google Search grounding
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: query,
-        config: {
-          systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          tools: [{ googleSearch: {} }],
-        },
-      });
-    } catch (primaryErr) {
-      console.warn('Primary search (gemini-4-hydrogen) failed:', primaryErr?.message);
-      await wait(450);
-
-      // 2. Secondary: gemini-3.1-flash-lite with Google Search grounding
+    for (let i = 0; i < attempts.length; i++) {
+      const a = attempts[i];
       try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: query,
-          config: {
-            systemInstruction,
-            tools: [{ googleSearch: {} }],
-          },
-        });
-      } catch (searchErr) {
-        console.warn('Search tool quota/error, trying standard gemini-4-hydrogen:', searchErr?.message);
-        await wait(450);
-
-        // 3. Fallback when Google Search grounding quota is busy: direct Gemini knowledge answer
-        searchFallback = true;
-        response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: query,
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        });
+        const config = { systemInstruction };
+        if (a.thinking) config.thinkingConfig = { thinkingLevel: a.thinking };
+        if (a.tools) config.tools = a.tools;
+        response = await withTimeout(
+          ai.models.generateContent({ model: a.model, contents: query, config }),
+          a.timeout
+        );
+        searchFallback = a.fallback;
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`Search attempt ${a.model} failed:`, err?.message);
+        if (i < attempts.length - 1) await wait(200);
       }
     }
+
+    if (!response) throw lastErr || new Error('All search attempts failed.');
 
     const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sources = rawChunks
