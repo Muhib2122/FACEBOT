@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import { FastForward } from 'lucide-react';
 
@@ -14,9 +14,24 @@ export const IntroSplashScreen: React.FC<IntroSplashScreenProps> = ({
   const [remainingMs, setRemainingMs] = useState(durationSec * 1000);
   const [exiting, setExiting] = useState(false);
 
+  const onFinishRef = useRef(onFinish);
+  onFinishRef.current = onFinish;
+  const completedRef = useRef(false);
+
+  const triggerExit = () => {
+    if (completedRef.current) return;
+    completedRef.current = true;
+    setExiting(true);
+    window.setTimeout(() => {
+      onFinishRef.current();
+    }, 220);
+  };
+
   useEffect(() => {
+    completedRef.current = false;
     const start = Date.now();
-    const totalMs = durationSec * 1000;
+    const totalMs = Math.max(1000, durationSec * 1000);
+    setRemainingMs(totalMs);
 
     const tick = window.setInterval(() => {
       const elapsed = Date.now() - start;
@@ -24,18 +39,25 @@ export const IntroSplashScreen: React.FC<IntroSplashScreenProps> = ({
       setRemainingMs(left);
       if (left <= 0) {
         window.clearInterval(tick);
-        setExiting(true);
-        window.setTimeout(onFinish, 240);
+        triggerExit();
       }
     }, 50);
 
-    return () => window.clearInterval(tick);
-  }, [durationSec, onFinish]);
+    // Failsafe hard timeout in case interval is throttled in background tabs
+    const failsafe = window.setTimeout(() => {
+      window.clearInterval(tick);
+      setRemainingMs(0);
+      triggerExit();
+    }, totalMs + 120);
+
+    return () => {
+      window.clearInterval(tick);
+      window.clearTimeout(failsafe);
+    };
+  }, [durationSec]);
 
   const handleSkip = () => {
-    if (exiting) return;
-    setExiting(true);
-    window.setTimeout(onFinish, 180);
+    triggerExit();
   };
 
   const progressPct = Math.min(100, Math.max(0, ((durationSec * 1000 - remainingMs) / (durationSec * 1000)) * 100));

@@ -195,6 +195,11 @@ app.get('/api/bot-state', (req, res) => {
     alarmTestSeq: 0,
     alarmTestSlot: 0,
     otaTriggerSeq: 0,
+    timerActive: false,
+    timerLabel: 'FOCUS',
+    timerEndEpochSec: 0,
+    timerDurationSec: 0,
+    wifiOfflineAuto: true,
     updatedAt: 0,
   };
   res.json(existing);

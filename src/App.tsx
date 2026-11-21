@@ -14,6 +14,8 @@ import {
   Mic,
   PenTool,
   SlidersHorizontal,
+  Wifi,
+  WifiOff,
   X,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
@@ -76,7 +78,7 @@ import { WeatherProfilePanel } from './components/WeatherProfilePanel';
 import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
 import { IntroSplashScreen } from './components/IntroSplashScreen';
-import { generateBootLogoPixels } from './utils/oledRenderer';
+import { generateBootLogoPixels, generateWifiStatusPixels } from './utils/oledRenderer';
 import { createStarterGifs } from './utils/gifOledCodec';
 
 const BRAND_LOGO_URL = '/assets/aistudio/image_d35aba0a.png';
@@ -84,6 +86,7 @@ const BRAND_LOGO_URL = '/assets/aistudio/image_d35aba0a.png';
 const STORAGE_KEY = 'facebot_esp32_portal_v1';
 const INTERACTIONS_STORAGE_KEY = 'facebot_daily_interactions_v1';
 const GIFS_STORAGE_KEY = 'facebot_saved_gifs_v1';
+const WEATHER_CACHE_KEY = 'facebot_cached_weather_v1';
 
 const DEFAULT_SETTINGS: BotSettings = {
   userName: 'Muhib',
@@ -226,6 +229,20 @@ function loadSavedGifs(): SavedGifItem[] {
   return createStarterGifs();
 }
 
+function loadCachedWeather(): WeatherData | null {
+  try {
+    const raw = localStorage.getItem(WEATHER_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.temperature === 'number') {
+      return parsed as WeatherData;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 function createInitialDailyEvents(): InteractionEvent[] {
   const now = new Date();
   const currentHour = now.getHours();
@@ -345,16 +362,23 @@ export default function App() {
   const [esp32HourlyOverrides, setEsp32HourlyOverrides] = useState<number[] | null>(null);
   const [esp32SyncStatus, setEsp32SyncStatus] = useState<string | null>(null);
 
-  // Focus Pomodoro OLED Timer State
+  // Focus Pomodoro OLED Timer State (Wall-clock accurate, smooth 1s updates with zero 1.2s stutter)
   const [pomodoroSecondsLeft, setPomodoroSecondsLeft] = useState(25 * 60);
+  const [pomodoroTotalSec, setPomodoroTotalSec] = useState(25 * 60);
   const [pomodoroRunning, setPomodoroRunning] = useState(false);
   const [pomodoroLabel, setPomodoroLabel] = useState('FOCUS');
+  const pomodoroEndAtMsRef = useRef<number>(0);
+  const pomodoroSecondsLeftRef = useRef<number>(25 * 60);
+  pomodoroSecondsLeftRef.current = pomodoroSecondsLeft;
 
-  // Live Runtime States
+  // Live Runtime States (Weather cached locally so offline Auto Mode keeps weather + alarms working)
   const [frame, setFrame] = useState(0);
   const [now, setNow] = useState(() => new Date());
   const [isSleeping, setIsSleeping] = useState(false);
-  const [weather, setWeather] = useState<WeatherData | null>(null);
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [weather, setWeather] = useState<WeatherData | null>(() => loadCachedWeather());
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [pingStatus, setPingStatus] = useState<string | null>(null);
@@ -377,6 +401,7 @@ export default function App() {
     locked: true,
   });
   const bootLogoTimerRef = useRef<number | null>(null);
+  const wifiStatusTimerRef = useRef<number | null>(null);
   const bootDayKeyRef = useRef<string>(getTodayKey());
 
   const [activeAlarm, setActiveAlarm] = useState<AlarmItem | null>(null);
@@ -969,15 +994,34 @@ export default function App() {
   // Build Cloud State Payload synced to Vercel /api/bot-state or Firebase RTDB
   const buildCloudPayload = useCallback(() => {
     let screenName = 'auto';
+    let textLine1 = activeScreen.textLine1 || '';
+    let textLine2 = activeScreen.textLine2 || '';
+
     if (activeScreen.locked) {
-      if (activeScreen.kind === 'custom-text') screenName = 'text';
-      else if (
+      if (activeScreen.kind === 'custom-text') {
+        screenName = 'text';
+      } else if (activeScreen.kind === 'timer') {
+        screenName = 'text';
+        const remSec =
+          activeScreen.timerPausedSec !== undefined
+            ? activeScreen.timerPausedSec
+            : activeScreen.timerEndAtMs
+              ? Math.max(0, Math.ceil((activeScreen.timerEndAtMs - Date.now()) / 1000))
+              : pomodoroSecondsLeftRef.current;
+        const mm = String(Math.floor(remSec / 60)).padStart(2, '0');
+        const ss = String(remSec % 60).padStart(2, '0');
+        textLine1 = `${(activeScreen.timerLabel || pomodoroLabel || 'FOCUS').toUpperCase()} TIMER`;
+        textLine2 = `${mm}:${ss}`;
+      } else if (
         activeScreen.kind === 'custom-bitmap' ||
         activeScreen.kind === 'boot-logo' ||
-        activeScreen.kind === 'custom-gif'
-      )
+        activeScreen.kind === 'custom-gif' ||
+        activeScreen.kind === 'wifi-status'
+      ) {
         screenName = 'bitmap';
-      else screenName = activeScreen.kind;
+      } else {
+        screenName = activeScreen.kind;
+      }
     }
 
     const mappedAlarms = alarms.slice(0, 8).map((a) => {
@@ -998,8 +1042,8 @@ export default function App() {
       mode,
       screen: screenName,
       faceId: activeScreen.faceId,
-      textLine1: activeScreen.textLine1 || '',
-      textLine2: activeScreen.textLine2 || '',
+      textLine1,
+      textLine2,
       userName: settings.userName || 'Muhib',
       city: location.city || 'Dhaka',
       greenLed: hardware.greenLedMode,
@@ -1012,6 +1056,11 @@ export default function App() {
       alarmTestSeq: alarmTestSeqRef.current,
       alarmTestSlot: alarmTestSlotRef.current,
       otaTriggerSeq: otaTriggerSeqRef.current,
+      timerActive: pomodoroRunning,
+      timerLabel: pomodoroLabel,
+      timerEndEpochSec: pomodoroRunning ? Math.round(pomodoroEndAtMsRef.current / 1000) : 0,
+      timerDurationSec: pomodoroTotalSec,
+      wifiOfflineAuto: true,
       updatedAt: Date.now(),
     };
   }, [
@@ -1022,6 +1071,9 @@ export default function App() {
     settings.userName,
     location.city,
     alarms,
+    pomodoroRunning,
+    pomodoroLabel,
+    pomodoroTotalSec,
   ]);
 
   const pushStateToCloud = useCallback(
@@ -1138,15 +1190,24 @@ export default function App() {
     }
   }, [hardware.esp32Ip, logInteraction]);
 
-  // Fetch Live Weather from Open-Meteo whenever location changes
+  // Fetch Live Weather from Open-Meteo whenever location changes (and cache locally for offline Auto Mode)
   const refreshWeather = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setWeatherError('Offline — using last synced weather in Auto Mode.');
+      return;
+    }
     setWeatherLoading(true);
     setWeatherError(null);
     try {
       const data = await fetchLiveWeather(location);
       setWeather(data);
+      try {
+        localStorage.setItem(WEATHER_CACHE_KEY, JSON.stringify(data));
+      } catch {
+        // Ignore storage quota
+      }
     } catch {
-      setWeatherError('Could not reach Open-Meteo weather API. Check internet connection.');
+      setWeatherError('Offline or weather API unreachable — keeping last synced weather.');
     } finally {
       setWeatherLoading(false);
     }
@@ -1157,6 +1218,77 @@ export default function App() {
     const interval = window.setInterval(refreshWeather, 10 * 60 * 1000);
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
+
+  // Show 10-second WiFi Connected / WiFi OFF pixel-art emoji screen + Offline Auto-Mode switch
+  const triggerWifiStatusScreen = useCallback(
+    (connected: boolean) => {
+      if (wifiStatusTimerRef.current) {
+        window.clearTimeout(wifiStatusTimerRef.current);
+      }
+
+      setIsSleeping(false);
+      if (!connected) {
+        // WiFi lost -> automatically switch bot to AUTO mode while keeping cached weather, alarms & clock
+        setMode('auto');
+        playShortClick(hardware.buzzerMuted);
+      } else {
+        // WiFi restored -> auto-reconnect, refresh weather, push WiFi Connected emoji bitmap to ESP32
+        playWakeChime(hardware.buzzerMuted);
+        void refreshWeather();
+        postBitmapToEsp32(generateWifiStatusPixels(true));
+      }
+
+      setActiveScreen({
+        kind: 'wifi-status',
+        faceId: connected ? 1 : 9,
+        wifiConnected: connected,
+        locked: true,
+      });
+
+      logInteraction(
+        'hardware',
+        connected
+          ? 'WiFi Reconnected · Auto Sync Restored (10s OLED Banner)'
+          : 'WiFi Disconnected · Switched to Offline Auto Mode (10s OLED Banner)',
+        'esp32'
+      );
+
+      // Hold the WiFi Connected / Disconnected emoji on OLED for exactly 10 seconds, then resume normal display
+      wifiStatusTimerRef.current = window.setTimeout(() => {
+        setActiveScreen((prev) =>
+          prev.kind === 'wifi-status'
+            ? { kind: 'face', faceId: connected ? 1 : 0, locked: false }
+            : prev
+        );
+        if (connected) {
+          sendToEsp32('/api/mode?mode=auto');
+        }
+      }, 10000);
+    },
+    [hardware.buzzerMuted, refreshWeather, postBitmapToEsp32, logInteraction, sendToEsp32]
+  );
+
+  // Automatic Real-Time WiFi Online / Offline Detection
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      triggerWifiStatusScreen(true);
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      triggerWifiStatusScreen(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      if (wifiStatusTimerRef.current) {
+        window.clearTimeout(wifiStatusTimerRef.current);
+      }
+    };
+  }, [triggerWifiStatusScreen]);
 
   // Smooth 24-FPS OLED Animation Frame Tick (Matches ESP32 Core-1 42ms frame loop)
   useEffect(() => {
@@ -1172,7 +1304,7 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [hardware.animationSpeed]);
 
-  // 1-Second Clock & Real Alarm Checker
+  // 1-Second Clock & Real Alarm Checker (Works seamlessly online AND offline in Auto Mode!)
   useEffect(() => {
     const id = window.setInterval(() => {
       const current = new Date();
@@ -1208,48 +1340,41 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [alarms, logInteraction]);
 
-  // Live OLED Pomodoro Focus Countdown
+  // Smooth Wall-Clock Focus Timer (Exact 1.000s ticks with ZERO 1.2s cloud-sync stutter!)
   useEffect(() => {
     if (!pomodoroRunning) return;
-    const id = window.setInterval(() => {
-      setPomodoroSecondsLeft((prev) => {
-        if (prev <= 1) {
-          setPomodoroRunning(false);
-          playWakeChime(hardware.buzzerMuted);
-          lastBuzzerModeRef.current = 'happy';
-          buzzerSeqRef.current += 1;
-          setCloudEventSeq((s) => s + 1);
-          setActiveScreen({
-            kind: 'custom-text',
-            faceId: 1,
-            textLine1: `${pomodoroLabel} DONE!`,
-            textLine2: 'NICE JOB!',
-            locked: true,
-          });
-          sendToEsp32(`/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} DONE!`)}&l2=NICE`);
-          sendToEsp32('/api/buzzer?mode=happy');
-          logInteraction('hardware', `Focus Timer Completed (${pomodoroLabel})`, 'portal');
-          return 0;
-        }
-        const next = prev - 1;
-        const mm = String(Math.floor(next / 60)).padStart(2, '0');
-        const ss = String(next % 60).padStart(2, '0');
+    if (!pomodoroEndAtMsRef.current || pomodoroEndAtMsRef.current <= Date.now()) {
+      pomodoroEndAtMsRef.current = Date.now() + Math.max(1, pomodoroSecondsLeft) * 1000;
+    }
+
+    const tickTimer = () => {
+      const remaining = Math.max(0, Math.ceil((pomodoroEndAtMsRef.current - Date.now()) / 1000));
+      setPomodoroSecondsLeft((prev) => (prev === remaining ? prev : remaining));
+
+      if (remaining <= 0) {
+        setPomodoroRunning(false);
+        pomodoroEndAtMsRef.current = 0;
+        playWakeChime(hardware.buzzerMuted);
+        lastBuzzerModeRef.current = 'happy';
+        buzzerSeqRef.current += 1;
+        setCloudEventSeq((s) => s + 1);
         setActiveScreen({
           kind: 'custom-text',
-          faceId: 0,
-          textLine1: `${pomodoroLabel} TIMER`,
-          textLine2: `${mm}:${ss}`,
+          faceId: 1,
+          textLine1: `${pomodoroLabel} DONE!`,
+          textLine2: 'NICE JOB!',
           locked: true,
         });
-        // Update real ESP32 OLED every 5 seconds to keep WiFi smooth
-        if (next % 5 === 0) {
-          sendToEsp32(
-            `/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} TIMER`)}&l2=${encodeURIComponent(`${mm}:${ss}`)}`
-          );
-        }
-        return next;
-      });
-    }, 1000);
+        sendToEsp32(
+          `/api/screen?kind=text&l1=${encodeURIComponent(`${pomodoroLabel} DONE!`)}&l2=NICE`
+        );
+        sendToEsp32('/api/buzzer?mode=happy');
+        logInteraction('hardware', `Focus Timer Completed (${pomodoroLabel})`, 'portal');
+      }
+    };
+
+    tickTimer();
+    const id = window.setInterval(tickTimer, 200);
     return () => window.clearInterval(id);
   }, [pomodoroRunning, pomodoroLabel, hardware.buzzerMuted, sendToEsp32, logInteraction]);
 
@@ -1940,7 +2065,7 @@ export default function App() {
     async (gif: SavedGifItem) => {
       setSavedGifs((prev) => [gif, ...prev.filter((g) => g.id !== gif.id)].slice(0, 60));
       playShortClick(hardware.buzzerMuted);
-      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+      if (fbUser && fbUser.emailVerified) {
         try {
           await saveGifToFirestore(fbUser.uid, gif);
         } catch (err) {
@@ -1949,7 +2074,7 @@ export default function App() {
       }
       logInteraction('oled-face', `Saved GIF to Firestore: ${gif.name} (${gif.framesHex.length} frames)`, 'portal');
     },
-    [fbUser, fbWorkspaceReady, hardware.buzzerMuted, logInteraction]
+    [fbUser, hardware.buzzerMuted, logInteraction]
   );
 
   const handleSaveMultipleGifs = useCallback(
@@ -1960,7 +2085,7 @@ export default function App() {
         return [...gifs, ...prev.filter((g) => !incomingIds.has(g.id))].slice(0, 60);
       });
       playShortClick(hardware.buzzerMuted);
-      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+      if (fbUser && fbUser.emailVerified) {
         for (const gif of gifs) {
           try {
             await saveGifToFirestore(fbUser.uid, gif);
@@ -1972,25 +2097,27 @@ export default function App() {
       }
       logInteraction('oled-face', `Saved ZIP Pack (${gifs.length} GIFs) to Firestore`, 'portal');
     },
-    [fbUser, fbWorkspaceReady, hardware.buzzerMuted, logInteraction]
+    [fbUser, hardware.buzzerMuted, logInteraction]
   );
 
   const handleDeleteGif = useCallback(
-    (id: string) => {
+    async (id: string) => {
       setSavedGifs((prev) => prev.filter((g) => g.id !== id));
       setActiveScreen((prev) =>
         prev.kind === 'custom-gif' && prev.activeGifId === id
           ? { kind: 'face', faceId: 0, locked: false }
           : prev
       );
-      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
-        deleteGifFromFirestore(fbUser.uid, id).catch((err) => {
+      if (fbUser && fbUser.emailVerified) {
+        try {
+          await deleteGifFromFirestore(fbUser.uid, id);
+        } catch (err) {
           setFbFatalError(err instanceof Error ? err : new Error(String(err)));
-        });
+        }
       }
       logInteraction('oled-face', 'Deleted GIF permanently from Firestore', 'portal');
     },
-    [fbUser, fbWorkspaceReady, logInteraction]
+    [fbUser, logInteraction]
   );
 
   const handlePlayGif = useCallback(
@@ -2347,17 +2474,16 @@ export default function App() {
     </nav>
   );
 
+  const handleIntroFinish = useCallback(() => {
+    setShowIntroSplash(false);
+    triggerFiveSecBootLogo();
+  }, [triggerFiveSecBootLogo]);
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex">
-      {/* Full-Screen 5-Second Animated Startup Intro Splash with Bottom Skip Option */}
+      {/* Full-Screen 5-Second Animated Startup Intro Splash with Auto-Skip + Bottom Skip Option */}
       {showIntroSplash && (
-        <IntroSplashScreen
-          durationSec={5}
-          onFinish={() => {
-            setShowIntroSplash(false);
-            triggerFiveSecBootLogo();
-          }}
-        />
+        <IntroSplashScreen durationSec={5} onFinish={handleIntroFinish} />
       )}
 
       {/* Desktop Grouped Sidebar Navigation */}
@@ -2493,6 +2619,25 @@ export default function App() {
           </div>
         )}
 
+        {!isOnline && (
+          <div className="bg-slate-900 text-slate-100 border-b border-slate-800 px-4 sm:px-6 lg:px-8 py-2 text-xs flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span>
+                WiFi Offline — Bot switched to <strong>Auto Mode</strong> with cached weather &amp; active alarms. Will auto-reconnect when WiFi returns.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => triggerWifiStatusScreen(false)}
+              className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 whitespace-nowrap"
+            >
+              <Wifi className="w-3 h-3" />
+              Show 10s WiFi OFF OLED
+            </button>
+          </div>
+        )}
+
         {/* Focused Workspace (No Cluttered Duplicated Rig on Every Page) */}
         <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-[1280px] w-full mx-auto space-y-6">
           {/* Global Active Alarm Alert Bar (only shown if an alarm is currently ringing) */}
@@ -2553,17 +2698,73 @@ export default function App() {
                 }
               }}
               onStartPomodoro={(mins, label) => {
+                const totalSec = Math.max(10, Math.round(mins * 60));
+                const endAtMs = Date.now() + totalSec * 1000;
+                pomodoroEndAtMsRef.current = endAtMs;
                 setPomodoroLabel(label);
-                setPomodoroSecondsLeft(mins * 60);
+                setPomodoroTotalSec(totalSec);
+                setPomodoroSecondsLeft(totalSec);
                 setPomodoroRunning(true);
                 setIsSleeping(false);
-                logInteraction('hardware', `Started OLED ${label} Timer (${mins}m)`, 'portal');
+                setActiveScreen({
+                  kind: 'timer',
+                  faceId: 0,
+                  timerLabel: label,
+                  timerEndAtMs: endAtMs,
+                  timerTotalSec: totalSec,
+                  locked: true,
+                });
+                const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+                const ss = String(totalSec % 60).padStart(2, '0');
+                sendToEsp32(
+                  `/api/screen?kind=text&l1=${encodeURIComponent(`${label} TIMER`)}&l2=${encodeURIComponent(`${mm}:${ss}`)}`
+                );
+                logInteraction('hardware', `Started Smooth OLED ${label} Timer (${mins}m)`, 'portal');
               }}
-              onTogglePomodoro={() => setPomodoroRunning((r) => !r)}
+              onTogglePomodoro={() => {
+                setPomodoroRunning((running) => {
+                  if (running) {
+                    const left = Math.max(
+                      0,
+                      Math.ceil((pomodoroEndAtMsRef.current - Date.now()) / 1000)
+                    );
+                    pomodoroEndAtMsRef.current = 0;
+                    setPomodoroSecondsLeft(left);
+                    setActiveScreen({
+                      kind: 'timer',
+                      faceId: 0,
+                      timerLabel: pomodoroLabel,
+                      timerTotalSec: pomodoroTotalSec,
+                      timerPausedSec: left,
+                      locked: true,
+                    });
+                    return false;
+                  } else {
+                    const resumeSec = Math.max(1, pomodoroSecondsLeft);
+                    const endAtMs = Date.now() + resumeSec * 1000;
+                    pomodoroEndAtMsRef.current = endAtMs;
+                    setIsSleeping(false);
+                    setActiveScreen({
+                      kind: 'timer',
+                      faceId: 0,
+                      timerLabel: pomodoroLabel,
+                      timerEndAtMs: endAtMs,
+                      timerTotalSec: Math.max(pomodoroTotalSec, resumeSec),
+                      locked: true,
+                    });
+                    return true;
+                  }
+                });
+              }}
               onResetPomodoro={() => {
+                pomodoroEndAtMsRef.current = 0;
                 setPomodoroRunning(false);
+                setPomodoroTotalSec(25 * 60);
                 setPomodoroSecondsLeft(25 * 60);
                 setPomodoroLabel('FOCUS');
+                setActiveScreen((prev) =>
+                  prev.kind === 'timer' ? { kind: 'face', faceId: 0, locked: false } : prev
+                );
               }}
               onNavigate={setNavSection}
             />

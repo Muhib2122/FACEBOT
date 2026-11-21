@@ -35,6 +35,8 @@ export type ScreenKind =
   | 'custom-bitmap'
   | 'custom-gif'
   | 'custom-text'
+  | 'timer'
+  | 'wifi-status'
   | 'proximity-wake'
   | 'alarm';
 
@@ -210,6 +212,11 @@ export interface ActiveScreenState {
   activeGifId?: string;
   textLine1?: string;
   textLine2?: string;
+  timerLabel?: string;
+  timerEndAtMs?: number;
+  timerTotalSec?: number;
+  timerPausedSec?: number;
+  wifiConnected?: boolean;
   alarmId?: string;
   locked?: boolean;
 }

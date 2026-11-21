@@ -123,6 +123,14 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
   const screenTitle = (() => {
     if (activeScreen.kind === 'alarm') return `Alarm · ${activeAlarm?.label || 'Ringing'}`;
     if (activeScreen.kind === 'boot-logo') return 'Muhib Creation · Startup Logo (5s)';
+    if (activeScreen.kind === 'wifi-status') {
+      return activeScreen.wifiConnected
+        ? 'WiFi Connected · Auto Sync (10s)'
+        : 'WiFi Disconnected · Auto Mode (10s)';
+    }
+    if (activeScreen.kind === 'timer') {
+      return `${activeScreen.timerLabel || 'Focus'} Timer${activeScreen.timerPausedSec !== undefined ? ' (Paused)' : ''}`;
+    }
     if (activeScreen.kind === 'watch') return 'Watch UI';
     if (activeScreen.kind === 'weather') return `Live Weather · ${location.city}`;
     if (activeScreen.kind === 'greeting') return `Greeting · ${settings.userName}`;

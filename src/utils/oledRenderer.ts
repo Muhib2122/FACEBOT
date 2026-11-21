@@ -1004,6 +1004,131 @@ export function generateBootLogoPixels(): number[] {
   return Array.from(buf.pixels);
 }
 
+/**
+ * Pixel-art WiFi Connected / WiFi Disconnected Emoji Screen (shown for 10 seconds on network transitions)
+ */
+export function drawWifiStatusScreen(
+  display: SSD1306Buffer,
+  connected: boolean,
+  frame: number
+) {
+  display.clearDisplay();
+  display.drawRoundRect(2, 1, 124, 62, 6, WHITE);
+
+  const cx = 64;
+  const cy = 34;
+
+  // Draw helper for concentric WiFi signal arcs (225°..315° upward)
+  const drawWifiArc = (radius: number) => {
+    for (let deg = 225; deg <= 315; deg += 3) {
+      const rad = (deg * Math.PI) / 180;
+      const x = Math.round(cx + Math.cos(rad) * radius);
+      const y = Math.round(cy + Math.sin(rad) * radius);
+      display.fillCircle(x, y, 1, WHITE);
+    }
+  };
+
+  if (connected) {
+    // Animated pulsing 3-bar WiFi icon (bars light up smoothly)
+    const phase = Math.floor(frame / 5) % 4;
+    display.fillCircle(cx, cy, 3, WHITE);
+    if (phase >= 1) drawWifiArc(10);
+    if (phase >= 2) drawWifiArc(17);
+    if (phase >= 3 || frame % 12 < 9) drawWifiArc(24);
+
+    // Cute tiny happy check-badge on top right
+    display.drawCircle(108, 16, 7, WHITE);
+    display.drawLine(104, 16, 107, 19, WHITE);
+    display.drawLine(107, 19, 112, 13, WHITE);
+
+    // Cute tiny smiling emoji on top left
+    display.drawCircle(20, 16, 7, WHITE);
+    display.drawPixel(18, 14, WHITE);
+    display.drawPixel(22, 14, WHITE);
+    display.drawLine(17, 18, 19, 20, WHITE);
+    display.drawLine(19, 20, 21, 20, WHITE);
+    display.drawLine(21, 20, 23, 18, WHITE);
+
+    display.printCentered('WIFI CONNECTED', 42, 1, WHITE);
+    display.printCentered('ONLINE & SYNCED', 52, 1, WHITE);
+  } else {
+    // Static WiFi arcs + bold diagonal slash (WiFi OFF emoji)
+    display.fillCircle(cx, cy, 2, WHITE);
+    drawWifiArc(10);
+    drawWifiArc(17);
+    drawWifiArc(24);
+
+    // Clear a small gap along the diagonal so the slash stands out crisply
+    for (let t = -22; t <= 22; t++) {
+      display.drawPixel(cx + t, cy - 11 + Math.round(t * 0.72) - 2, BLACK);
+      display.drawPixel(cx + t, cy - 11 + Math.round(t * 0.72) + 2, BLACK);
+    }
+    // Draw bold 2px slash across WiFi symbol
+    display.drawLine(cx - 21, cy - 26, cx + 21, cy + 4, WHITE);
+    display.drawLine(cx - 21, cy - 25, cx + 21, cy + 5, WHITE);
+
+    // Cute blinking alert/sad emoji on top left
+    if (frame % 16 < 12) {
+      display.drawCircle(20, 16, 7, WHITE);
+      display.drawPixel(18, 14, WHITE);
+      display.drawPixel(22, 14, WHITE);
+      display.drawLine(17, 20, 20, 18, WHITE);
+      display.drawLine(20, 18, 23, 20, WHITE);
+    }
+
+    display.printCentered('WIFI OFF', 42, 1, WHITE);
+    display.printCentered('AUTO MODE ACTIVE', 52, 1, WHITE);
+  }
+}
+
+export function generateWifiStatusPixels(connected: boolean): number[] {
+  const buf = new SSD1306Buffer();
+  drawWifiStatusScreen(buf, connected, 10);
+  return Array.from(buf.pixels);
+}
+
+/**
+ * Smooth 1-Second User Focus Timer OLED Screen (computes exact remaining time with smooth progress bar)
+ */
+export function drawTimerScreen(
+  display: SSD1306Buffer,
+  label: string,
+  remainingSec: number,
+  totalSec: number,
+  isPaused: boolean,
+  frame: number
+) {
+  display.clearDisplay();
+  display.drawRoundRect(1, 1, 126, 62, 5, WHITE);
+
+  const safeRem = Math.max(0, Math.floor(remainingSec));
+  const safeTotal = Math.max(1, totalSec || safeRem || 1);
+  const mins = Math.floor(safeRem / 60);
+  const secs = safeRem % 60;
+  const colon = isPaused || Math.floor(frame / 12) % 2 === 0 ? ':' : ' ';
+  const clockStr = `${String(mins).padStart(2, '0')}${colon}${String(secs).padStart(2, '0')}`;
+
+  // Top header
+  const header = `${(label || 'FOCUS').toUpperCase().slice(0, 10)}${isPaused ? ' PAUSED' : ' TIMER'}`;
+  display.printCentered(header, 7, 1, WHITE);
+  display.drawFastHLine(10, 17, 108, WHITE);
+
+  // Large smooth countdown digits (size 3 = 18x21 per char -> 5 chars = 90px centered cleanly)
+  display.printCentered(clockStr, 23, 3, WHITE);
+
+  // Smooth bottom progress bar
+  const barX = 12;
+  const barY = 50;
+  const barW = 104;
+  const barH = 7;
+  display.drawRoundRect(barX, barY, barW, barH, 2, WHITE);
+  const progress = Math.max(0, Math.min(1, safeRem / safeTotal));
+  const fillW = Math.max(0, Math.round((barW - 4) * progress));
+  if (fillW > 0) {
+    display.fillRect(barX + 2, barY + 2, fillW, barH - 4, WHITE);
+  }
+}
+
 export function renderScreenToBuffer(
   buffer: SSD1306Buffer,
   screen: ActiveScreenState,
@@ -1025,6 +1150,26 @@ export function renderScreenToBuffer(
     case 'boot-logo':
       drawBootLogoScreen(buffer, frame);
       break;
+    case 'wifi-status':
+      drawWifiStatusScreen(buffer, Boolean(screen.wifiConnected), frame);
+      break;
+    case 'timer': {
+      const isPaused = screen.timerPausedSec !== undefined;
+      const remSec = isPaused
+        ? Math.max(0, screen.timerPausedSec ?? 0)
+        : screen.timerEndAtMs
+          ? Math.max(0, Math.ceil((screen.timerEndAtMs - Date.now()) / 1000))
+          : 0;
+      drawTimerScreen(
+        buffer,
+        screen.timerLabel || 'FOCUS',
+        remSec,
+        screen.timerTotalSec || Math.max(1, remSec),
+        isPaused,
+        frame
+      );
+      break;
+    }
     case 'watch':
       drawWatchScreen(buffer, now, settings, weather, location, frame);
       break;

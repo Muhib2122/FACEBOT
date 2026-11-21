@@ -163,6 +163,10 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     if (activeScreen.kind === 'watch') return 'Watch UI';
     if (activeScreen.kind === 'weather') return 'Live Weather';
     if (activeScreen.kind === 'greeting') return 'Greeting';
+    if (activeScreen.kind === 'wifi-status') {
+      return activeScreen.wifiConnected ? 'WiFi Connected (10s)' : 'WiFi OFF · Auto Mode (10s)';
+    }
+    if (activeScreen.kind === 'timer') return `${activeScreen.timerLabel || 'Focus'} Timer`;
     if (activeScreen.kind === 'custom-text') return activeScreen.textLine1 || 'Custom Text';
     if (activeScreen.kind === 'custom-bitmap') return 'Touchpad Art';
     if (activeScreen.kind === 'custom-gif') return 'Animated GIF';
