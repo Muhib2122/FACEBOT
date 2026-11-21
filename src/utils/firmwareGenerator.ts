@@ -62,7 +62,7 @@ export function generateEsp32Firmware(
     ? safeFirebaseUrl
     : `${safeCloudBase}/api/bot-state?device=${safeDeviceId}`;
   const otaVersionUrl = `${safeCloudBase}/ota/version.json`;
-  const fwVersion = (hardware.firmwareVersion || '3.0.0').replace(/"/g, '');
+  const fwVersion = (hardware.firmwareVersion || '4.0.0').replace(/"/g, '');
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -73,14 +73,15 @@ export function generateEsp32Firmware(
 
   return `/*
  * =========================================================================
- * FaceBot — Dual-Core ESP32 Cloud Firmware (Muhib Creation · v${fwVersion})
- * Control from ANYWHERE via Vercel Web Portal — Zero ESP32 WiFi Switching!
+ * FaceBot — Always-On AI Agent Dual-Core ESP32 Firmware (Muhib Creation · v${fwVersion})
+ * Zero WiFi Timeout · Instant 5s WiFi ON/OFF OLED + Buzzer + Green LED Alerts
  * =========================================================================
  * ARCHITECTURE (Maximum Efficiency & Butter-Smooth 24-FPS Animations):
- *   - Core 1 (loop)         : 24-FPS silky-smooth OLED animations + Green LED + Buzzer
- *   - Core 0 (FreeRTOS Task): 1.2s Vercel Cloud HTTPS Sync + Auto OTA + Open-Meteo Weather
- *   - No Hotspot needed! ESP32 stays on Home WiFi ("${safeSsid}").
- *   - Anyone with your Vercel URL can control FaceBot from anywhere in the world!
+ *   - Core 1 (loop)         : 24-FPS silky-smooth OLED + 5s Priority WiFi Alert + Timer + LED + Buzzer
+ *   - Core 0 (FreeRTOS Task): Persistent-TLS 1.2s Vercel Cloud Sync + Auto OTA + Open-Meteo Weather
+ *   - Always-Connected WiFi : Modem-sleep OFF (WIFI_PS_NONE), Max TX Power, Persistent SSL (zero timeout!)
+ *   - Offline AI Auto Mode  : Instant 5s WiFi OFF OLED+Buzzer+LED -> Auto Mode with NVS-cached weather/alarms
+ *   - Online User Unlock    : Instant 5s WiFi ON OLED+Buzzer+LED -> User Mode & Cloud Sync auto-unlocked!
  *
  * Required Arduino Libraries (ONLY 3):
  *   1. Adafruit SSD1306
@@ -94,6 +95,7 @@ export function generateEsp32Firmware(
  */
 
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -168,6 +170,22 @@ bool   buzzerActiveMode = false;
 volatile bool pendingBuzzer = false;
 String pendingBuzzerMode    = "tone";
 
+// -------- #1 TOP-PRIORITY 5-Second WiFi ON/OFF Hardware Alert (OLED + Buzzer + Green LED) --------
+volatile int  wifiEventPending    = 0;     // 0=none, 1=WiFi ON, 2=WiFi OFF (set from WiFi.onEvent)
+volatile bool wifiWasConnected    = false;
+bool          wifiAlertActive     = false;
+bool          wifiAlertConnected  = false;
+unsigned long wifiAlertStartMs    = 0;
+unsigned long wifiAlertUntilMs    = 0;
+unsigned long lastWifiAlertBeepMs = 0;
+
+// -------- Native 24-FPS Smooth Focus Timer State (Zero 1.2s Stutter!) --------
+bool          localTimerActive    = false;
+String        localTimerLabel     = "FOCUS";
+unsigned long localTimerEndMs     = 0;
+int           localTimerTotalSec  = 1500;
+int64_t       lastSyncedTimerEnd  = 0;
+
 // Cloud deduplication counters (64-bit int64_t for JS Date.now() ms!)
 int64_t lastCloudUpdatedAt = 0;
 int  lastBuzzerSeq         = 0;
@@ -176,7 +194,7 @@ int  lastAlarmDismissSeq   = 0;
 int  lastAlarmTestSeq      = 0;
 int  lastOtaTriggerSeq     = 0;
 bool cloudOnline           = false;
-bool ntpConfigured         = false;
+volatile bool ntpConfigured = false;
 
 // Screen durations (seconds)
 int watchDurSec   = ${watchDur};
@@ -185,7 +203,7 @@ int faceDurSec    = ${faceDur};
 unsigned long lastCycleSwitchMs = 0;
 int cycleStep = 0;
 
-// Live Weather Cache
+// Live Weather Cache (persisted in ESP32 NVS so offline Auto Mode always responds with synced weather!)
 float  liveTempC      = 24.0;
 int    liveHumidity   = 65;
 float  liveWindKmh    = 6.0;
@@ -194,6 +212,107 @@ String liveCondition  = "Clear";
 // Daily Interaction Stats (24 hourly buckets)
 int hourlyHits[24] = { 0 };
 unsigned long totalHitsToday = 0;
+
+// -------- NVS Offline Cache (Weather + Alarms + Profile survive WiFi OFF & Reboot!) --------
+void saveWeatherCacheToNvs() {
+  prefs.begin("facebot", false);
+  prefs.putFloat("wTemp", liveTempC);
+  prefs.putInt("wHum", liveHumidity);
+  prefs.putFloat("wWind", liveWindKmh);
+  prefs.putString("wCond", liveCondition);
+  prefs.putString("city", cityName);
+  prefs.putString("user", userName);
+  prefs.end();
+}
+
+void saveAlarmsCacheToNvs() {
+  prefs.begin("facebot", false);
+  prefs.putInt("alCnt", alarmCount);
+  for (int i = 0; i < alarmCount && i < MAX_ALARMS; i++) {
+    String prefix = "a" + String(i);
+    prefs.putInt((prefix + "h").c_str(), alarms[i].hour);
+    prefs.putInt((prefix + "m").c_str(), alarms[i].minute);
+    prefs.putBool((prefix + "e").c_str(), alarms[i].enabled);
+    prefs.putInt((prefix + "f").c_str(), alarms[i].faceId);
+    prefs.putInt((prefix + "y").c_str(), alarms[i].melody);
+    prefs.putString((prefix + "l").c_str(), alarms[i].label);
+  }
+  prefs.end();
+}
+
+void loadOfflineCacheFromNvs() {
+  prefs.begin("facebot", true);
+  if (prefs.isKey("wTemp")) liveTempC = prefs.getFloat("wTemp", liveTempC);
+  if (prefs.isKey("wHum")) liveHumidity = prefs.getInt("wHum", liveHumidity);
+  if (prefs.isKey("wWind")) liveWindKmh = prefs.getFloat("wWind", liveWindKmh);
+  String cCond = prefs.getString("wCond", "");
+  if (cCond.length() > 0) liveCondition = cCond;
+  String cCity = prefs.getString("city", "");
+  if (cCity.length() > 0) cityName = cCity;
+  String cUser = prefs.getString("user", "");
+  if (cUser.length() > 0) userName = cUser;
+
+  int savedCnt = prefs.getInt("alCnt", -1);
+  if (savedCnt > 0 && savedCnt <= MAX_ALARMS) {
+    alarmCount = savedCnt;
+    for (int i = 0; i < alarmCount; i++) {
+      String prefix = "a" + String(i);
+      alarms[i].hour    = prefs.getInt((prefix + "h").c_str(), 7);
+      alarms[i].minute  = prefs.getInt((prefix + "m").c_str(), 0);
+      alarms[i].enabled = prefs.getBool((prefix + "e").c_str(), true);
+      alarms[i].faceId  = prefs.getInt((prefix + "f").c_str(), 1);
+      alarms[i].melody  = prefs.getInt((prefix + "y").c_str(), 0);
+      alarms[i].label   = prefs.getString((prefix + "l").c_str(), "Alarm");
+    }
+  }
+  prefs.end();
+}
+
+// -------- Instant Hardware WiFi Event Callback (0ms lag on WiFi ON / OFF!) --------
+void onEsp32WifiEvent(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    wifiWasConnected = true;
+    wifiEventPending = 1; // Triggers 5s WiFi ON OLED + Buzzer + Green LED on Core 1!
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    if (wifiWasConnected) {
+      wifiWasConnected = false;
+      wifiEventPending = 2; // Triggers 5s WiFi OFF OLED + Buzzer + Green LED + Auto Mode on Core 1!
+    }
+  }
+}
+
+void triggerWifiAlert5s(bool connected) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    wifiAlertActive     = true;
+    wifiAlertConnected  = connected;
+    wifiAlertStartMs    = millis();
+    wifiAlertUntilMs    = wifiAlertStartMs + 5000UL;
+    lastWifiAlertBeepMs = 0;
+    isSleeping          = false;
+    if (!connected) {
+      // WiFi OFF -> strictly lock ESP32 into Auto Mode using cached weather, alarms & clock!
+      botMode      = "auto";
+      screenLocked = false;
+    }
+    xSemaphoreGive(stateMutex);
+  } else {
+    wifiAlertActive     = true;
+    wifiAlertConnected  = connected;
+    wifiAlertStartMs    = millis();
+    wifiAlertUntilMs    = wifiAlertStartMs + 5000UL;
+    lastWifiAlertBeepMs = 0;
+    isSleeping          = false;
+    if (!connected) {
+      botMode      = "auto";
+      screenLocked = false;
+    }
+  }
+  if (connected) {
+    Serial.println("[WiFi ALERT 5s] CONNECTED! IP=" + WiFi.localIP().toString() + " -> User Mode Unlocked");
+  } else {
+    Serial.println("[WiFi ALERT 5s] WIFI OFF! -> Auto Mode Active (Using Synced Cache)");
+  }
+}
 
 void logEspInteraction() {
   totalHitsToday++;
@@ -222,7 +341,10 @@ void decodeHexBitmap(const String& hex) {
 // -------- Single Green LED (GPIO 26, No Resistor) --------
 void updateGreenLed() {
   bool ledOn = false;
-  if (greenLedMode == "on") ledOn = true;
+  if (wifiAlertActive) {
+    // #1 TOP PRIORITY: Fast unmistakable Green LED notification blink for full 5s on WiFi ON / OFF!
+    ledOn = ((millis() / 110UL) % 2 == 0);
+  } else if (greenLedMode == "on") ledOn = true;
   else if (greenLedMode == "off") ledOn = false;
   else if (greenLedMode == "blink") ledOn = ((millis() / 280UL) % 2 == 0);
   else ledOn = alarmRinging ? ((millis() / 160UL) % 2 == 0) : !isSleeping;
@@ -237,6 +359,7 @@ void playToneSafe(int freqHz, int durationMs, bool forceDc = false) {
     digitalWrite(PIN_BUZZER, HIGH);
     unsigned long start = millis();
     while (millis() - start < (unsigned long)durationMs) {
+      updateGreenLed();
       delay(4);
       yield();
     }
@@ -252,7 +375,10 @@ void playToneSafe(int freqHz, int durationMs, bool forceDc = false) {
     delayMicroseconds(halfPeriodUs);
     digitalWrite(PIN_BUZZER, LOW);
     delayMicroseconds(halfPeriodUs);
-    if ((++cycles & 31) == 0) yield();
+    if ((++cycles & 31) == 0) {
+      updateGreenLed();
+      yield();
+    }
   }
   digitalWrite(PIN_BUZZER, LOW);
 }
@@ -262,6 +388,24 @@ void playHappyChime() {
   playToneSafe(659, 75); delay(20);
   playToneSafe(784, 100); delay(20);
   playToneSafe(1046, 130);
+}
+
+// Crisp 1-second pulse called 5 times across the 5-second WiFi ON / OFF priority alert
+void playWifiAlertPulse(bool connected) {
+  if (connected) {
+    // Rising bright connected chime (WiFi ON)
+    playToneSafe(1550, 85);
+    updateGreenLed();
+    delay(35);
+    playToneSafe(2250, 115);
+  } else {
+    // Urgent falling alert beep (WiFi OFF)
+    playToneSafe(2200, 95);
+    updateGreenLed();
+    delay(35);
+    playToneSafe(1250, 130);
+  }
+  updateGreenLed();
 }
 
 // Loud, crisp Bip-Bip-Bip alarm sound pattern on GPIO 14 (Classic / Gentle / Urgent)
@@ -690,6 +834,124 @@ void drawAlarmOled(int idx, int frame) {
   display.display();
 }
 
+// -------- #1 TOP-PRIORITY 5-Second WiFi ON / OFF OLED Screen (With Live 5s Progress Bar!) --------
+void drawWifiArc(int cx, int cy, int r) {
+  for (int deg = -135; deg <= -45; deg += 4) {
+    float rad = deg * 0.0174533f;
+    int px = cx + (int)round(cosf(rad) * r);
+    int py = cy + (int)round(sinf(rad) * r);
+    display.drawPixel(px, py, SSD1306_WHITE);
+    display.drawPixel(px, py - 1, SSD1306_WHITE);
+  }
+}
+
+void drawWifiStatusOled(bool connected, int frame) {
+  display.clearDisplay();
+  display.drawRoundRect(0, 0, 128, 64, 5, SSD1306_WHITE);
+
+  int cx = 32;
+  int cy = 34;
+  if (connected) {
+    // Animated pulsing WiFi signal waves (WiFi ON)
+    int wavePhase = (frame / 4) % 4;
+    display.fillCircle(cx, cy, 3, SSD1306_WHITE);
+    if (wavePhase >= 1) drawWifiArc(cx, cy, 9);
+    if (wavePhase >= 2) drawWifiArc(cx, cy, 15);
+    if (wavePhase >= 3) drawWifiArc(cx, cy, 21);
+
+    // Happy checkmark badge + status text
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(58, 10);
+    display.print("WIFI ON!");
+    display.setCursor(58, 22);
+    display.print("CONNECTED");
+    display.setCursor(58, 34);
+    display.print("USER UNLOCK");
+  } else {
+    // Bold flashing WiFi OFF icon with diagonal slash
+    bool flash = ((frame / 4) % 2 == 0);
+    display.fillCircle(cx, cy, 3, SSD1306_WHITE);
+    drawWifiArc(cx, cy, 10);
+    drawWifiArc(cx, cy, 17);
+    if (flash) {
+      display.drawLine(14, 14, 50, 38, SSD1306_WHITE);
+      display.drawLine(14, 15, 50, 39, SSD1306_WHITE);
+      display.drawLine(15, 14, 51, 38, SSD1306_WHITE);
+    }
+
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(58, 10);
+    display.print("WIFI OFF!");
+    display.setCursor(58, 22);
+    display.print("AUTO MODE");
+    display.setCursor(58, 34);
+    display.print("CACHED SYNC");
+  }
+
+  // Live 5-second countdown progress bar across the bottom
+  unsigned long nowMs = millis();
+  long remMs = (long)(wifiAlertUntilMs - nowMs);
+  if (remMs < 0) remMs = 0;
+  if (remMs > 5000) remMs = 5000;
+  int barW = (int)((remMs * 114L) / 5000L);
+  display.drawRect(6, 48, 116, 10, SSD1306_WHITE);
+  if (barW > 0) {
+    display.fillRect(7, 49, barW, 8, SSD1306_WHITE);
+  }
+  display.display();
+}
+
+// -------- Native Silky-Smooth 24-FPS Focus Timer Screen (Zero 1.2s Stutter!) --------
+void drawTimerOled(int frame) {
+  unsigned long nowMs = millis();
+  long remMs = (long)(localTimerEndMs - nowMs);
+  if (remMs <= 0) {
+    localTimerActive = false;
+    customLine1 = localTimerLabel + " DONE!";
+    customLine2 = "NICE JOB!";
+    activeScreen = "text";
+    screenLocked = true;
+    pendingBuzzerMode = "happy";
+    pendingBuzzer = true;
+    drawCustomTextOled();
+    return;
+  }
+
+  int remSec = (int)((remMs + 999) / 1000);
+  int mm = remSec / 60;
+  int ss = remSec % 60;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:%02d", mm, ss);
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(4, 3);
+  display.print(localTimerLabel.substring(0, 12) + " TIMER");
+  // Subtle pulsing dot
+  if ((frame / 8) % 2 == 0) {
+    display.fillCircle(120, 6, 2, SSD1306_WHITE);
+  }
+  display.drawFastHLine(0, 13, 128, SSD1306_WHITE);
+
+  display.setTextSize(3);
+  display.setCursor(18, 21);
+  display.print(buf);
+
+  // Smooth fractional 24-FPS progress bar
+  long totalMs = (long)max(1, localTimerTotalSec) * 1000L;
+  int fillW = (int)((remMs * 116L) / totalMs);
+  if (fillW < 0) fillW = 0;
+  if (fillW > 116) fillW = 116;
+  display.drawRect(5, 50, 118, 9, SSD1306_WHITE);
+  if (fillW > 0) {
+    display.fillRect(6, 51, fillW, 7, SSD1306_WHITE);
+  }
+  display.display();
+}
+
 // =========================================================================
 // CORE 0 BACKGROUND CLOUD SYNC, WEATHER & AUTO-OTA (Zero OLED Stutter!)
 // =========================================================================
@@ -713,6 +975,7 @@ void fetchWeatherCloud() {
       else if (wcode >= 51 && wcode <= 82) liveCondition = "Rainy";
       else if (wcode >= 95) liveCondition = "Thunderstorm";
       else liveCondition = "Cloudy";
+      saveWeatherCacheToNvs();
     }
   }
   http.end();
@@ -741,18 +1004,20 @@ void checkVercelOtaUpdate() {
   http.end();
 }
 
-void pollVercelCloudOnce() {
+void pollVercelCloudOnce(WiFiClientSecure& sharedClient) {
   if (WiFi.status() != WL_CONNECTED) {
     cloudOnline = false;
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
+  http.setReuse(true);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.begin(client, CLOUD_URL);
-  http.setTimeout(4000);
+  if (!http.begin(sharedClient, CLOUD_URL)) {
+    cloudOnline = false;
+    return;
+  }
+  http.setTimeout(3500);
   int code = http.GET();
   if (code == 200) {
     cloudOnline = true;
@@ -760,6 +1025,35 @@ void pollVercelCloudOnce() {
     JsonDocument doc;
     if (!deserializeJson(doc, body)) {
       int64_t upd = doc["updatedAt"] | (int64_t)0;
+
+      // Sync smooth native 24-FPS Focus Timer from cloud timestamps (immune to NTP drift!)
+      bool tActive      = doc["timerActive"] | false;
+      int64_t tEndAtMs  = doc["timerEndAtMs"] | (int64_t)0;
+      int64_t srvNowMs  = doc["serverTimeMs"] | (int64_t)0;
+      int tDurSec       = doc["timerDurationSec"] | 1500;
+      String tLabel     = String(doc["timerLabel"] | "FOCUS");
+
+      if (tActive && tEndAtMs > srvNowMs && srvNowMs > 0) {
+        if (tEndAtMs != lastSyncedTimerEnd) {
+          lastSyncedTimerEnd = tEndAtMs;
+          unsigned long remMs = (unsigned long)(tEndAtMs - srvNowMs);
+          if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            localTimerActive   = true;
+            localTimerLabel    = tLabel;
+            localTimerEndMs    = millis() + remMs;
+            localTimerTotalSec = max(1, tDurSec);
+            isSleeping         = false;
+            xSemaphoreGive(stateMutex);
+          }
+        }
+      } else if (!tActive && localTimerActive) {
+        if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          localTimerActive   = false;
+          lastSyncedTimerEnd = 0;
+          xSemaphoreGive(stateMutex);
+        }
+      }
+
       if (upd > 0 && upd != lastCloudUpdatedAt) {
         lastCloudUpdatedAt = upd;
         logEspInteraction();
@@ -781,6 +1075,9 @@ void pollVercelCloudOnce() {
         int    testSlot  = doc["alarmTestSlot"] | 0;
         int    otaSeq    = doc["otaTriggerSeq"] | 0;
 
+        bool alarmsChanged = false;
+        bool profileChanged = (newUser != userName || newCity != cityName);
+
         if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
           botMode      = newMode;
           activeScreen = newScreen;
@@ -798,14 +1095,26 @@ void pollVercelCloudOnce() {
             int idx = 0;
             for (JsonObject a : arr) {
               if (idx >= MAX_ALARMS) break;
-              alarms[idx].hour    = a["hour"] | 7;
-              alarms[idx].minute  = a["min"] | 0;
-              alarms[idx].enabled = a["on"] | false;
-              alarms[idx].faceId  = a["face"] | 1;
-              alarms[idx].melody  = a["melody"] | 0;
-              alarms[idx].label   = String(a["label"] | "Alarm");
+              int nh    = a["hour"] | 7;
+              int nm    = a["min"] | 0;
+              bool ne   = a["on"] | false;
+              int nf    = a["face"] | 1;
+              int ny    = a["melody"] | 0;
+              String nl = String(a["label"] | "Alarm");
+              if (alarms[idx].hour != nh || alarms[idx].minute != nm ||
+                  alarms[idx].enabled != ne || alarms[idx].faceId != nf ||
+                  alarms[idx].melody != ny || alarms[idx].label != nl) {
+                alarmsChanged = true;
+              }
+              alarms[idx].hour    = nh;
+              alarms[idx].minute  = nm;
+              alarms[idx].enabled = ne;
+              alarms[idx].faceId  = nf;
+              alarms[idx].melody  = ny;
+              alarms[idx].label   = nl;
               idx++;
             }
+            if (alarmCount != idx) alarmsChanged = true;
             alarmCount = idx;
           }
 
@@ -846,8 +1155,11 @@ void pollVercelCloudOnce() {
           }
 
           xSemaphoreGive(stateMutex);
-          Serial.println("[Cloud Sync] screen=" + newScreen + " face=" + String(newFace) + " led=" + newLed);
+          Serial.println("[Cloud Sync] mode=" + newMode + " screen=" + newScreen + " face=" + String(newFace));
         }
+
+        if (alarmsChanged) saveAlarmsCacheToNvs();
+        if (profileChanged) saveWeatherCacheToNvs();
 
         if (otaSeq > lastOtaTriggerSeq) {
           lastOtaTriggerSeq = otaSeq;
@@ -859,49 +1171,44 @@ void pollVercelCloudOnce() {
     }
   } else {
     cloudOnline = false;
-    Serial.println("[Cloud Sync] HTTP error: " + String(code));
+    sharedClient.stop(); // Reset stale TLS socket cleanly without touching WiFi!
+    Serial.println("[Cloud Sync] HTTP retry code: " + String(code));
   }
   http.end();
 }
 
 void cloudSyncTask(void* param) {
+  // Persistent TLS client allocated ONCE on Core 0 -> zero heap fragmentation, zero WiFi timeout!
+  WiFiClientSecure sharedClient;
+  sharedClient.setInsecure();
+  sharedClient.setTimeout(4);
+
   unsigned long lastWeatherMs = 0;
   unsigned long lastReconnectAttemptMs = millis();
   bool otaCheckedOnce = false;
-  bool lastWifiConnected = (WiFi.status() == WL_CONNECTED);
 
   for (;;) {
     bool wifiNow = (WiFi.status() == WL_CONNECTED);
 
-    // Detect WiFi ON / OFF transition natively -> 5s top-priority buzzer + offline Auto Mode fallback
-    if (wifiNow != lastWifiConnected) {
-      lastWifiConnected = wifiNow;
-      if (!wifiNow) {
-        botMode = "auto";
-        screenLocked = false;
-        pendingBuzzerMode = "alarm";
-        pendingBuzzer = true;
-        Serial.println("[WiFi] Lost connection -> Auto Mode active (cached weather & alarms)");
-      } else {
-        pendingBuzzerMode = "happy";
-        pendingBuzzer = true;
-        Serial.println("[WiFi] Connected! IP=" + WiFi.localIP().toString() + " -> User Mode unlocked");
-      }
-    }
-
     if (!wifiNow) {
       cloudOnline = false;
-      // Clean non-destructive reconnect every 12s (never interrupts active association!)
-      if (millis() - lastReconnectAttemptMs >= 12000UL) {
+      sharedClient.stop();
+      // Always enforce offline Auto Mode strictly while WiFi is absent
+      if (botMode != "auto") {
+        botMode = "auto";
+        screenLocked = false;
+      }
+      // Clean non-destructive reconnect every 8s (snaps back online the instant router returns!)
+      if (millis() - lastReconnectAttemptMs >= 8000UL) {
         lastReconnectAttemptMs = millis();
-        Serial.println("[WiFi] Auto-reconnecting to SSID: " + wifiSsid);
+        Serial.println("[WiFi] Waiting for SSID: " + wifiSsid + " (Auto-reconnecting...)");
         WiFi.reconnect();
       }
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      vTaskDelay(pdMS_TO_TICKS(800));
       continue;
     }
 
-    // Ensure NTP clock is configured even if WiFi connected after setup()
+    // Ensure NTP clock is configured whenever WiFi comes online
     if (!ntpConfigured) {
       ntpConfigured = true;
       configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
@@ -913,14 +1220,14 @@ void cloudSyncTask(void* param) {
       checkVercelOtaUpdate();
     }
 
-    pollVercelCloudOnce();
+    pollVercelCloudOnce(sharedClient);
 
     if (millis() - lastWeatherMs > 600000UL || lastWeatherMs == 0) {
       lastWeatherMs = millis();
       fetchWeatherCloud();
     }
 
-    // Fast 1.2s cloud poll interval -> near-instant control from anywhere on Vercel!
+    // Fast 1.2s cloud poll interval -> near-instant control & steady heartbeat on Vercel!
     vTaskDelay(pdMS_TO_TICKS(1200));
   }
 }
@@ -957,6 +1264,21 @@ void setupLocalApi() {
     }
     json += "]}";
     sendCorsOk(json, "application/json");
+  });
+
+  server.on("/api/mode", []() {
+    if (server.hasArg("mode")) {
+      String reqMode = server.arg("mode");
+      if (WiFi.status() == WL_CONNECTED && (reqMode == "auto" || reqMode == "user")) {
+        botMode = reqMode;
+        if (reqMode == "auto") screenLocked = false;
+        logEspInteraction();
+      } else {
+        botMode = "auto";
+        screenLocked = false;
+      }
+    }
+    sendCorsOk(botMode);
   });
 
   server.on("/api/face", []() {
@@ -1093,7 +1415,7 @@ void setup() {
   }
   playHappyChime();
 
-  // Only load saved WiFi if non-empty (so hardcoded SSID is never wiped by blank NVS)
+  // Load saved WiFi + previously synced offline cache (weather, alarms, city, user)
   prefs.begin("facebot", true);
   String savedSsid = prefs.getString("ssid", "");
   String savedPass = prefs.getString("pass", "");
@@ -1104,15 +1426,18 @@ void setup() {
   }
 
 ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0, true, 1, 0, "Good Morning" }; alarmCount = 1;'}
+  loadOfflineCacheFromNvs();
 
-  // Ultra-Stable Always-On WiFi Init (Zero Power-Save Sleep, Max TX Power, Never Times Out!)
-  WiFi.disconnect(true, true);
-  delay(200);
+  stateMutex = xSemaphoreCreateMutex();
+
+  // Ultra-Stable Always-On WiFi Init (Zero Power-Save Sleep, Max TX Power, Instant Event Hooks!)
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.onEvent(onEsp32WifiEvent);
 
   Serial.println("[WiFi] Connecting to 2.4GHz SSID: " + wifiSsid);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
@@ -1129,51 +1454,56 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
   display.display();
 
   unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
-    delay(300);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+    delay(150);
     Serial.print(".");
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    wifiWasConnected = true;
+    wifiEventPending = 0; // We trigger the 5s connected alert cleanly right below!
     ntpConfigured = true;
     configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
-    Serial.println("[WiFi] Connected! IP: " + WiFi.localIP().toString());
-    display.clearDisplay();
-    display.setCursor(4, 12);
-    display.println("Vercel Cloud Ready!");
-    display.setCursor(4, 28);
-    display.println("LAN: " + WiFi.localIP().toString());
-    display.setCursor(4, 44);
-    display.println("Control from anywhere");
-    display.display();
-    delay(1200);
+    triggerWifiAlert5s(true);
   } else {
-    Serial.println("[WiFi] Could not connect to '" + wifiSsid + "'. Scanning nearby 2.4GHz WiFi:");
-    int n = WiFi.scanNetworks();
-    for (int i = 0; i < n; i++) {
-      Serial.println("  - " + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)");
-    }
-    Serial.println("[WiFi] Tip: ESP32 ONLY supports 2.4GHz WiFi & SSID/Password is case-sensitive!");
-    // Re-initiate background STA connect cleanly
-    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    Serial.println("[WiFi] Offline at boot -> 5s WiFi OFF Alert + Cached Auto Mode!");
+    triggerWifiAlert5s(false);
   }
 
-  stateMutex = xSemaphoreCreateMutex();
   setupLocalApi();
 
-  // Launch Core 0 Background Cloud Sync Task (leaves Core 1 100% dedicated to smooth OLED!)
-  xTaskCreatePinnedToCore(cloudSyncTask, "CloudSync", 10240, NULL, 1, NULL, 0);
+  // Launch Core 0 Background Cloud Sync Task (12KB stack for rock-solid persistent TLS!)
+  xTaskCreatePinnedToCore(cloudSyncTask, "CloudSync", 12288, NULL, 1, NULL, 0);
   lastCycleSwitchMs = millis();
 }
 
 void loop() {
   server.handleClient();
+
+  // 1. Handle instant hardware WiFi ON / OFF event (0ms latency!)
+  int ev = wifiEventPending;
+  if (ev != 0) {
+    wifiEventPending = 0;
+    triggerWifiAlert5s(ev == 1);
+  }
+
+  // 2. Manage 5-second top-priority WiFi ON / OFF notification (OLED + Buzzer + Green LED together!)
+  if (wifiAlertActive) {
+    if ((long)(millis() - wifiAlertUntilMs) >= 0) {
+      wifiAlertActive = false;
+      digitalWrite(PIN_BUZZER, LOW);
+    } else if (lastWifiAlertBeepMs == 0 || millis() - lastWifiAlertBeepMs >= 1000UL) {
+      lastWifiAlertBeepMs = millis();
+      playWifiAlertPulse(wifiAlertConnected);
+    }
+  }
+
   updateGreenLed();
   checkAlarms();
 
-  // Handle pending buzzer chimes requested from Vercel Cloud
-  if (pendingBuzzer) {
+  // Handle pending buzzer chimes requested from Vercel Cloud (only when WiFi 5s alert isn't active)
+  if (pendingBuzzer && !wifiAlertActive) {
     pendingBuzzer = false;
     if (pendingBuzzerMode == "dc") playToneSafe(0, 220, true);
     else if (pendingBuzzerMode == "happy" || pendingBuzzerMode == "wake") playHappyChime();
@@ -1185,8 +1515,8 @@ void loop() {
     }
   }
 
-  // Ring active alarm with unmistakable Bip-Bip-Bip melody every 1.25s
-  if (alarmRinging && ringingAlarmIdx >= 0 && ringingAlarmIdx < MAX_ALARMS) {
+  // Ring active alarm with unmistakable Bip-Bip-Bip melody every 1.25s (suppressed during 5s WiFi alert)
+  if (!wifiAlertActive && alarmRinging && ringingAlarmIdx >= 0 && ringingAlarmIdx < MAX_ALARMS) {
     static unsigned long lastBeep = 0;
     if (millis() - lastBeep >= 1250) {
       lastBeep = millis();
@@ -1194,8 +1524,8 @@ void loop() {
     }
   }
 
-  // Automatic Screen Sequencer when unlocked
-  if (!alarmRinging && !isSleeping && !screenLocked) {
+  // Automatic Screen Sequencer when unlocked (Auto Mode runs offline with cached weather, alarms & faces!)
+  if (!wifiAlertActive && !alarmRinging && !localTimerActive && !isSleeping && !screenLocked) {
     unsigned long holdMs = (activeScreen == "watch")
       ? (unsigned long)watchDurSec * 1000UL
       : (activeScreen == "weather")
@@ -1224,8 +1554,14 @@ void loop() {
     frameCount++;
 
     if (!stateMutex || xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      if (alarmRinging && ringingAlarmIdx >= 0) {
+      if (wifiAlertActive) {
+        // #1 ABSOLUTE TOP PRIORITY: 5-Second WiFi ON / OFF OLED Notification!
+        drawWifiStatusOled(wifiAlertConnected, frameCount);
+      } else if (alarmRinging && ringingAlarmIdx >= 0) {
         drawAlarmOled(ringingAlarmIdx, frameCount);
+      } else if (localTimerActive) {
+        // Native 24-FPS Smooth Focus Timer!
+        drawTimerOled(frameCount);
       } else if (activeScreen == "watch") {
         drawWatchOled();
       } else if (activeScreen == "weather") {

@@ -58,8 +58,15 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
             <div className="text-xs font-bold tracking-tight truncate">
               {connected ? 'WiFi ON · User Mode Unlocked' : 'WiFi OFF · Auto Mode Only'}
             </div>
-            <div className="text-[11px] text-slate-400 tabular-nums">
-              Priority OLED · Buzzer ON · {secondsLeft}s
+            <div className="flex items-center gap-1.5 text-[11px] text-slate-400 tabular-nums">
+              <span
+                className={`inline-block w-2 h-2 rounded-full transition-opacity ${
+                  Math.floor(frame / 3) % 2 === 0
+                    ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
+                    : 'bg-emerald-950'
+                }`}
+              />
+              <span>OLED + LED + Buzzer · {secondsLeft}s</span>
             </div>
           </div>
         </div>

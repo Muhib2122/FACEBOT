@@ -136,7 +136,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '3.0.0',
+  firmwareVersion: '4.0.0',
   otaAutoCheck: true,
 };
 
@@ -1074,7 +1074,10 @@ export default function App() {
       textLine2,
       userName: settings.userName || 'Muhib',
       city: location.city || 'Dhaka',
-      greenLed: hardware.greenLedMode,
+      greenLed:
+        activeScreen.kind === 'wifi-status' || wifiPriorityUntilMsRef.current > Date.now()
+          ? 'blink'
+          : hardware.greenLedMode,
       buzzerSeq: buzzerSeqRef.current,
       buzzerMode: lastBuzzerModeRef.current,
       bitmapSeq: bitmapSeqRef.current,
@@ -1449,11 +1452,16 @@ export default function App() {
           setEsp32LastSeenAt(nowMs);
         }
       } else if (!forceImmediate && esp32OnlineRef.current) {
-        // Anti-flap & Vercel multi-instance shield: never drop offline after a single 10s hiccup or cold lambda!
-        missedHeartbeatCountRef.current += 1;
-        const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
-        if (msSinceConfirmed < 28000 || missedHeartbeatCountRef.current < 5) {
-          return;
+        // Smart offline detection:
+        // - If warm server explicitly reports lastSeenAt > 0 & esp32Online === false (>=16s elapsed), go offline IMMEDIATELY (0 extra lag!)
+        // - Only debounce 3 polls (~7.5s) if lastSeenAt === 0 (cold Vercel serverless instance shield)
+        const confirmedStaleByWarmServer = typeof lastSeenAt === 'number' && lastSeenAt > 0;
+        if (!confirmedStaleByWarmServer) {
+          missedHeartbeatCountRef.current += 1;
+          const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
+          if (msSinceConfirmed < 8000 || missedHeartbeatCountRef.current < 3) {
+            return;
+          }
         }
       }
 
@@ -1548,7 +1556,7 @@ export default function App() {
     const handleBrowserOffline = () => {
       isOnlineRef.current = false;
       setIsOnline(false);
-      applyEsp32OnlineState(false);
+      applyEsp32OnlineState(false, 0, true);
     };
 
     window.addEventListener('online', handleBrowserOnline);
@@ -1940,14 +1948,15 @@ export default function App() {
     settings.coldThresholdC,
   ]);
 
-  // Compute Single Green LED (GPIO 26) State (smoothly timed at 24-FPS)
+  // Compute Single Green LED (GPIO 26) State (smoothly timed at 24-FPS, #1 priority blink on WiFi ON/OFF!)
   const greenLedOn = useMemo(() => {
+    if (activeScreen.kind === 'wifi-status') return Math.floor(frame / 3) % 2 === 0;
     if (hardware.greenLedMode === 'on') return true;
     if (hardware.greenLedMode === 'off') return false;
     if (hardware.greenLedMode === 'blink') return Math.floor(frame / 7) % 2 === 0;
     if (activeAlarm) return Math.floor(frame / 4) % 2 === 0;
     return !isSleeping;
-  }, [hardware.greenLedMode, frame, activeAlarm, isSleeping]);
+  }, [activeScreen.kind, hardware.greenLedMode, frame, activeAlarm, isSleeping]);
 
   // Hardware Action Handlers
   const handleChangeGreenLedMode = useCallback(
