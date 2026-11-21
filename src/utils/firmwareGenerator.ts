@@ -173,8 +173,10 @@ int64_t lastCloudUpdatedAt = 0;
 int  lastBuzzerSeq         = 0;
 int  lastBitmapSeq         = 0;
 int  lastAlarmDismissSeq   = 0;
+int  lastAlarmTestSeq      = 0;
 int  lastOtaTriggerSeq     = 0;
 bool cloudOnline           = false;
+bool ntpConfigured         = false;
 
 // Screen durations (seconds)
 int watchDurSec   = ${watchDur};
@@ -260,6 +262,29 @@ void playHappyChime() {
   playToneSafe(659, 75); delay(20);
   playToneSafe(784, 100); delay(20);
   playToneSafe(1046, 130);
+}
+
+// Loud, crisp Bip-Bip-Bip alarm sound pattern on GPIO 14 (Classic / Gentle / Urgent)
+void playAlarmBipPattern(int melody) {
+  if (melody == 1) {
+    // Gentle Chime
+    playToneSafe(587, 130); delay(45);
+    playToneSafe(784, 130); delay(45);
+    playToneSafe(1046, 200);
+  } else if (melody == 2) {
+    // Urgent Siren: Bip-Bop-Bip-Bop!
+    playToneSafe(2400, 90); delay(30);
+    playToneSafe(1600, 90); delay(30);
+    playToneSafe(2400, 90); delay(30);
+    playToneSafe(1600, 90); delay(30);
+    playToneSafe(2600, 150);
+  } else {
+    // Classic Digital Alarm: BIP - BIP - BIP - BEEP!
+    playToneSafe(2000, 100); delay(55);
+    playToneSafe(2000, 100); delay(55);
+    playToneSafe(2000, 100); delay(55);
+    playToneSafe(2400, 170);
+  }
 }
 
 // -------- Smooth 24-FPS OLED Helper Drawings --------
@@ -752,6 +777,8 @@ void pollVercelCloudOnce() {
         int    bmpSeq    = doc["bitmapSeq"] | 0;
         String bmpHex    = String(doc["bitmapHex"] | "");
         int    disSeq    = doc["alarmDismissSeq"] | 0;
+        int    testSeq   = doc["alarmTestSeq"] | 0;
+        int    testSlot  = doc["alarmTestSlot"] | 0;
         int    otaSeq    = doc["otaTriggerSeq"] | 0;
 
         if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
@@ -765,27 +792,6 @@ void pollVercelCloudOnce() {
           cityName     = newCity;
           screenLocked = (newScreen != "auto");
           isSleeping   = (newScreen == "face" && currentFace == 7);
-
-          if (buzSeq > lastBuzzerSeq) {
-            lastBuzzerSeq = buzSeq;
-            pendingBuzzerMode = buzMode;
-            pendingBuzzer = true;
-          }
-
-          if (bmpSeq > lastBitmapSeq) {
-            lastBitmapSeq = bmpSeq;
-            if (bmpHex.length() >= 2048) {
-              decodeHexBitmap(bmpHex);
-              activeScreen = "bitmap";
-              screenLocked = true;
-            }
-          }
-
-          if (disSeq > lastAlarmDismissSeq) {
-            lastAlarmDismissSeq = disSeq;
-            alarmRinging = false;
-            ringingAlarmIdx = -1;
-          }
 
           if (doc["alarms"].is<JsonArray>()) {
             JsonArray arr = doc["alarms"].as<JsonArray>();
@@ -802,6 +808,43 @@ void pollVercelCloudOnce() {
             }
             alarmCount = idx;
           }
+
+          if (buzSeq > lastBuzzerSeq) {
+            lastBuzzerSeq = buzSeq;
+            pendingBuzzerMode = buzMode;
+            pendingBuzzer = true;
+          }
+
+          if (bmpSeq > lastBitmapSeq) {
+            lastBitmapSeq = bmpSeq;
+            if (bmpHex.length() >= 2048) {
+              decodeHexBitmap(bmpHex);
+              activeScreen = "bitmap";
+              screenLocked = true;
+            }
+          }
+
+          if (testSeq > lastAlarmTestSeq) {
+            lastAlarmTestSeq = testSeq;
+            if (alarmCount > 0) {
+              ringingAlarmIdx = constrain(testSlot, 0, alarmCount - 1);
+            } else {
+              alarms[0] = { 7, 0, true, 1, 0, "FaceBot Alarm" };
+              alarmCount = 1;
+              ringingAlarmIdx = 0;
+            }
+            alarmRinging = true;
+            isSleeping = false;
+            Serial.println("[Alarm] Triggered from Cloud: " + alarms[ringingAlarmIdx].label);
+          }
+
+          if (disSeq > lastAlarmDismissSeq) {
+            lastAlarmDismissSeq = disSeq;
+            alarmRinging = false;
+            ringingAlarmIdx = -1;
+            Serial.println("[Alarm] Dismissed from Cloud");
+          }
+
           xSemaphoreGive(stateMutex);
           Serial.println("[Cloud Sync] screen=" + newScreen + " face=" + String(newFace) + " led=" + newLed);
         }
@@ -823,15 +866,34 @@ void pollVercelCloudOnce() {
 
 void cloudSyncTask(void* param) {
   unsigned long lastWeatherMs = 0;
-  if (otaAutoCheck) {
-    vTaskDelay(pdMS_TO_TICKS(2500));
-    checkVercelOtaUpdate();
-  }
+  unsigned long lastReconnectAttemptMs = millis();
+  bool otaCheckedOnce = false;
+
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.reconnect();
-      vTaskDelay(pdMS_TO_TICKS(3000));
+      cloudOnline = false;
+      // Wait 15 seconds between clean reconnect attempts (prevents "sta is connecting, return error"!)
+      if (millis() - lastReconnectAttemptMs >= 15000UL) {
+        lastReconnectAttemptMs = millis();
+        Serial.println("[WiFi] Reconnecting cleanly to SSID: " + wifiSsid);
+        WiFi.disconnect(false);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
+    }
+
+    // Ensure NTP clock is configured even if WiFi connected after setup()
+    if (!ntpConfigured) {
+      ntpConfigured = true;
+      configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+      Serial.println("[WiFi] Connected! IP=" + WiFi.localIP().toString() + " | Syncing NTP Time...");
+    }
+
+    if (otaAutoCheck && !otaCheckedOnce) {
+      otaCheckedOnce = true;
+      checkVercelOtaUpdate();
     }
 
     pollVercelCloudOnce();
@@ -947,11 +1009,47 @@ void setupLocalApi() {
     sendCorsOk();
   });
 
+  server.on("/api/alarm/set", []() {
+    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, MAX_ALARMS - 1) : 0;
+    alarms[slot].hour    = server.hasArg("hour") ? server.arg("hour").toInt() : 7;
+    alarms[slot].minute  = server.hasArg("min") ? server.arg("min").toInt() : 0;
+    alarms[slot].enabled = server.hasArg("on") ? (server.arg("on").toInt() != 0) : true;
+    alarms[slot].faceId  = server.hasArg("face") ? server.arg("face").toInt() : 1;
+    alarms[slot].melody  = server.hasArg("melody") ? server.arg("melody").toInt() : 0;
+    alarms[slot].label   = server.hasArg("label") ? server.arg("label") : "Alarm";
+    if (slot + 1 > alarmCount) alarmCount = slot + 1;
+    logEspInteraction();
+    sendCorsOk();
+  });
+
+  server.on("/api/alarm/test", []() {
+    int slot = server.hasArg("slot") ? constrain(server.arg("slot").toInt(), 0, max(0, alarmCount - 1)) : 0;
+    if (alarmCount == 0) {
+      alarms[0] = { 7, 0, true, 1, 0, "Test Alarm" };
+      alarmCount = 1;
+      slot = 0;
+    }
+    ringingAlarmIdx = slot;
+    alarmRinging = true;
+    isSleeping = false;
+    logEspInteraction();
+    sendCorsOk();
+  });
+
+  server.on("/api/alarm/dismiss", []() {
+    alarmRinging = false;
+    ringingAlarmIdx = -1;
+    sendCorsOk();
+  });
+
   server.begin();
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  Serial.println("\\n=== Muhib Creation FaceBot ESP32 Booting ===");
+
   Wire.begin(21, 22);
   Wire.setClock(400000); // Fast 400kHz I2C for ultra-smooth 24-FPS OLED!
 
@@ -963,11 +1061,11 @@ void setup() {
   digitalWrite(PIN_LED_ONBOARD, LOW);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 init failed!");
+    Serial.println("SSD1306 init failed! Check SDA=21, SCL=22, VCC=3.3V, GND=GND.");
     for (;;) delay(500);
   }
 
-  // Boot Confirmation: Green LED blink + Happy Chime
+  // Boot Confirmation: Green LED blink + Crisp Chime
   for (int i = 0; i < 3; i++) {
     digitalWrite(PIN_LED_GREEN, HIGH);
     digitalWrite(PIN_LED_ONBOARD, HIGH);
@@ -978,16 +1076,27 @@ void setup() {
   }
   playHappyChime();
 
+  // Only load saved WiFi if non-empty (so hardcoded SSID is never wiped by blank NVS)
   prefs.begin("facebot", true);
-  wifiSsid     = prefs.getString("ssid", wifiSsid);
-  wifiPassword = prefs.getString("pass", wifiPassword);
+  String savedSsid = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
   prefs.end();
+  if (savedSsid.length() > 0) {
+    wifiSsid = savedSsid;
+    wifiPassword = savedPass;
+  }
 
 ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0, true, 1, 0, "Good Morning" }; alarmCount = 1;'}
 
-  // Connect directly to Home WiFi (No ESP32 hotspot switching needed!)
+  // Clean WiFi Init (Prevents "wifi:sta is connecting, return error" on ESP32 Core 3.x!)
+  WiFi.disconnect(true, true);
+  delay(200);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // Low-latency WiFi for instant Vercel cloud response
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+
+  Serial.println("[WiFi] Connecting to 2.4GHz SSID: " + wifiSsid);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
   display.clearDisplay();
@@ -1003,11 +1112,15 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
 
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
-    delay(250);
+    delay(300);
+    Serial.print(".");
   }
+  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    ntpConfigured = true;
     configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+    Serial.println("[WiFi] Connected! IP: " + WiFi.localIP().toString());
     display.clearDisplay();
     display.setCursor(4, 12);
     display.println("Vercel Cloud Ready!");
@@ -1017,6 +1130,15 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
     display.println("Control from anywhere");
     display.display();
     delay(1200);
+  } else {
+    Serial.println("[WiFi] Could not connect to '" + wifiSsid + "'. Scanning nearby 2.4GHz WiFi:");
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      Serial.println("  - " + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)");
+    }
+    Serial.println("[WiFi] Tip: ESP32 ONLY supports 2.4GHz WiFi & SSID/Password is case-sensitive!");
+    // Re-initiate background STA connect cleanly
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   }
 
   stateMutex = xSemaphoreCreateMutex();
@@ -1038,21 +1160,19 @@ void loop() {
     if (pendingBuzzerMode == "dc") playToneSafe(0, 220, true);
     else if (pendingBuzzerMode == "happy" || pendingBuzzerMode == "wake") playHappyChime();
     else if (pendingBuzzerMode == "alarm") {
-      playToneSafe(1760, 140); delay(40); playToneSafe(2093, 180);
+      playAlarmBipPattern(0);
     } else {
-      playToneSafe(880, 100); delay(30); playToneSafe(1318, 140);
+      // Crisp double Bip-Bip piezo beep
+      playToneSafe(1800, 100); delay(50); playToneSafe(2200, 130);
     }
   }
 
-  // Ring active alarm non-blockingly
-  if (alarmRinging && ringingAlarmIdx >= 0) {
+  // Ring active alarm with unmistakable Bip-Bip-Bip melody every 1.25s
+  if (alarmRinging && ringingAlarmIdx >= 0 && ringingAlarmIdx < MAX_ALARMS) {
     static unsigned long lastBeep = 0;
-    if (millis() - lastBeep >= 900) {
+    if (millis() - lastBeep >= 1250) {
       lastBeep = millis();
-      int m = alarms[ringingAlarmIdx].melody;
-      if (m == 1) playToneSafe(587, 160);
-      else if (m == 2) playToneSafe(2200, 140);
-      else playToneSafe(1760, 160);
+      playAlarmBipPattern(alarms[ringingAlarmIdx].melody);
     }
   }
 

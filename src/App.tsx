@@ -57,6 +57,8 @@ import {
   playBuzzerTest,
   playShortClick,
   playWakeChime,
+  stopBuzzerAudio,
+  unlockBuzzerAudio,
 } from './utils/buzzerAudio';
 import { DashboardPanel } from './components/DashboardPanel';
 import { OledHardwareStage } from './components/OledHardwareStage';
@@ -349,7 +351,20 @@ export default function App() {
   const bitmapSeqRef = useRef(0);
   const lastBitmapHexRef = useRef('');
   const alarmDismissSeqRef = useRef(0);
+  const alarmTestSeqRef = useRef(0);
+  const alarmTestSlotRef = useRef(0);
   const otaTriggerSeqRef = useRef(0);
+
+  // Unlock browser Web Audio API on the very first click/tap so scheduled alarms ALWAYS ring loud
+  useEffect(() => {
+    const unlock = () => unlockBuzzerAudio();
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('keydown', unlock, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
 
   // Keep latest local state accessible during initial first-login migration
   const latestLocalStateRef = useRef({
@@ -881,6 +896,8 @@ export default function App() {
       bitmapHex: lastBitmapHexRef.current,
       alarms: mappedAlarms,
       alarmDismissSeq: alarmDismissSeqRef.current,
+      alarmTestSeq: alarmTestSeqRef.current,
+      alarmTestSlot: alarmTestSlotRef.current,
       otaTriggerSeq: otaTriggerSeqRef.current,
       updatedAt: Date.now(),
     };
@@ -1053,12 +1070,16 @@ export default function App() {
       const key = `${hh}:${mm}`;
       const dayIdx = current.getDay();
 
-      if (key !== lastAlarmMinuteRef.current && current.getSeconds() < 3) {
+      if (key !== lastAlarmMinuteRef.current) {
         const matched = alarms.find(
           (a) => a.enabled && a.time === key && a.days.includes(dayIdx)
         );
         if (matched) {
           lastAlarmMinuteRef.current = key;
+          const slotIdx = Math.max(0, alarms.findIndex((a) => a.id === matched.id));
+          alarmTestSlotRef.current = slotIdx;
+          alarmTestSeqRef.current += 1;
+          setCloudEventSeq((s) => s + 1);
           setIsSleeping(false);
           setActiveAlarm(matched);
           setActiveScreen({
@@ -1116,14 +1137,20 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [pomodoroRunning, pomodoroLabel, hardware.buzzerMuted, sendToEsp32, logInteraction]);
 
-  // Repeating Piezo Buzzer when an alarm is actively ringing
+  // Repeating Piezo Buzzer (Bip-Bip-Bip) when an alarm is actively ringing
   useEffect(() => {
-    if (!activeAlarm) return;
+    if (!activeAlarm) {
+      stopBuzzerAudio();
+      return;
+    }
     playAlarmMelody(activeAlarm.melody, hardware.buzzerMuted);
     const id = window.setInterval(() => {
       playAlarmMelody(activeAlarm.melody, hardware.buzzerMuted);
-    }, 1600);
-    return () => window.clearInterval(id);
+    }, 1250);
+    return () => {
+      window.clearInterval(id);
+      stopBuzzerAudio();
+    };
   }, [activeAlarm, hardware.buzzerMuted]);
 
   // Auto Mode & User Mode Screen Sequencer
@@ -1419,6 +1446,7 @@ export default function App() {
   };
 
   const handleDismissAlarm = () => {
+    stopBuzzerAudio();
     setActiveAlarm(null);
     setActiveScreen({ kind: 'face', faceId: 0, locked: false });
     alarmDismissSeqRef.current += 1;
@@ -1444,6 +1472,16 @@ export default function App() {
   };
 
   const handleTestAlarm = (alarm: AlarmItem) => {
+    unlockBuzzerAudio();
+    if (hardware.buzzerMuted) {
+      setHardware((prev) => ({ ...prev, buzzerMuted: false }));
+    }
+    const slot = Math.max(0, alarms.findIndex((a) => a.id === alarm.id));
+    alarmTestSlotRef.current = slot;
+    alarmTestSeqRef.current += 1;
+    lastBuzzerModeRef.current = 'alarm';
+    buzzerSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
     setIsSleeping(false);
     setActiveAlarm(alarm);
     setActiveScreen({
@@ -1452,13 +1490,16 @@ export default function App() {
       alarmId: alarm.id,
       locked: true,
     });
-    const slot = Math.max(0, alarms.findIndex((a) => a.id === alarm.id));
     sendToEsp32(`/api/alarm/test?slot=${slot}`);
+    setAlarmSyncMessage(
+      `Ringing "${alarm.label}" (Bip-Bip buzzer + Green LED) — syncing to ESP32 via Vercel Cloud!`
+    );
     logInteraction('alarm', `Tested Alarm: ${alarm.label}`, 'portal');
   };
 
   const handleSnoozeAlarm = () => {
     if (!activeAlarm) return;
+    stopBuzzerAudio();
     const snoozeDate = new Date(Date.now() + 5 * 60 * 1000);
     const hh = String(snoozeDate.getHours()).padStart(2, '0');
     const mm = String(snoozeDate.getMinutes()).padStart(2, '0');
@@ -1472,6 +1513,8 @@ export default function App() {
     };
     setActiveAlarm(null);
     setActiveScreen({ kind: 'face', faceId: 7, locked: false });
+    alarmDismissSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
     sendToEsp32('/api/alarm/dismiss');
     handleAddAlarm(snoozedAlarm);
     setAlarmSyncMessage(`Snoozed for 5 minutes — next ring at ${snoozeTime}.`);
@@ -1479,10 +1522,13 @@ export default function App() {
 
   const handleSyncAllAlarmsToEsp32 = () => {
     alarms.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
+    void pushStateToCloud(false);
     setAlarmSyncMessage(
-      hardware.esp32Ip.trim()
-        ? `Dispatched ${Math.min(alarms.length, 8)} alarm(s) to ${hardware.esp32Ip.trim()}.`
-        : 'Add your ESP32 IP in WiFi & Hardware to push alarms live over WiFi.'
+      hardware.cloudSyncEnabled
+        ? `Synced ${Math.min(alarms.length, 8)} alarm(s) to Vercel Cloud (${hardware.deviceId || 'muhib-bot-1'}) — ESP32 updates within 1.2s!`
+        : hardware.esp32Ip.trim()
+          ? `Dispatched ${Math.min(alarms.length, 8)} alarm(s) to ${hardware.esp32Ip.trim()}.`
+          : 'Enable Vercel Cloud Sync in WiFi & Hardware to push alarms to ESP32.'
     );
   };
 
@@ -2059,11 +2105,20 @@ export default function App() {
               alarms={alarms}
               activeAlarm={activeAlarm}
               esp32Ip={hardware.esp32Ip}
+              cloudSyncEnabled={hardware.cloudSyncEnabled}
+              buzzerMuted={hardware.buzzerMuted}
               alarmSyncMessage={alarmSyncMessage}
               onAddAlarm={handleAddAlarm}
               onToggleAlarm={handleToggleAlarm}
               onDeleteAlarm={handleDeleteAlarm}
               onTestAlarm={handleTestAlarm}
+              onTestBuzzerBeep={() => {
+                unlockBuzzerAudio();
+                if (hardware.buzzerMuted) {
+                  setHardware((prev) => ({ ...prev, buzzerMuted: false }));
+                }
+                handleTestBuzzer('tone');
+              }}
               onDismissAlarm={handleDismissAlarm}
               onSnoozeAlarm={handleSnoozeAlarm}
               onSyncAllAlarmsToEsp32={handleSyncAllAlarmsToEsp32}

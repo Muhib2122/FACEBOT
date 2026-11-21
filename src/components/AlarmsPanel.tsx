@@ -6,11 +6,14 @@ interface AlarmsPanelProps {
   alarms: AlarmItem[];
   activeAlarm: AlarmItem | null;
   esp32Ip: string;
+  cloudSyncEnabled: boolean;
+  buzzerMuted: boolean;
   alarmSyncMessage: string | null;
   onAddAlarm: (alarm: AlarmItem) => void;
   onToggleAlarm: (id: string) => void;
   onDeleteAlarm: (id: string) => void;
   onTestAlarm: (alarm: AlarmItem) => void;
+  onTestBuzzerBeep: () => void;
   onDismissAlarm: () => void;
   onSnoozeAlarm: () => void;
   onSyncAllAlarmsToEsp32: () => void;
@@ -22,11 +25,14 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
   alarms,
   activeAlarm,
   esp32Ip,
+  cloudSyncEnabled,
+  buzzerMuted,
   alarmSyncMessage,
   onAddAlarm,
   onToggleAlarm,
   onDeleteAlarm,
   onTestAlarm,
+  onTestBuzzerBeep,
   onDismissAlarm,
   onSnoozeAlarm,
   onSyncAllAlarmsToEsp32,
@@ -68,7 +74,7 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
                 Alarm Ringing Now · {activeAlarm.time}
               </h3>
               <p className="text-xs text-red-700 mt-0.5">
-                {activeAlarm.label} · Piezo Buzzer &amp; Red LED Active
+                {activeAlarm.label} · Piezo Buzzer (GPIO 14) &amp; Green LED (GPIO 26) Blinking
               </p>
             </div>
           </div>
@@ -100,17 +106,28 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
                 Create Piezo Buzzer Alarm
               </h3>
               <p className="text-xs text-slate-500">
-                Synced to ESP32 GPIO 14 buzzer, Red LED alert, and OLED display in real time
+                Synced via Vercel Cloud to ESP32 GPIO 14 Bip-Bip buzzer, Green LED (GPIO 26), and 0.96&quot; OLED
               </p>
             </div>
           </div>
-          <button
-            onClick={onSyncAllAlarmsToEsp32}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Sync Alarms to ESP32
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onTestBuzzerBeep}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+            >
+              <Volume2 className="w-3.5 h-3.5 text-blue-600" />
+              Test Bip-Bip Sound
+            </button>
+            <button
+              type="button"
+              onClick={onSyncAllAlarmsToEsp32}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Sync Alarms Now
+            </button>
+          </div>
         </div>
 
         {alarmSyncMessage && (
@@ -222,7 +239,12 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
             </p>
           </div>
           <span className="text-xs text-slate-500 font-mono">
-            {esp32Ip.trim() ? `ESP32 Target: ${esp32Ip.trim()}` : 'Simulator Mode (Add ESP32 IP in Hardware tab)'}
+            {cloudSyncEnabled
+              ? 'Vercel Cloud Auto-Sync ON'
+              : esp32Ip.trim()
+                ? `ESP32 Target: ${esp32Ip.trim()}`
+                : 'Browser Audio Ready'}
+            {buzzerMuted ? ' · Browser Muted' : ''}
           </span>
         </div>
 
@@ -318,7 +340,7 @@ export const AlarmsPanel: React.FC<AlarmsPanelProps> = ({
       <div className="bg-slate-100/80 border border-slate-200 rounded-xl p-4 flex items-center gap-3 text-xs text-slate-600">
         <Volume2 className="w-4 h-4 text-slate-700 shrink-0" />
         <span>
-          Alarms automatically dispatch to <code className="font-mono text-slate-900">/api/alarm/set</code> and <code className="font-mono text-slate-900">/api/alarm/dismiss</code> on your ESP32 when an IP address is set in Hardware &amp; Servo.
+          Click <strong className="text-slate-900">Test Ring</strong> to immediately ring both your device speaker and ESP32 GPIO 14 Piezo Buzzer with a loud Bip-Bip alarm pattern + Green LED blink over Vercel Cloud.
         </span>
       </div>
     </div>

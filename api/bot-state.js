@@ -46,6 +46,8 @@ export default async function handler(req, res) {
     bitmapHex: '',
     alarms: [],
     alarmDismissSeq: 0,
+    alarmTestSeq: 0,
+    alarmTestSlot: 0,
     otaTriggerSeq: 0,
     updatedAt: 0,
   };
