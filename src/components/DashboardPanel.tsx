@@ -165,6 +165,7 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     if (activeScreen.kind === 'greeting') return 'Greeting';
     if (activeScreen.kind === 'custom-text') return activeScreen.textLine1 || 'Custom Text';
     if (activeScreen.kind === 'custom-bitmap') return 'Touchpad Art';
+    if (activeScreen.kind === 'custom-gif') return 'Animated GIF';
     return activeFaceDef ? activeFaceDef.name : 'Face';
   })();
 

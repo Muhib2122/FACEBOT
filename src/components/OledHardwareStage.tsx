@@ -21,6 +21,7 @@ import {
   HardwareConfig,
   LocationConfig,
   OledColorScheme,
+  SavedGifItem,
   WeatherData,
 } from '../types';
 import {
@@ -42,6 +43,7 @@ interface OledHardwareStageProps {
   greenLedOn: boolean;
   activeAlarm: { id: string; time: string; label: string } | null;
   customReactions: CustomReaction[];
+  savedGifs: SavedGifItem[];
   onChangeOledScheme: (scheme: OledColorScheme) => void;
   onChangeAnimationSpeed: (speed: AnimationSpeed) => void;
   onChangeGreenLedMode: (mode: GreenLedMode) => void;
@@ -68,6 +70,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
   greenLedOn,
   activeAlarm,
   customReactions,
+  savedGifs,
   onChangeOledScheme,
   onChangeAnimationSpeed,
   onChangeGreenLedMode,
@@ -99,7 +102,8 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
       weather,
       location,
       customReactions,
-      activeAlarm
+      activeAlarm,
+      savedGifs
     );
     paintBufferToCanvas(ctx, bufferRef.current, hardware.oledScheme, 3, true);
   }, [
@@ -112,6 +116,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     hardware.oledScheme,
     customReactions,
     activeAlarm,
+    savedGifs,
   ]);
 
   const activeFaceDef = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
@@ -125,6 +130,10 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     if (activeScreen.kind === 'custom-bitmap') {
       const cr = customReactions.find((r) => r.id === activeScreen.customReactionId);
       return `Touchpad Art · ${cr?.name || 'Custom'}`;
+    }
+    if (activeScreen.kind === 'custom-gif') {
+      const gif = savedGifs.find((g) => g.id === activeScreen.activeGifId);
+      return `Animated GIF · ${gif?.name || 'GIF'}`;
     }
     if (activeScreen.kind === 'custom-text') return 'Custom OLED Message';
     return activeFaceDef ? `Face #${activeFaceDef.id + 1} · ${activeFaceDef.name}` : 'Face Expression';

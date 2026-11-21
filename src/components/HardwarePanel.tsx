@@ -21,6 +21,7 @@ import { CloudBackendType, GreenLedMode, HardwareConfig } from '../types';
 export interface BackupSummaryCounts {
   alarmsCount: number;
   reactionsCount: number;
+  gifsCount: number;
   playlistCount: number;
   galleryCount: number;
 }
@@ -530,7 +531,7 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border border-slate-200 rounded-lg bg-slate-50/70 mt-4">
+        <div className="grid grid-cols-2 sm:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border border-slate-200 rounded-lg bg-slate-50/70 mt-4">
           <div className="p-3">
             <div className="text-[11px] text-slate-500">Saved Alarms</div>
             <div className="text-base font-bold font-mono text-slate-900 tabular-nums mt-0.5">
@@ -538,19 +539,25 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
             </div>
           </div>
           <div className="p-3">
-            <div className="text-[11px] text-slate-500">Custom Reactions</div>
+            <div className="text-[11px] text-slate-500">Custom Art</div>
             <div className="text-base font-bold font-mono text-slate-900 tabular-nums mt-0.5">
               {backupCounts.reactionsCount}
             </div>
           </div>
           <div className="p-3">
-            <div className="text-[11px] text-slate-500">Playlist Screens</div>
+            <div className="text-[11px] text-slate-500">Saved GIFs</div>
+            <div className="text-base font-bold font-mono text-slate-900 tabular-nums mt-0.5">
+              {backupCounts.gifsCount}
+            </div>
+          </div>
+          <div className="p-3">
+            <div className="text-[11px] text-slate-500">Playlist</div>
             <div className="text-base font-bold font-mono text-slate-900 tabular-nums mt-0.5">
               {backupCounts.playlistCount}
             </div>
           </div>
           <div className="p-3">
-            <div className="text-[11px] text-slate-500">Gallery Captures</div>
+            <div className="text-[11px] text-slate-500">Gallery</div>
             <div className="text-base font-bold font-mono text-slate-900 tabular-nums mt-0.5">
               {backupCounts.galleryCount}
             </div>
@@ -569,6 +576,63 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
             <span>{backupNotice.text}</span>
           </div>
         )}
+      </div>
+
+      {/* Zero-Resistor Minimal ESP32 Pinout & Wiring Reference */}
+      <div className="bg-white border border-slate-200 rounded-xl p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <Cpu className="w-4 h-4 text-slate-700 shrink-0" />
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">
+                ESP32 Zero-Resistor Minimal Wiring Pinout
+              </h3>
+              <p className="text-xs text-slate-500">
+                Direct 3.3V safe connections — no resistor, no servo, no ultrasonic sensor required
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-mono text-slate-500">I2C 0x3C · 3.3V</span>
+        </div>
+
+        <div className="overflow-x-auto mt-3">
+          <table className="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr className="border-b border-slate-200 text-slate-500">
+                <th className="py-2 pr-4 font-medium">Component</th>
+                <th className="py-2 px-4 font-medium">Component Pin</th>
+                <th className="py-2 px-4 font-medium">ESP32 Pin</th>
+                <th className="py-2 pl-4 font-medium">Note</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 font-mono">
+              <tr>
+                <td className="py-2.5 pr-4 font-sans font-semibold text-slate-900">0.96&quot; SSD1306 OLED</td>
+                <td className="py-2.5 px-4 text-slate-700">VCC / GND</td>
+                <td className="py-2.5 px-4 text-blue-700 font-semibold">3V3 / GND</td>
+                <td className="py-2.5 pl-4 font-sans text-slate-500">3.3V power (safe)</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-sans font-semibold text-slate-900">0.96&quot; SSD1306 OLED</td>
+                <td className="py-2.5 px-4 text-slate-700">SDA / SCL</td>
+                <td className="py-2.5 px-4 text-blue-700 font-semibold">GPIO 21 / GPIO 22</td>
+                <td className="py-2.5 pl-4 font-sans text-slate-500">Default ESP32 I2C (0x3C)</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-sans font-semibold text-slate-900">Piezo Buzzer</td>
+                <td className="py-2.5 px-4 text-slate-700">(+) / (−)</td>
+                <td className="py-2.5 px-4 text-blue-700 font-semibold">GPIO 14 / GND</td>
+                <td className="py-2.5 pl-4 font-sans text-slate-500">Direct connection · Bip-Bip alarm</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-sans font-semibold text-slate-900">Single Green LED</td>
+                <td className="py-2.5 px-4 text-slate-700">Long (+) / Short (−)</td>
+                <td className="py-2.5 px-4 text-emerald-700 font-semibold">GPIO 26 / GND</td>
+                <td className="py-2.5 pl-4 font-sans text-slate-500">No resistor needed (3.3V forward Vf)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

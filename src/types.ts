@@ -5,6 +5,7 @@ export type NavSection =
   | 'agent'
   | 'control'
   | 'touchpad'
+  | 'gifs'
   | 'gallery'
   | 'weather'
   | 'alarms'
@@ -32,6 +33,7 @@ export type ScreenKind =
   | 'greeting'
   | 'boot-logo'
   | 'custom-bitmap'
+  | 'custom-gif'
   | 'custom-text'
   | 'proximity-wake'
   | 'alarm';
@@ -190,10 +192,20 @@ export interface BotSettings {
   wakeGreetingPrefix: string;
 }
 
+export interface SavedGifItem {
+  id: string;
+  name: string;
+  frameDelayMs: number;
+  /** Array of 2048-char hex strings (each = 1024 bytes = 128x64 1-bit SSD1306 frame) */
+  framesHex: string[];
+  createdAt: number;
+}
+
 export interface ActiveScreenState {
   kind: ScreenKind;
   faceId: number;
   customReactionId?: string;
+  activeGifId?: string;
   textLine1?: string;
   textLine2?: string;
   alarmId?: string;

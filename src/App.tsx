@@ -6,6 +6,7 @@ import {
   CloudCheck,
   CloudSun,
   Cpu,
+  Film,
   Image as ImageIcon,
   LogIn,
   LogOut,
@@ -49,6 +50,7 @@ import {
   NavSection,
   OledScreenshot,
   PlaylistItem,
+  SavedGifItem,
   WeatherData,
 } from './types';
 import { PRESET_CITIES, fetchLiveWeather } from './utils/weatherApi';
@@ -65,17 +67,20 @@ import { OledHardwareStage } from './components/OledHardwareStage';
 import { AiAgentPanel } from './components/AiAgentPanel';
 import { ControlPanel } from './components/ControlPanel';
 import { TouchpadStudio } from './components/TouchpadStudio';
+import { GifStudioPanel } from './components/GifStudioPanel';
 import { GalleryPanel } from './components/GalleryPanel';
 import { WeatherProfilePanel } from './components/WeatherProfilePanel';
 import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
 import { IntroSplashScreen } from './components/IntroSplashScreen';
 import { generateBootLogoPixels } from './utils/oledRenderer';
+import { createStarterGifs } from './utils/gifOledCodec';
 
 const BRAND_LOGO_URL = '/assets/aistudio/image_d35aba0a.png';
 
 const STORAGE_KEY = 'facebot_esp32_portal_v1';
 const INTERACTIONS_STORAGE_KEY = 'facebot_daily_interactions_v1';
+const GIFS_STORAGE_KEY = 'facebot_saved_gifs_v1';
 
 const DEFAULT_SETTINGS: BotSettings = {
   userName: 'Muhib',
@@ -164,6 +169,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'control', label: 'OLED Display', icon: SlidersHorizontal },
       { id: 'touchpad', label: 'Touchpad Studio', icon: PenTool },
+      { id: 'gifs', label: 'GIF Studio', icon: Film },
       { id: 'gallery', label: 'Gallery', icon: ImageIcon },
       { id: 'alarms', label: 'Alarms & Buzzer', icon: Bell },
     ],
@@ -192,6 +198,29 @@ function loadSavedState() {
   } catch {
     return null;
   }
+}
+
+function loadSavedGifs(): SavedGifItem[] {
+  try {
+    const raw = localStorage.getItem(GIFS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const valid = parsed.filter(
+          (g): g is SavedGifItem =>
+            Boolean(g) &&
+            typeof g.id === 'string' &&
+            typeof g.name === 'string' &&
+            Array.isArray(g.framesHex) &&
+            g.framesHex.length > 0
+        );
+        return valid;
+      }
+    }
+  } catch {
+    // Fallback to starter animations
+  }
+  return createStarterGifs();
 }
 
 function createInitialDailyEvents(): InteractionEvent[] {
@@ -304,6 +333,7 @@ export default function App() {
   const [galleryScreenshots, setGalleryScreenshots] = useState<OledScreenshot[]>(
     Array.isArray(saved?.galleryScreenshots) ? saved.galleryScreenshots : []
   );
+  const [savedGifs, setSavedGifs] = useState<SavedGifItem[]>(() => loadSavedGifs());
 
   // Daily Interaction Analytics State
   const [interactionEvents, setInteractionEvents] = useState<InteractionEvent[]>(() =>
@@ -814,6 +844,15 @@ export default function App() {
     }
   }, [interactionEvents]);
 
+  // Persist Animated GIF Gallery in its own localStorage bucket so large GIFs never block main state
+  useEffect(() => {
+    try {
+      localStorage.setItem(GIFS_STORAGE_KEY, JSON.stringify(savedGifs.slice(0, 30)));
+    } catch {
+      // Ignore quota exceeded
+    }
+  }, [savedGifs]);
+
   const logInteraction = useCallback(
     (category: InteractionCategory, label: string, source: 'portal' | 'esp32' | 'voice' = 'portal') => {
       const current = new Date();
@@ -870,7 +909,11 @@ export default function App() {
     let screenName = 'auto';
     if (activeScreen.locked) {
       if (activeScreen.kind === 'custom-text') screenName = 'text';
-      else if (activeScreen.kind === 'custom-bitmap' || activeScreen.kind === 'boot-logo')
+      else if (
+        activeScreen.kind === 'custom-bitmap' ||
+        activeScreen.kind === 'boot-logo' ||
+        activeScreen.kind === 'custom-gif'
+      )
         screenName = 'bitmap';
       else screenName = activeScreen.kind;
     }
@@ -1765,6 +1808,130 @@ export default function App() {
     }
   };
 
+  // Stream active Animated GIF frames to already-flashed ESP32 via Local LAN (/api/bitmap) and/or Vercel Cloud
+  useEffect(() => {
+    if (activeScreen.kind !== 'custom-gif' || !activeScreen.activeGifId || isSleeping || activeAlarm) {
+      return;
+    }
+    const gif = savedGifs.find((g) => g.id === activeScreen.activeGifId);
+    if (!gif || gif.framesHex.length === 0) return;
+
+    const ip = hardware.esp32Ip.trim();
+    const base = ip ? (ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`) : '';
+
+    const pushFrameHexToLan = (hex: string) => {
+      if (!base) return;
+      fetch(`${base}/api/bitmap`, {
+        method: 'POST',
+        mode: 'no-cors',
+        body: hex,
+      }).catch(() => {});
+    };
+
+    // Push frame 0 immediately to both LAN and Cloud so ESP32 updates right away
+    lastBitmapHexRef.current = gif.framesHex[0];
+    bitmapSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
+    pushFrameHexToLan(gif.framesHex[0]);
+
+    if (gif.framesHex.length <= 1) return;
+
+    let lanIdx = 1;
+    let lanTimer: number | null = null;
+    if (base) {
+      const lanDelay = Math.max(100, Math.min(1000, gif.frameDelayMs));
+      lanTimer = window.setInterval(() => {
+        const hex = gif.framesHex[lanIdx % gif.framesHex.length];
+        lanIdx = (lanIdx + 1) % gif.framesHex.length;
+        pushFrameHexToLan(hex);
+      }, lanDelay);
+    }
+
+    let cloudIdx = 1;
+    let cloudTimer: number | null = null;
+    if (hardware.cloudSyncEnabled) {
+      cloudTimer = window.setInterval(() => {
+        const hex = gif.framesHex[cloudIdx % gif.framesHex.length];
+        cloudIdx = (cloudIdx + 1) % gif.framesHex.length;
+        lastBitmapHexRef.current = hex;
+        bitmapSeqRef.current += 1;
+        setCloudEventSeq((s) => s + 1);
+      }, 1350);
+    }
+
+    return () => {
+      if (lanTimer !== null) window.clearInterval(lanTimer);
+      if (cloudTimer !== null) window.clearInterval(cloudTimer);
+    };
+  }, [
+    activeScreen.kind,
+    activeScreen.activeGifId,
+    isSleeping,
+    activeAlarm,
+    savedGifs,
+    hardware.esp32Ip,
+    hardware.cloudSyncEnabled,
+  ]);
+
+  // Animated GIF Studio Handlers
+  const handleSaveGif = useCallback(
+    (gif: SavedGifItem) => {
+      setSavedGifs((prev) => [gif, ...prev.filter((g) => g.id !== gif.id)].slice(0, 30));
+      playShortClick(hardware.buzzerMuted);
+      logInteraction('oled-face', `Saved GIF: ${gif.name} (${gif.framesHex.length} frames)`, 'portal');
+    },
+    [hardware.buzzerMuted, logInteraction]
+  );
+
+  const handleDeleteGif = useCallback(
+    (id: string) => {
+      setSavedGifs((prev) => prev.filter((g) => g.id !== id));
+      setActiveScreen((prev) =>
+        prev.kind === 'custom-gif' && prev.activeGifId === id
+          ? { kind: 'face', faceId: 0, locked: false }
+          : prev
+      );
+      logInteraction('oled-face', 'Deleted GIF from Gallery', 'portal');
+    },
+    [logInteraction]
+  );
+
+  const handlePlayGif = useCallback(
+    (gif: SavedGifItem, speedOverrideMs?: number) => {
+      const nextDelay = speedOverrideMs ?? gif.frameDelayMs;
+      if (speedOverrideMs !== undefined && speedOverrideMs !== gif.frameDelayMs) {
+        setSavedGifs((prev) =>
+          prev.map((g) => (g.id === gif.id ? { ...g, frameDelayMs: nextDelay } : g))
+        );
+      }
+      setIsSleeping(false);
+      setActiveAlarm(null);
+      setPomodoroRunning(false);
+      setActiveScreen({
+        kind: 'custom-gif',
+        faceId: 0,
+        activeGifId: gif.id,
+        locked: true,
+      });
+      playShortClick(hardware.buzzerMuted);
+      logInteraction('oled-face', `Playing GIF on OLED: ${gif.name}`, 'portal');
+    },
+    [hardware.buzzerMuted, logInteraction]
+  );
+
+  const handleStopGif = useCallback(() => {
+    setActiveScreen({ kind: 'face', faceId: 0, locked: false });
+    sendToEsp32('/api/mode?mode=auto');
+    playShortClick(hardware.buzzerMuted);
+  }, [hardware.buzzerMuted, sendToEsp32]);
+
+  const handleUpdateGifSpeed = useCallback((id: string, frameDelayMs: number) => {
+    const clamped = Math.max(30, Math.min(1000, Math.round(frameDelayMs)));
+    setSavedGifs((prev) =>
+      prev.map((g) => (g.id === id ? { ...g, frameDelayMs: clamped } : g))
+    );
+  }, []);
+
   // Export all saved settings, alarms, custom reactions, playlist & gallery as a portable local JSON backup
   const handleExportBackup = useCallback((): string => {
     const savedReactions = customReactions
@@ -1790,6 +1957,7 @@ export default function App() {
       playlist,
       customReactions: savedReactions,
       galleryScreenshots: galleryScreenshots.slice(0, 40),
+      savedGifs: savedGifs.slice(0, 30),
     };
 
     const json = JSON.stringify(backupPayload, null, 2);
@@ -1815,6 +1983,7 @@ export default function App() {
     playlist,
     customReactions,
     galleryScreenshots,
+    savedGifs,
     logInteraction,
   ]);
 
@@ -1949,6 +2118,30 @@ export default function App() {
             }))
         : galleryScreenshots;
 
+      const nextGifs: SavedGifItem[] = Array.isArray(parsed.savedGifs)
+        ? parsed.savedGifs
+            .filter((g): g is Record<string, unknown> => Boolean(g && typeof g === 'object'))
+            .slice(0, 30)
+            .map((g, idx) => ({
+              id: typeof g.id === 'string' && g.id.trim() ? g.id : `gif-imp-${Date.now()}-${idx}`,
+              name:
+                typeof g.name === 'string' && g.name.trim()
+                  ? g.name.slice(0, 24)
+                  : `restored_gif_${idx + 1}`,
+              framesHex: Array.isArray(g.framesHex)
+                ? g.framesHex
+                    .filter((f): f is string => typeof f === 'string' && f.length >= 2048)
+                    .slice(0, 30)
+                    .map((f) => f.slice(0, 2048))
+                : [],
+              frameDelayMs: Math.max(30, Math.min(1000, Math.round(Number(g.frameDelayMs) || 100))),
+              threshold: Math.max(10, Math.min(245, Math.round(Number(g.threshold) || 128))),
+              inverted: Boolean(g.inverted),
+              createdAt: Number(g.createdAt) || Date.now(),
+            }))
+            .filter((g) => g.framesHex.length > 0)
+        : savedGifs;
+
       setMode(nextMode);
       setSettings(nextSettings);
       setLocation(nextLocation);
@@ -1957,6 +2150,7 @@ export default function App() {
       setCustomReactions(nextReactions);
       setPlaylist(nextPlaylist);
       setGalleryScreenshots(nextGallery);
+      setSavedGifs(nextGifs);
       setCloudEventSeq((s) => s + 1);
 
       // Sync restored backup to Firebase Firestore if user is signed in
@@ -1986,13 +2180,13 @@ export default function App() {
 
       logInteraction(
         'hardware',
-        `Restored JSON Backup (${nextAlarms.length} alarms, ${nextReactions.length} reactions)`,
+        `Restored JSON Backup (${nextAlarms.length} alarms, ${nextReactions.length} reactions, ${nextGifs.length} GIFs)`,
         'portal'
       );
 
       return {
         ok: true,
-        message: `Restored backup: ${nextAlarms.length} alarm(s), ${nextReactions.length} custom reaction(s), ${nextPlaylist.length} playlist item(s), and ${nextGallery.length} gallery capture(s).`,
+        message: `Restored backup: ${nextAlarms.length} alarm(s), ${nextReactions.length} custom reaction(s), ${nextPlaylist.length} playlist item(s), ${nextGallery.length} gallery capture(s), and ${nextGifs.length} GIF(s).`,
       };
     },
     [
@@ -2000,6 +2194,7 @@ export default function App() {
       customReactions,
       playlist,
       galleryScreenshots,
+      savedGifs,
       fbUser,
       fbWorkspaceReady,
       activeScreen.faceId,
@@ -2281,6 +2476,7 @@ export default function App() {
               activeScreen={activeScreen}
               activeAlarm={activeAlarm}
               customReactions={customReactions}
+              savedGifs={savedGifs}
               alarmCount={alarms.length}
               todayInteractions={interactionEvents.length}
               onExecuteAgentAction={handleExecuteAgentAction}
@@ -2305,6 +2501,7 @@ export default function App() {
                 greenLedOn={greenLedOn}
                 activeAlarm={activeAlarm}
                 customReactions={customReactions}
+                savedGifs={savedGifs}
                 onChangeOledScheme={(scheme) => handleUpdateHardware({ oledScheme: scheme })}
                 onChangeAnimationSpeed={(animationSpeed) =>
                   handleUpdateHardware({ animationSpeed })
@@ -2380,6 +2577,24 @@ export default function App() {
               onDeleteReaction={handleDeleteReaction}
               onDisplayReaction={handleDisplayReaction}
               onPushLivePixels={handlePushLivePixels}
+            />
+          )}
+
+          {/* 4a. Dedicated Animated GIF Studio (128x64 OLED Monochrome + Gallery) */}
+          {navSection === 'gifs' && (
+            <GifStudioPanel
+              oledScheme={hardware.oledScheme}
+              savedGifs={savedGifs}
+              activeGifId={
+                activeScreen.kind === 'custom-gif' ? activeScreen.activeGifId ?? null : null
+              }
+              cloudSyncEnabled={hardware.cloudSyncEnabled}
+              esp32Ip={hardware.esp32Ip}
+              onSaveGif={handleSaveGif}
+              onDeleteGif={handleDeleteGif}
+              onPlayGif={handlePlayGif}
+              onStopGif={handleStopGif}
+              onUpdateGifSpeed={handleUpdateGifSpeed}
             />
           )}
 
@@ -2479,6 +2694,7 @@ export default function App() {
                 reactionsCount: customReactions.filter((r) => r.id !== 'live-touchpad-preview').length,
                 playlistCount: playlist.length,
                 galleryCount: galleryScreenshots.length,
+                gifsCount: savedGifs.length,
               }}
               onUpdateHardware={handleUpdateHardware}
               onChangeGreenLedMode={handleChangeGreenLedMode}
@@ -2529,6 +2745,13 @@ export default function App() {
                 className="hover:text-slate-900 transition-colors"
               >
                 OLED Display
+              </button>
+              <button
+                type="button"
+                onClick={() => setNavSection('gifs')}
+                className="hover:text-slate-900 transition-colors"
+              >
+                GIF Studio
               </button>
               <button
                 type="button"

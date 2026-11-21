@@ -1,4 +1,4 @@
-import { ActiveScreenState, BotSettings, CustomReaction, LocationConfig, OledColorScheme, WeatherData } from '../types';
+import { ActiveScreenState, BotSettings, CustomReaction, LocationConfig, OledColorScheme, SavedGifItem, WeatherData } from '../types';
 
 export const OLED_WIDTH = 128;
 export const OLED_HEIGHT = 64;
@@ -1013,7 +1013,8 @@ export function renderScreenToBuffer(
   weather: WeatherData | null,
   location: LocationConfig,
   customReactions: CustomReaction[],
-  activeAlarm?: { time: string; label: string } | null
+  activeAlarm?: { time: string; label: string } | null,
+  savedGifs?: SavedGifItem[]
 ) {
   if (screen.kind === 'alarm' && activeAlarm) {
     drawAlarmScreen(buffer, activeAlarm.label, activeAlarm.time, frame);
@@ -1048,6 +1049,29 @@ export function renderScreenToBuffer(
         }
       } else {
         buffer.printCentered('No Drawing Yet', 26, 1, WHITE);
+      }
+      break;
+    }
+    case 'custom-gif': {
+      buffer.clearDisplay();
+      const gif = savedGifs?.find((g) => g.id === screen.activeGifId);
+      if (gif && gif.framesHex.length > 0) {
+        const delayMs = Math.max(30, gif.frameDelayMs || 100);
+        const frameIdx = Math.floor((frame * 42) / delayMs) % gif.framesHex.length;
+        const hex = gif.framesHex[frameIdx] || '';
+        if (hex.length >= 2048) {
+          for (let i = 0; i < 1024; i++) {
+            const byteVal = parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
+            const y = Math.floor(i / 16);
+            const xb = i % 16;
+            const rowBase = y * OLED_WIDTH + xb * 8;
+            for (let bit = 0; bit < 8; bit++) {
+              buffer.pixels[rowBase + bit] = (byteVal >> (7 - bit)) & 1;
+            }
+          }
+        }
+      } else {
+        buffer.printCentered('No GIF Loaded', 26, 1, WHITE);
       }
       break;
     }

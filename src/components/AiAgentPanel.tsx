@@ -26,6 +26,7 @@ import {
   GreenLedMode,
   HardwareConfig,
   LocationConfig,
+  SavedGifItem,
   WeatherData,
 } from '../types';
 import {
@@ -47,6 +48,7 @@ interface AiAgentPanelProps {
   activeScreen: ActiveScreenState;
   activeAlarm: { id: string; time: string; label: string } | null;
   customReactions: CustomReaction[];
+  savedGifs: SavedGifItem[];
   alarmCount: number;
   todayInteractions: number;
   onExecuteAgentAction: (action: AgentActionResponse, source: 'portal' | 'voice') => string[];
@@ -155,6 +157,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   activeScreen,
   activeAlarm,
   customReactions,
+  savedGifs,
   alarmCount,
   todayInteractions,
   onExecuteAgentAction,
@@ -246,7 +249,8 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       weather,
       location,
       customReactions,
-      activeAlarm
+      activeAlarm,
+      savedGifs
     );
     paintBufferToCanvas(ctx, bufferRef.current, hardware.oledScheme, 3, true);
   }, [
@@ -259,6 +263,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     hardware.oledScheme,
     customReactions,
     activeAlarm,
+    savedGifs,
   ]);
 
   useEffect(() => {
