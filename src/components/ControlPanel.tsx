@@ -400,7 +400,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
               25 Dynamic Face Expressions
             </h3>
             <p className="text-xs text-slate-500 mt-0.5">
-              Click any expression to trigger OLED animation and synchronized servo head motion
+              Click any expression to animate the 0.96&quot; OLED and auto-sync to your ESP32 over Vercel Cloud
             </p>
           </div>
 

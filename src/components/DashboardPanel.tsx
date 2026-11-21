@@ -159,6 +159,7 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
   const activeFaceDef = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
   const activeScreenLabel = (() => {
     if (activeScreen.kind === 'alarm') return 'Alarm Ringing';
+    if (activeScreen.kind === 'boot-logo') return 'Startup Logo (5s)';
     if (activeScreen.kind === 'watch') return 'Watch UI';
     if (activeScreen.kind === 'weather') return 'Live Weather';
     if (activeScreen.kind === 'greeting') return 'Greeting';
@@ -234,9 +235,11 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
             {weather ? `${weather.temperature.toFixed(1)}°C` : '--°C'} · {location.city}
           </div>
           <div className="text-xs text-slate-500 mt-1 truncate">
-            {hardware.esp32Ip.trim()
-              ? `ESP32 Bridge: ${hardware.esp32Ip.trim()}`
-              : `${settings.userName}'s Local Simulator`}
+            {hardware.cloudSyncEnabled
+              ? `Vercel Cloud Sync (${hardware.deviceId || 'muhib-bot-1'})`
+              : hardware.esp32Ip.trim()
+                ? `ESP32 Bridge: ${hardware.esp32Ip.trim()}`
+                : `${settings.userName}'s Local Simulator`}
           </div>
         </div>
       </section>

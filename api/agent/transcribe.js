@@ -1,5 +1,14 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Transcribe timeout (${ms}ms)`)), ms)
+    ),
+  ]);
+}
+
 function formatFriendlyError(err) {
   const raw = err instanceof Error ? err.message : String(err || '');
   const lower = raw.toLowerCase();
@@ -27,7 +36,12 @@ export default async function handler(req, res) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY is not configured.' });
 
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    let body = {};
+    try {
+      body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+    } catch {
+      return res.status(400).json({ error: 'Invalid JSON body.' });
+    }
     const audioBase64 = typeof body.audioBase64 === 'string' ? body.audioBase64 : '';
     const mimeType = typeof body.mimeType === 'string' ? body.mimeType : 'audio/webm';
     if (!audioBase64) return res.status(400).json({ error: 'audioBase64 is required.' });
@@ -44,19 +58,35 @@ export default async function handler(req, res) {
       },
     ];
 
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: { parts },
-      });
-    } catch {
-      response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: { parts },
-        config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
-      });
+    const attempts = [
+      { model: 'gemini-3.5-transcribe', timeout: 8500 },
+      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 8500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 9500 },
+      { model: 'gemini-2.5-flash', timeout: 9500 },
+    ];
+
+    let response = null;
+    let lastErr = null;
+    for (const attempt of attempts) {
+      try {
+        response = await withTimeout(
+          ai.models.generateContent({
+            model: attempt.model,
+            contents: { parts },
+            ...(attempt.thinking
+              ? { config: { thinkingConfig: { thinkingLevel: attempt.thinking } } }
+              : {}),
+          }),
+          attempt.timeout
+        );
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`Transcribe attempt ${attempt.model} failed:`, err?.message || err);
+      }
     }
+
+    if (!response) throw lastErr || new Error('All transcribe models failed.');
 
     return res.status(200).json({ text: (response.text || '').trim() });
   } catch (err) {

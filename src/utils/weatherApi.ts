@@ -26,28 +26,47 @@ export function decodeWeatherCode(code: number): string {
   return 'Mild Weather';
 }
 
+async function fetchWithTimeout(url: string, timeoutMs = 10000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export async function fetchLiveWeather(location: LocationConfig): Promise<WeatherData> {
+  const lat = Number.isFinite(location.latitude) ? location.latitude : 23.8103;
+  const lon = Number.isFinite(location.longitude) ? location.longitude : 90.4125;
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${location.latitude.toFixed(4)}` +
-    `&longitude=${location.longitude.toFixed(4)}` +
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}` +
+    `&longitude=${lon.toFixed(4)}` +
     `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,wind_speed_10m` +
     `&timezone=auto`;
 
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url, 10000);
   if (!response.ok) {
     throw new Error('Could not fetch live weather data');
   }
 
   const data = await response.json();
-  const current = data.current;
+  const current = data?.current;
+  if (!current || typeof current !== 'object') {
+    throw new Error('Weather feed returned an incomplete response');
+  }
 
   return {
-    temperature: Number(current.temperature_2m),
-    apparentTemperature: Number(current.apparent_temperature),
-    humidity: Number(current.relative_humidity_2m),
-    windSpeed: Number(current.wind_speed_10m),
-    weatherCode: Number(current.weather_code),
-    conditionLabel: decodeWeatherCode(Number(current.weather_code)),
+    temperature: Number.isFinite(Number(current.temperature_2m)) ? Number(current.temperature_2m) : 28,
+    apparentTemperature: Number.isFinite(Number(current.apparent_temperature))
+      ? Number(current.apparent_temperature)
+      : Number(current.temperature_2m) || 28,
+    humidity: Number.isFinite(Number(current.relative_humidity_2m))
+      ? Number(current.relative_humidity_2m)
+      : 65,
+    windSpeed: Number.isFinite(Number(current.wind_speed_10m)) ? Number(current.wind_speed_10m) : 8,
+    weatherCode: Number.isFinite(Number(current.weather_code)) ? Number(current.weather_code) : 0,
+    conditionLabel: decodeWeatherCode(Number(current.weather_code) || 0),
     isDay: Number(current.is_day) === 1,
     elevation: Number(data.elevation ?? location.altitude ?? 0),
     utcOffsetSeconds: Number(data.utc_offset_seconds ?? 21600),
@@ -59,10 +78,10 @@ export async function fetchLiveWeather(location: LocationConfig): Promise<Weathe
 export async function searchCityGeocoding(query: string): Promise<LocationConfig[]> {
   if (!query.trim() || query.trim().length < 2) return [];
   const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query.trim())}&count=6&language=en&format=json`;
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url, 10000);
   if (!response.ok) return [];
   const data = await response.json();
-  if (!Array.isArray(data.results)) return [];
+  if (!Array.isArray(data?.results)) return [];
 
   return data.results.map(
     (item: {

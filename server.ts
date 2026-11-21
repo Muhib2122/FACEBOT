@@ -19,6 +19,20 @@ const __dirname = path.dirname(__filename);
 const PORT = 3000;
 const app = express();
 app.use(express.json({ limit: '15mb' }));
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (err && typeof err === 'object' && 'type' in err && (err as { type?: string }).type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'Malformed JSON body.' });
+      return;
+    }
+    next(err);
+  }
+);
 
 const FACE_CATALOG = [
   '0: Normal Blink',
@@ -66,6 +80,44 @@ function withTimeoutMs<T>(promise: Promise<T>, ms: number): Promise<T> {
       setTimeout(() => reject(new Error(`Model timeout (${ms}ms)`)), ms)
     ),
   ]);
+}
+
+function ensureWavBase64(base64Audio: string, inlineMimeType = ''): string {
+  const rawBuf = Buffer.from(base64Audio, 'base64');
+  if (
+    rawBuf.length >= 12 &&
+    rawBuf[0] === 0x52 &&
+    rawBuf[1] === 0x49 &&
+    rawBuf[2] === 0x46 &&
+    rawBuf[3] === 0x46
+  ) {
+    return base64Audio;
+  }
+
+  const rateMatch = String(inlineMimeType).match(/rate=(\d+)/i);
+  const sampleRate = rateMatch ? Number(rateMatch[1]) || 24000 : 24000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = rawBuf.length;
+
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, rawBuf]).toString('base64');
 }
 
 function formatFriendlyGeminiError(err: unknown, fallbackMsg: string): { status: number; message: string } {
@@ -488,19 +540,35 @@ app.post('/api/agent/transcribe', async (req, res) => {
       },
     ];
 
+    const transcribeAttempts: { model: string; thinking?: ThinkingLevel; timeout: number }[] = [
+      { model: 'gemini-3.5-transcribe', timeout: 8500 },
+      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 8500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 9500 },
+      { model: 'gemini-2.5-flash', timeout: 9500 },
+    ];
+
     let response;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: { parts },
-      });
-    } catch {
-      response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: { parts },
-        config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
-      });
+    let lastTranscribeErr: unknown = null;
+    for (const attempt of transcribeAttempts) {
+      try {
+        response = await withTimeoutMs(
+          ai.models.generateContent({
+            model: attempt.model,
+            contents: { parts },
+            ...(attempt.thinking
+              ? { config: { thinkingConfig: { thinkingLevel: attempt.thinking } } }
+              : {}),
+          }),
+          attempt.timeout
+        );
+        break;
+      } catch (err) {
+        lastTranscribeErr = err;
+        console.warn(`Transcribe attempt ${attempt.model} failed:`, err);
+      }
     }
+
+    if (!response) throw lastTranscribeErr || new Error('All transcribe models failed.');
 
     res.json({ text: (response.text || '').trim() });
   } catch (err) {
@@ -532,40 +600,90 @@ app.post('/api/agent/tts', async (req, res) => {
     const requestedVoice = typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Kore';
     const voiceName = ALLOWED_TTS_VOICES.has(requestedVoice) ? requestedVoice : 'Kore';
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: speechText,
-              speechMetadata: {
-                style:
-                  'Crystal-clear, warm, friendly Bangladeshi Bengali and English voice assistant speaking calmly at a steady, easy-to-understand pace with crisp enunciation',
+    const ttsAttempts: { model: string; contents: unknown[]; timeout: number }[] = [
+      {
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: speechText,
+                speechMetadata: {
+                  style:
+                    'Crystal-clear, warm, friendly Bangladeshi Bengali and English voice assistant speaking calmly at a steady pace',
+                },
+              },
+            ],
+          },
+        ],
+        timeout: 6500,
+      },
+      {
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [{ role: 'user', parts: [{ text: speechText }] }],
+        timeout: 6500,
+      },
+      {
+        model: 'gemini-3.8-flash-tts',
+        contents: [{ role: 'user', parts: [{ text: speechText }] }],
+        timeout: 7000,
+      },
+      {
+        model: 'gemini-2.5-flash-preview-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `Speak clearly and warmly: ${speechText}` }],
+          },
+        ],
+        timeout: 8000,
+      },
+    ];
+
+    let inlineData: { data?: string; mimeType?: string } | null = null;
+    let lastTtsErr: unknown = null;
+    for (const attempt of ttsAttempts) {
+      try {
+        const response = await withTimeoutMs(
+          ai.models.generateContent({
+            model: attempt.model,
+            contents: attempt.contents as never,
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
               },
             },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
-          },
-        },
-      },
-    });
+          }),
+          attempt.timeout
+        );
+        const found = response.candidates?.[0]?.content?.parts?.find(
+          (p) => Boolean(p?.inlineData?.data)
+        )?.inlineData;
+        if (found?.data) {
+          inlineData = found;
+          break;
+        }
+      } catch (err) {
+        lastTtsErr = err;
+        console.warn(`TTS attempt ${attempt.model} failed:`, err);
+      }
+    }
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const base64Audio = inlineData?.data;
     if (!base64Audio) {
+      if (lastTtsErr) throw lastTtsErr;
       res.status(502).json({ error: 'No audio returned by Gemini TTS.' });
       return;
     }
 
+    const wavBase64 = ensureWavBase64(base64Audio, inlineData?.mimeType || '');
+
     res.json({
-      audioBase64: base64Audio,
+      audioBase64: wavBase64,
       mimeType: 'audio/wav',
       voiceName,
     });

@@ -18,7 +18,17 @@ export default async function handler(req, res) {
   const deviceId = String((req.query && req.query.device) || 'muhib-bot-1').slice(0, 32);
 
   if (req.method === 'POST') {
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    let body = {};
+    try {
+      const parsed = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        body = parsed;
+      } else {
+        return res.status(400).json({ error: 'Invalid JSON payload object.' });
+      }
+    } catch {
+      return res.status(400).json({ error: 'Malformed JSON body.' });
+    }
     const prev = deviceStore.get(deviceId) || {};
     const payload = {
       ...prev,

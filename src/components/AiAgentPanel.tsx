@@ -344,6 +344,20 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   }, [clearLiveAudioQueue]);
 
   useEffect(() => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.getVoices();
+      const handleVoices = () => {
+        window.speechSynthesis.getVoices();
+      };
+      window.speechSynthesis.addEventListener?.('voiceschanged', handleVoices);
+      return () => {
+        window.speechSynthesis.removeEventListener?.('voiceschanged', handleVoices);
+      };
+    }
+    return undefined;
+  }, []);
+
+  useEffect(() => {
     return () => {
       stopLiveVoice();
       stopCurrentSpeech();
@@ -951,13 +965,20 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       recordStreamRef.current = stream;
       recordChunksRef.current = [];
 
-      const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/webm')
-          ? 'audio/webm'
-          : 'audio/mp4';
+      const candidateMimes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+      ];
+      const preferredMime =
+        typeof MediaRecorder !== 'undefined' && typeof MediaRecorder.isTypeSupported === 'function'
+          ? candidateMimes.find((m) => MediaRecorder.isTypeSupported(m)) || ''
+          : '';
 
-      const recorder = new MediaRecorder(stream, { mimeType: preferredMime });
+      const recorder = preferredMime
+        ? new MediaRecorder(stream, { mimeType: preferredMime })
+        : new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (ev) => {
@@ -970,21 +991,38 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
         stream.getTracks().forEach((t) => t.stop());
         recordStreamRef.current = null;
 
-        const blob = new Blob(recordChunksRef.current, { type: preferredMime.split(';')[0] });
-        if (blob.size < 200) return;
+        const actualMime = (recorder.mimeType || preferredMime || 'audio/webm').split(';')[0];
+        const blob = new Blob(recordChunksRef.current, { type: actualMime });
+        if (blob.size < 200) {
+          setStatusNotice('Khup choto audio chilo — Mic e tap kore 1-2 second kotha bolo.');
+          return;
+        }
 
         setTranscribing(true);
+        const transcribeAbort = new AbortController();
+        const transcribeTimer = window.setTimeout(() => transcribeAbort.abort(), 22000);
         try {
           const audioBase64 = await blobToBase64(blob);
           const res = await fetch('/api/agent/transcribe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: transcribeAbort.signal,
             body: JSON.stringify({
               audioBase64,
-              mimeType: preferredMime.split(';')[0],
+              mimeType: actualMime,
             }),
           });
-          const data = await res.json();
+          const rawText = await res.text();
+          let data: { text?: string; error?: string } = {};
+          try {
+            data = JSON.parse(rawText);
+          } catch {
+            throw new Error(
+              res.status === 504
+                ? 'Voice transcribe timeout (504). Abr try koro!'
+                : `Transcribe failed (${res.status})`
+            );
+          }
           if (!res.ok) {
             throw new Error(data?.error || `Transcribe failed (${res.status})`);
           }
@@ -996,10 +1034,14 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             setStatusNotice('Sorry Muhib, kono voice shona jay ni. Aro clear kore bolo.');
           }
         } catch (err) {
+          const isAbort = err instanceof Error && err.name === 'AbortError';
           setStatusNotice(
-            cleanErrorMessage(err instanceof Error ? err.message : 'Audio transcription failed.')
+            isAbort
+              ? 'Voice transcribe time besi laglo — abr try koro.'
+              : cleanErrorMessage(err instanceof Error ? err.message : 'Audio transcription failed.')
           );
         } finally {
+          window.clearTimeout(transcribeTimer);
           setTranscribing(false);
         }
       };

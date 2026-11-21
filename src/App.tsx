@@ -879,8 +879,8 @@ export default function App() {
       const [hh, mm] = a.time.split(':').map(Number);
       const melody = a.melody === 'gentle' ? 1 : a.melody === 'urgent' ? 2 : 0;
       return {
-        hour: hh || 7,
-        min: mm || 0,
+        hour: Number.isFinite(hh) ? hh : 7,
+        min: Number.isFinite(mm) ? mm : 0,
         on: a.enabled,
         face: a.faceId,
         melody,
@@ -1111,6 +1111,9 @@ export default function App() {
         if (prev <= 1) {
           setPomodoroRunning(false);
           playWakeChime(hardware.buzzerMuted);
+          lastBuzzerModeRef.current = 'happy';
+          buzzerSeqRef.current += 1;
+          setCloudEventSeq((s) => s + 1);
           setActiveScreen({
             kind: 'custom-text',
             faceId: 1,
@@ -1461,26 +1464,24 @@ export default function App() {
       }
       setAlarmSyncMessage(
         fbUser
-          ? `Alarm ${alarm.time} saved to Firebase Cloud and synced to ESP32.`
-          : hardware.esp32Ip.trim()
-            ? `Alarm ${alarm.time} saved and synced to ESP32.`
-            : `Alarm ${alarm.time} saved locally and embedded in your ESP32 firmware.`
+          ? `Alarm ${alarm.time} saved to Firebase Cloud and auto-synced to ESP32.`
+          : hardware.cloudSyncEnabled
+            ? `Alarm ${alarm.time} saved and auto-syncing to ESP32 via Vercel Cloud.`
+            : hardware.esp32Ip.trim()
+              ? `Alarm ${alarm.time} saved and synced to ESP32.`
+              : `Alarm ${alarm.time} saved locally.`
       );
       logInteraction('alarm', `Set Alarm ${alarm.time} (${alarm.label})`, 'portal');
     },
-    [fbUser, fbWorkspaceReady, hardware.esp32Ip, syncSingleAlarmSlot, logInteraction]
+    [fbUser, fbWorkspaceReady, hardware.cloudSyncEnabled, hardware.esp32Ip, syncSingleAlarmSlot, logInteraction]
   );
 
   const handleToggleAlarm = (id: string) => {
-    let nextEnabled = true;
+    const target = alarms.find((a) => a.id === id);
+    if (!target) return;
+    const nextEnabled = !target.enabled;
     setAlarms((prev) => {
-      const next = prev.map((a) => {
-        if (a.id === id) {
-          nextEnabled = !a.enabled;
-          return { ...a, enabled: nextEnabled };
-        }
-        return a;
-      });
+      const next = prev.map((a) => (a.id === id ? { ...a, enabled: nextEnabled } : a));
       next.slice(0, 8).forEach((item, idx) => syncSingleAlarmSlot(item, idx));
       return next;
     });
@@ -1763,6 +1764,248 @@ export default function App() {
       setPingStatus('Could not reach ESP32 IP. Verify WiFi connection and IP address.');
     }
   };
+
+  // Export all saved settings, alarms, custom reactions, playlist & gallery as a portable local JSON backup
+  const handleExportBackup = useCallback((): string => {
+    const savedReactions = customReactions
+      .filter((r) => r.id !== 'live-touchpad-preview')
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        createdAt: r.createdAt,
+        pixelsHex: pixelsToHex2048(r.pixels),
+        servoStyle: r.servoStyle || 'center',
+      }));
+
+    const backupPayload = {
+      schema: 'facebot-esp32-backup',
+      version: 1,
+      app: 'Muhib Creation · FaceBot ESP32 AI Portal',
+      exportedAt: new Date().toISOString(),
+      mode,
+      settings,
+      location,
+      hardware,
+      alarms,
+      playlist,
+      customReactions: savedReactions,
+      galleryScreenshots: galleryScreenshots.slice(0, 40),
+    };
+
+    const json = JSON.stringify(backupPayload, null, 2);
+    const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const filename = `facebot-backup-${getTodayKey()}.json`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    logInteraction('hardware', `Exported JSON Backup (${filename})`, 'portal');
+    return filename;
+  }, [
+    mode,
+    settings,
+    location,
+    hardware,
+    alarms,
+    playlist,
+    customReactions,
+    galleryScreenshots,
+    logInteraction,
+  ]);
+
+  // Restore all saved settings, alarms, custom reactions, playlist & gallery from a local JSON backup
+  const handleImportBackup = useCallback(
+    async (rawJson: string): Promise<{ ok: boolean; message: string }> => {
+      let parsed: Record<string, unknown>;
+      try {
+        const obj = JSON.parse(rawJson);
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+          return { ok: false, message: 'Invalid backup file: root must be a JSON object.' };
+        }
+        parsed = obj as Record<string, unknown>;
+      } catch {
+        return { ok: false, message: 'Invalid JSON syntax. Please select a valid FaceBot backup file.' };
+      }
+
+      const hasKnownFields =
+        'settings' in parsed ||
+        'alarms' in parsed ||
+        'customReactions' in parsed ||
+        'hardware' in parsed ||
+        'playlist' in parsed;
+      if (!hasKnownFields) {
+        return {
+          ok: false,
+          message: 'Unrecognized JSON file — no FaceBot settings, alarms, or reactions found.',
+        };
+      }
+
+      const nextMode: BotMode = parsed.mode === 'user' ? 'user' : 'auto';
+      const nextSettings: BotSettings = {
+        ...DEFAULT_SETTINGS,
+        ...(parsed.settings && typeof parsed.settings === 'object'
+          ? (parsed.settings as Partial<BotSettings>)
+          : {}),
+      };
+      const nextLocation: LocationConfig = {
+        ...DEFAULT_LOCATION,
+        ...(parsed.location && typeof parsed.location === 'object'
+          ? (parsed.location as Partial<LocationConfig>)
+          : {}),
+      };
+      const nextHardware: HardwareConfig = {
+        ...DEFAULT_HARDWARE,
+        ...(parsed.hardware && typeof parsed.hardware === 'object'
+          ? (parsed.hardware as Partial<HardwareConfig>)
+          : {}),
+      };
+
+      const nextAlarms: AlarmItem[] = Array.isArray(parsed.alarms)
+        ? parsed.alarms
+            .filter((a): a is Record<string, unknown> => Boolean(a && typeof a === 'object'))
+            .slice(0, 20)
+            .map((a, idx) => ({
+              id: typeof a.id === 'string' && a.id.trim() ? a.id : `al-imp-${Date.now()}-${idx}`,
+              time:
+                typeof a.time === 'string' && /^[0-2][0-9]:[0-5][0-9]$/.test(a.time)
+                  ? a.time
+                  : '07:00',
+              label: typeof a.label === 'string' && a.label.trim() ? a.label.slice(0, 32) : 'Alarm',
+              enabled: Boolean(a.enabled),
+              days: Array.isArray(a.days)
+                ? a.days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+                : [0, 1, 2, 3, 4, 5, 6],
+              faceId: Math.max(0, Math.min(24, Math.round(Number(a.faceId) || 1))),
+              melody:
+                a.melody === 'gentle' || a.melody === 'urgent' ? a.melody : 'classic',
+            }))
+        : alarms;
+
+      const nextReactions: CustomReaction[] = Array.isArray(parsed.customReactions)
+        ? parsed.customReactions
+            .filter((r): r is Record<string, unknown> => Boolean(r && typeof r === 'object'))
+            .slice(0, 30)
+            .map((r, idx) => {
+              const pixels =
+                typeof r.pixelsHex === 'string' && r.pixelsHex.length >= 2048
+                  ? hex2048ToPixels(r.pixelsHex)
+                  : Array.isArray(r.pixels) && r.pixels.length === 128 * 64
+                    ? r.pixels.map((p) => (p ? 1 : 0))
+                    : new Array<number>(128 * 64).fill(0);
+              return {
+                id: typeof r.id === 'string' && r.id.trim() ? r.id : `rx-imp-${Date.now()}-${idx}`,
+                name:
+                  typeof r.name === 'string' && r.name.trim()
+                    ? r.name.slice(0, 40)
+                    : `Restored Art ${idx + 1}`,
+                createdAt: Number(r.createdAt) || Date.now(),
+                pixels,
+                servoStyle: 'center',
+              };
+            })
+        : customReactions;
+
+      const nextPlaylist: PlaylistItem[] =
+        Array.isArray(parsed.playlist) && parsed.playlist.length > 0
+          ? parsed.playlist
+              .filter((p): p is Record<string, unknown> => Boolean(p && typeof p === 'object'))
+              .slice(0, 50)
+              .map((p, idx) => ({
+                id: typeof p.id === 'string' && p.id.trim() ? p.id : `pl-imp-${idx}`,
+                kind: (
+                  ['face', 'watch', 'weather', 'greeting', 'custom-bitmap', 'custom-text'] as const
+                ).includes(p.kind as PlaylistItem['kind'])
+                  ? (p.kind as PlaylistItem['kind'])
+                  : 'face',
+                label: typeof p.label === 'string' ? p.label.slice(0, 48) : 'Screen',
+                durationSec: Math.max(2, Math.min(300, Math.round(Number(p.durationSec) || 5))),
+                enabled: Boolean(p.enabled),
+                faceId: typeof p.faceId === 'number' ? Math.max(0, Math.min(24, p.faceId)) : 0,
+                customReactionId:
+                  typeof p.customReactionId === 'string' ? p.customReactionId : undefined,
+                textMessage: typeof p.textMessage === 'string' ? p.textMessage : undefined,
+              }))
+          : playlist;
+
+      const nextGallery: OledScreenshot[] = Array.isArray(parsed.galleryScreenshots)
+        ? parsed.galleryScreenshots
+            .filter((g): g is Record<string, unknown> => Boolean(g && typeof g === 'object'))
+            .slice(0, 40)
+            .map((g, idx) => ({
+              id: typeof g.id === 'string' && g.id.trim() ? g.id : `shot-imp-${Date.now()}-${idx}`,
+              title: typeof g.title === 'string' ? g.title.slice(0, 48) : 'Restored Capture',
+              screenKind: typeof g.screenKind === 'string' ? g.screenKind.slice(0, 24) : 'face',
+              oledScheme:
+                g.oledScheme === 'white' || g.oledScheme === 'dual-yellow-blue'
+                  ? g.oledScheme
+                  : 'ice-blue',
+              pixelsHex: String(g.pixelsHex || '').padEnd(2048, '0').slice(0, 2048),
+              capturedAtMs: Number(g.capturedAtMs) || Date.now(),
+            }))
+        : galleryScreenshots;
+
+      setMode(nextMode);
+      setSettings(nextSettings);
+      setLocation(nextLocation);
+      setHardware(nextHardware);
+      setAlarms(nextAlarms);
+      setCustomReactions(nextReactions);
+      setPlaylist(nextPlaylist);
+      setGalleryScreenshots(nextGallery);
+      setCloudEventSeq((s) => s + 1);
+
+      // Sync restored backup to Firebase Firestore if user is signed in
+      if (fbUser && fbUser.emailVerified && fbWorkspaceReady) {
+        try {
+          await saveWorkspaceToFirestore(fbUser.uid, {
+            mode: nextMode,
+            settings: nextSettings,
+            location: nextLocation,
+            hardware: nextHardware,
+            activeFaceId: activeScreen.faceId,
+          });
+          for (const al of nextAlarms.slice(0, 12)) {
+            await saveAlarmToFirestore(fbUser.uid, al);
+          }
+          for (const rx of nextReactions.slice(0, 20)) {
+            await saveReactionToFirestore(fbUser.uid, rx);
+          }
+          await savePlaylistToFirestore(fbUser.uid, nextPlaylist);
+          for (const shot of nextGallery.slice(0, 20)) {
+            await saveGalleryShotToFirestore(fbUser.uid, shot);
+          }
+        } catch (err) {
+          console.warn('Partial Firestore sync after backup restore:', err);
+        }
+      }
+
+      logInteraction(
+        'hardware',
+        `Restored JSON Backup (${nextAlarms.length} alarms, ${nextReactions.length} reactions)`,
+        'portal'
+      );
+
+      return {
+        ok: true,
+        message: `Restored backup: ${nextAlarms.length} alarm(s), ${nextReactions.length} custom reaction(s), ${nextPlaylist.length} playlist item(s), and ${nextGallery.length} gallery capture(s).`,
+      };
+    },
+    [
+      alarms,
+      customReactions,
+      playlist,
+      galleryScreenshots,
+      fbUser,
+      fbWorkspaceReady,
+      activeScreen.faceId,
+      logInteraction,
+    ]
+  );
 
   const currentSectionMeta = ALL_NAV_ITEMS.find((n) => n.id === navSection);
 
@@ -2227,10 +2470,16 @@ export default function App() {
             />
           )}
 
-          {/* 7. Dedicated WiFi & Hardware (with Vercel Cloud Anywhere Sync & OTA) */}
+          {/* 7. Dedicated WiFi & Hardware (with Vercel Cloud Anywhere Sync, OTA & JSON Backup) */}
           {navSection === 'hardware' && (
             <HardwarePanel
               hardware={hardware}
+              backupCounts={{
+                alarmsCount: alarms.length,
+                reactionsCount: customReactions.filter((r) => r.id !== 'live-touchpad-preview').length,
+                playlistCount: playlist.length,
+                galleryCount: galleryScreenshots.length,
+              }}
               onUpdateHardware={handleUpdateHardware}
               onChangeGreenLedMode={handleChangeGreenLedMode}
               onTestBuzzer={handleTestBuzzer}
@@ -2241,6 +2490,8 @@ export default function App() {
               onPushCloudState={() => pushStateToCloud(false)}
               onTriggerOtaUpdate={handleTriggerOtaUpdate}
               cloudSyncStatus={cloudSyncStatus}
+              onExportBackup={handleExportBackup}
+              onImportBackup={handleImportBackup}
             />
           )}
         </main>

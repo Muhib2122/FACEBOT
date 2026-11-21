@@ -41,15 +41,23 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
   const [cityQuery, setCityQuery] = useState('');
   const [searchResults, setSearchResults] = useState<LocationConfig[]>([]);
   const [searching, setSearching] = useState(false);
+  const [citySearchMsg, setCitySearchMsg] = useState<string | null>(null);
   const [gpsStatus, setGpsStatus] = useState<string | null>(null);
 
   const handleCitySearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!cityQuery.trim()) return;
     setSearching(true);
+    setCitySearchMsg(null);
     try {
       const results = await searchCityGeocoding(cityQuery);
       setSearchResults(results);
+      if (results.length === 0) {
+        setCitySearchMsg(`No matching city found for "${cityQuery.trim()}". Try another spelling.`);
+      }
+    } catch {
+      setSearchResults([]);
+      setCitySearchMsg('Could not reach Open-Meteo city search right now. Check internet connection.');
     } finally {
       setSearching(false);
     }
@@ -122,7 +130,7 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Proximity Wake Prefix
+                  Wake Greeting Prefix
                 </label>
                 <input
                   type="text"
@@ -273,7 +281,7 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
                 <div className="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-700">
                   <span className="font-semibold text-slate-900">Bot Auto Reaction: </span>
                   {weather.temperature <= settings.coldThresholdC
-                    ? 'Freezing Cold face (#4) + "Today is too cold!" banner + Shivering servo motion.'
+                    ? 'Freezing Cold face (#4) + "Today is too cold!" OLED banner + Piezo chime.'
                     : weather.temperature >= settings.hotThresholdC
                       ? 'Hot weather alert banner + Dizzy expression.'
                       : 'Nominal comfort range — Normal Blink, Happy, and Watch screens.'}
@@ -350,6 +358,10 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
           </button>
         </form>
 
+        {citySearchMsg && (
+          <p className="text-xs text-amber-700 mt-2.5">{citySearchMsg}</p>
+        )}
+
         {/* Search Results */}
         {searchResults.length > 0 && (
           <div className="mt-3 border border-slate-200 rounded-lg divide-y divide-slate-100">
@@ -420,9 +432,12 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
               type="number"
               step="0.0001"
               value={location.latitude}
-              onChange={(e) =>
-                onUpdateLocation({ ...location, latitude: Number(e.target.value) })
-              }
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) {
+                  onUpdateLocation({ ...location, latitude: Math.max(-90, Math.min(90, n)) });
+                }
+              }}
               className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg tabular-nums"
             />
           </div>
@@ -434,9 +449,12 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
               type="number"
               step="0.0001"
               value={location.longitude}
-              onChange={(e) =>
-                onUpdateLocation({ ...location, longitude: Number(e.target.value) })
-              }
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) {
+                  onUpdateLocation({ ...location, longitude: Math.max(-180, Math.min(180, n)) });
+                }
+              }}
               className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg tabular-nums"
             />
           </div>
@@ -447,9 +465,12 @@ export const WeatherProfilePanel: React.FC<WeatherProfilePanelProps> = ({
             <input
               type="number"
               value={location.altitude}
-              onChange={(e) =>
-                onUpdateLocation({ ...location, altitude: Number(e.target.value) })
-              }
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) {
+                  onUpdateLocation({ ...location, altitude: Math.max(-500, Math.min(9000, n)) });
+                }
+              }}
               className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg tabular-nums"
             />
           </div>

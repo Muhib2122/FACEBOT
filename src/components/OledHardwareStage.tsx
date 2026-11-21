@@ -327,7 +327,11 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
                 {isSleeping ? 'Sleeping' : 'Awake'}
               </div>
               <div className="text-[11px] text-slate-500">
-                {hardware.esp32Ip.trim() ? 'ESP32 Linked' : 'Simulator'}
+                {hardware.cloudSyncEnabled
+                  ? 'Vercel Cloud'
+                  : hardware.esp32Ip.trim()
+                    ? 'ESP32 Linked'
+                    : 'Simulator'}
               </div>
             </div>
           </div>

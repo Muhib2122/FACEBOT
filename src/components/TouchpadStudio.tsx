@@ -13,7 +13,7 @@ import {
   Type,
   Undo2,
 } from 'lucide-react';
-import { CustomReaction, OledColorScheme, ServoMotionStyle } from '../types';
+import { CustomReaction, OledColorScheme } from '../types';
 import {
   drawHeart,
   drawStar,
@@ -50,7 +50,6 @@ export const TouchpadStudio: React.FC<TouchpadStudioProps> = ({
   const [tool, setTool] = useState<'draw' | 'erase'>('draw');
   const [brushSize, setBrushSize] = useState<1 | 2 | 3>(2);
   const [reactionName, setReactionName] = useState('');
-  const [servoStyle, setServoStyle] = useState<ServoMotionStyle>('happy-sway');
   const [stampText, setStampText] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [renderTick, setRenderTick] = useState(0);
@@ -177,7 +176,7 @@ export const TouchpadStudio: React.FC<TouchpadStudioProps> = ({
       name,
       createdAt: Date.now(),
       pixels: Array.from(bufferRef.current.pixels),
-      servoStyle,
+      servoStyle: 'center',
     };
     onSaveReaction(reaction);
     onDisplayReaction(reaction);
@@ -186,9 +185,14 @@ export const TouchpadStudio: React.FC<TouchpadStudioProps> = ({
 
   const handleLoadIntoCanvas = (reaction: CustomReaction) => {
     pushHistory();
-    bufferRef.current.pixels.set(reaction.pixels);
+    bufferRef.current.clearDisplay();
+    if (Array.isArray(reaction.pixels) && reaction.pixels.length > 0) {
+      const len = Math.min(reaction.pixels.length, OLED_WIDTH * OLED_HEIGHT);
+      for (let i = 0; i < len; i++) {
+        bufferRef.current.pixels[i] = reaction.pixels[i] ? 1 : 0;
+      }
+    }
     setReactionName(reaction.name);
-    setServoStyle(reaction.servoStyle);
     setRenderTick((t) => t + 1);
   };
 
@@ -327,6 +331,12 @@ export const TouchpadStudio: React.FC<TouchpadStudioProps> = ({
                   maxLength={18}
                   value={stampText}
                   onChange={(e) => setStampText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleStampText();
+                    }
+                  }}
                   placeholder="e.g. HI MUHIB!"
                   className="flex-1 px-3 py-2 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                 />
@@ -356,23 +366,9 @@ export const TouchpadStudio: React.FC<TouchpadStudioProps> = ({
                   className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                 />
               </div>
-              <div>
-                <label className="block text-[11px] text-slate-500 mb-1">
-                  Paired Servo Head Motion
-                </label>
-                <select
-                  value={servoStyle}
-                  onChange={(e) => setServoStyle(e.target.value as ServoMotionStyle)}
-                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-white"
-                >
-                  <option value="happy-sway">Happy Sway (70° ↔ 110°)</option>
-                  <option value="surprised-tilt">Surprised Tilt</option>
-                  <option value="angry-shake">Rapid Shake</option>
-                  <option value="sleepy-droop">Sleepy Tilt</option>
-                  <option value="look-around">Look Around</option>
-                  <option value="center">Center (90°)</option>
-                </select>
-              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Saved drawings are stored in Firebase Cloud and pushed instantly as a 128×64 monochrome bitmap to your ESP32 OLED.
+              </p>
               <button
                 onClick={handleSave}
                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors"
@@ -446,7 +442,12 @@ const SavedReactionCard: React.FC<SavedReactionCardProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const buf = new SSD1306Buffer();
-    buf.pixels.set(reaction.pixels);
+    if (Array.isArray(reaction.pixels) && reaction.pixels.length > 0) {
+      const len = Math.min(reaction.pixels.length, OLED_WIDTH * OLED_HEIGHT);
+      for (let i = 0; i < len; i++) {
+        buf.pixels[i] = reaction.pixels[i] ? 1 : 0;
+      }
+    }
     paintBufferToCanvas(ctx, buf, scheme, 2, false);
   }, [reaction, scheme]);
 
@@ -463,8 +464,8 @@ const SavedReactionCard: React.FC<SavedReactionCardProps> = ({
           <div className="text-xs font-semibold text-slate-900 truncate">
             {reaction.name}
           </div>
-          <div className="text-[11px] text-slate-500 capitalize">
-            {reaction.servoStyle.replace('-', ' ')}
+          <div className="text-[11px] text-slate-500 font-mono">
+            128×64 OLED Bitmap
           </div>
         </div>
         <div className="flex items-center gap-1 shrink-0">
