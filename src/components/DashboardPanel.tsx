@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CartesianGrid,
   Line,
@@ -29,6 +29,11 @@ import {
   NavSection,
   WeatherData,
 } from '../types';
+import {
+  drawTimerScreen,
+  paintBufferToCanvas,
+  SSD1306Buffer,
+} from '../utils/oledRenderer';
 
 interface DashboardPanelProps {
   events: InteractionEvent[];
@@ -42,12 +47,14 @@ interface DashboardPanelProps {
   hardware: HardwareConfig;
   isSleeping: boolean;
   greenLedOn: boolean;
+  frame: number;
   pomodoroSecondsLeft: number;
+  pomodoroTotalSec: number;
   pomodoroRunning: boolean;
   pomodoroLabel: string;
   onSyncEsp32Stats: () => Promise<void>;
   onResetStats: () => void;
-  onStartPomodoro: (minutes: number, label: string) => void;
+  onStartPomodoro: (totalSeconds: number, label: string) => void;
   onTogglePomodoro: () => void;
   onResetPomodoro: () => void;
   onNavigate: (section: NavSection) => void;
@@ -84,7 +91,9 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
   hardware,
   isSleeping,
   greenLedOn,
+  frame,
   pomodoroSecondsLeft,
+  pomodoroTotalSec,
   pomodoroRunning,
   pomodoroLabel,
   onSyncEsp32Stats,
@@ -97,6 +106,42 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [syncing, setSyncing] = useState(false);
+  const [customMinutes, setCustomMinutes] = useState('15');
+  const [customSeconds, setCustomSeconds] = useState('0');
+  const timerCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const timerBufferRef = useRef<SSD1306Buffer>(new SSD1306Buffer());
+
+  useEffect(() => {
+    const canvas = timerCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    drawTimerScreen(
+      timerBufferRef.current,
+      pomodoroLabel,
+      pomodoroSecondsLeft,
+      Math.max(1, pomodoroTotalSec),
+      !pomodoroRunning,
+      frame
+    );
+    paintBufferToCanvas(ctx, timerBufferRef.current, hardware.oledScheme, 2, true);
+  }, [
+    pomodoroLabel,
+    pomodoroSecondsLeft,
+    pomodoroTotalSec,
+    pomodoroRunning,
+    frame,
+    hardware.oledScheme,
+  ]);
+
+  const handleStartCustomTimer = (e: React.FormEvent) => {
+    e.preventDefault();
+    const mins = Math.max(0, Math.min(180, Math.floor(Number(customMinutes) || 0)));
+    const secs = Math.max(0, Math.min(59, Math.floor(Number(customSeconds) || 0)));
+    const total = mins * 60 + secs;
+    if (total < 5) return;
+    onStartPomodoro(total, 'CUSTOM');
+  };
 
   const filteredEvents = useMemo(() => {
     return events.filter((ev) => {
@@ -450,41 +495,92 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
                 OLED Focus Timer
               </h3>
             </div>
-            <span className="text-xs text-slate-500">{pomodoroLabel}</span>
+            <span className="text-xs font-medium text-slate-500">
+              {pomodoroRunning ? 'Running' : 'Ready'} · {pomodoroLabel}
+            </span>
           </div>
 
-          <div className="text-center py-2">
-            <div className="text-4xl font-bold font-mono text-slate-900 tabular-nums tracking-tight">
+          {/* Live Smooth 24-FPS OLED Timer Preview */}
+          <div className="rounded-xl bg-slate-950 p-2.5 flex flex-col items-center justify-center border border-slate-800">
+            <canvas
+              ref={timerCanvasRef}
+              className="w-full max-w-[256px] aspect-[2/1] rounded-md"
+              style={{ imageRendering: 'pixelated' }}
+            />
+          </div>
+
+          <div className="text-center">
+            <div className="text-3xl font-bold font-mono text-slate-900 tabular-nums tracking-tight">
               {formatClockMmSs(pomodoroSecondsLeft)}
             </div>
-            <p className="text-xs text-slate-500 mt-1.5">
-              Pushes live countdown to OLED + rings buzzer when done
+            <p className="text-xs text-slate-500 mt-1">
+              Smooth 1s wall-clock countdown + buzzer chime when finished
             </p>
           </div>
 
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-4 gap-1.5">
             <button
               type="button"
-              onClick={() => onStartPomodoro(25, 'FOCUS')}
-              className="py-2 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
+              onClick={() => onStartPomodoro(60, '1M TEST')}
+              className="py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
             >
-              25m Focus
+              1m
             </button>
             <button
               type="button"
-              onClick={() => onStartPomodoro(10, 'STUDY')}
-              className="py-2 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
+              onClick={() => onStartPomodoro(5 * 60, 'BREAK')}
+              className="py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
             >
-              10m Sprint
+              5m
             </button>
             <button
               type="button"
-              onClick={() => onStartPomodoro(5, 'BREAK')}
-              className="py-2 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
+              onClick={() => onStartPomodoro(10 * 60, 'STUDY')}
+              className="py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
             >
-              5m Break
+              10m
+            </button>
+            <button
+              type="button"
+              onClick={() => onStartPomodoro(25 * 60, 'FOCUS')}
+              className="py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
+            >
+              25m
             </button>
           </div>
+
+          <form onSubmit={handleStartCustomTimer} className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1 flex-1">
+              <input
+                type="number"
+                min={0}
+                max={180}
+                value={customMinutes}
+                onChange={(e) => setCustomMinutes(e.target.value)}
+                aria-label="Custom timer minutes"
+                className="w-full px-2 py-1.5 text-xs font-mono border border-slate-200 rounded-lg text-center focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+                placeholder="Min"
+              />
+              <span className="text-xs font-bold text-slate-400">m</span>
+              <input
+                type="number"
+                min={0}
+                max={59}
+                value={customSeconds}
+                onChange={(e) => setCustomSeconds(e.target.value)}
+                aria-label="Custom timer seconds"
+                className="w-full px-2 py-1.5 text-xs font-mono border border-slate-200 rounded-lg text-center focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+                placeholder="Sec"
+              />
+              <span className="text-xs font-bold text-slate-400">s</span>
+            </div>
+            <button
+              type="submit"
+              className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors whitespace-nowrap"
+            >
+              Set &amp; Go
+            </button>
+          </form>
 
           <div className="flex items-center gap-2 pt-1">
             <button
@@ -500,7 +596,9 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
               ) : (
                 <>
                   <Play className="w-3.5 h-3.5" />
-                  Start on OLED
+                  {pomodoroSecondsLeft < pomodoroTotalSec && pomodoroSecondsLeft > 0
+                    ? 'Resume Timer'
+                    : 'Start on OLED'}
                 </>
               )}
             </button>

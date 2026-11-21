@@ -1083,7 +1083,7 @@ export function drawWifiStatusScreen(
 
 export function generateWifiStatusPixels(connected: boolean): number[] {
   const buf = new SSD1306Buffer();
-  drawWifiStatusScreen(buf, connected, 10);
+  drawWifiStatusScreen(buf, connected, 15);
   return Array.from(buf.pixels);
 }
 
