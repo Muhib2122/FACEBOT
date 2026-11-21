@@ -171,7 +171,7 @@ bool   buzzerActiveMode     = false;
 volatile bool pendingBuzzer = false;
 String pendingBuzzerMode    = "tone";
 
-// -------- #1 TOP-PRIORITY 5-Second WiFi ON/OFF Hardware Alert (OLED + Buzzer + Green LED) --------
+// -------- #1 TOP-PRIORITY 3-Second WiFi Connected Hardware Alert (OLED + Buzzer + Green LED) --------
 volatile int  wifiEventPending      = 0;     // 0=none, 1=WiFi ON, 2=WiFi OFF (set from WiFi.onEvent)
 volatile bool wifiWasConnected      = false;
 bool          lastLoopWifiConnected = false;
@@ -276,11 +276,11 @@ void loadOfflineCacheFromNvs() {
 void onEsp32WifiEvent(WiFiEvent_t event) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
     wifiWasConnected = true;
-    wifiEventPending = 1; // Triggers 5s WiFi ON OLED + Buzzer + Green LED on Core 1!
+    wifiEventPending = 1; // Triggers 3s WiFi Connected OLED + Buzzer + Green LED on Core 1!
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     if (wifiWasConnected) {
       wifiWasConnected = false;
-      wifiEventPending = 2; // Triggers 5s WiFi OFF OLED + Buzzer + Green LED + Auto Mode on Core 1!
+      wifiEventPending = 2; // Silently switches to Auto Mode on Core 1 (zero WiFi OFF alert)
     }
   }
 }
@@ -373,7 +373,7 @@ void decodeHexBitmap(const String& hex) {
 void updateGreenLed() {
   bool ledOn = false;
   if (wifiAlertActive) {
-    // #1 TOP PRIORITY: Fast unmistakable Green LED notification blink for full 5s on WiFi ON / OFF!
+    // #1 TOP PRIORITY: Fast unmistakable Green LED notification blink for exact 3s on WiFi Connected!
     ledOn = ((millis() / 110UL) % 2 == 0);
   } else if (greenLedMode == "on") ledOn = true;
   else if (greenLedMode == "off") ledOn = false;
@@ -898,7 +898,7 @@ void drawWifiStatusOled(bool connected, int frame) {
     display.setCursor(58, 22);
     display.print("CONNECTED");
     display.setCursor(58, 34);
-    display.print("USER UNLOCK");
+    display.print("AUTO MODE");
   } else {
     // Bold flashing WiFi OFF icon with diagonal slash
     bool flash = ((frame / 4) % 2 == 0);
@@ -1086,11 +1086,12 @@ void pollVercelCloudOnce(WiFiClientSecure& sharedClient) {
       }
 
       if (upd > 0 && upd != lastCloudUpdatedAt) {
+        bool isFirstSync = (lastCloudUpdatedAt == 0);
         lastCloudUpdatedAt = upd;
         logEspInteraction();
 
-        String newMode   = String(doc["mode"] | "auto");
-        String newScreen = String(doc["screen"] | "auto");
+        String newMode   = isFirstSync ? "auto" : String(doc["mode"] | "auto");
+        String newScreen = isFirstSync ? "auto" : String(doc["screen"] | "auto");
         int    newFace   = doc["faceId"] | currentFace;
         String newL1     = String(doc["textLine1"] | "");
         String newL2     = String(doc["textLine2"] | "");
