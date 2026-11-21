@@ -868,17 +868,34 @@ void cloudSyncTask(void* param) {
   unsigned long lastWeatherMs = 0;
   unsigned long lastReconnectAttemptMs = millis();
   bool otaCheckedOnce = false;
+  bool lastWifiConnected = (WiFi.status() == WL_CONNECTED);
 
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED) {
+    bool wifiNow = (WiFi.status() == WL_CONNECTED);
+
+    // Detect WiFi ON / OFF transition natively -> 5s top-priority buzzer + offline Auto Mode fallback
+    if (wifiNow != lastWifiConnected) {
+      lastWifiConnected = wifiNow;
+      if (!wifiNow) {
+        botMode = "auto";
+        screenLocked = false;
+        pendingBuzzerMode = "alarm";
+        pendingBuzzer = true;
+        Serial.println("[WiFi] Lost connection -> Auto Mode active (cached weather & alarms)");
+      } else {
+        pendingBuzzerMode = "happy";
+        pendingBuzzer = true;
+        Serial.println("[WiFi] Connected! IP=" + WiFi.localIP().toString() + " -> User Mode unlocked");
+      }
+    }
+
+    if (!wifiNow) {
       cloudOnline = false;
-      // Wait 15 seconds between clean reconnect attempts (prevents "sta is connecting, return error"!)
-      if (millis() - lastReconnectAttemptMs >= 15000UL) {
+      // Clean non-destructive reconnect every 12s (never interrupts active association!)
+      if (millis() - lastReconnectAttemptMs >= 12000UL) {
         lastReconnectAttemptMs = millis();
-        Serial.println("[WiFi] Reconnecting cleanly to SSID: " + wifiSsid);
-        WiFi.disconnect(false);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+        Serial.println("[WiFi] Auto-reconnecting to SSID: " + wifiSsid);
+        WiFi.reconnect();
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
@@ -1088,13 +1105,14 @@ void setup() {
 
 ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0, true, 1, 0, "Good Morning" }; alarmCount = 1;'}
 
-  // Clean WiFi Init (Prevents "wifi:sta is connecting, return error" on ESP32 Core 3.x!)
+  // Ultra-Stable Always-On WiFi Init (Zero Power-Save Sleep, Max TX Power, Never Times Out!)
   WiFi.disconnect(true, true);
   delay(200);
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
   Serial.println("[WiFi] Connecting to 2.4GHz SSID: " + wifiSsid);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());

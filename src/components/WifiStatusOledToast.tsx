@@ -56,7 +56,7 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
           )}
           <div className="min-w-0">
             <div className="text-xs font-bold tracking-tight truncate">
-              {connected ? 'WiFi Connected · Synced' : 'WiFi OFF · Auto Mode'}
+              {connected ? 'WiFi ON · User Mode Unlocked' : 'WiFi OFF · Auto Mode Only'}
             </div>
             <div className="text-[11px] text-slate-400 tabular-nums">
               Priority OLED · Buzzer ON · {secondsLeft}s

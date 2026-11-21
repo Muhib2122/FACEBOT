@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Clock,
   CloudSun,
+  Lock,
   MessageSquare,
   Plus,
   Search,
@@ -51,6 +52,7 @@ const MiniFacePreview: React.FC<MiniFacePreviewProps> = ({ faceId, scheme, activ
 
 interface ControlPanelProps {
   mode: BotMode;
+  esp32Online: boolean;
   activeScreen: ActiveScreenState;
   oledScheme: OledColorScheme;
   playlist: PlaylistItem[];
@@ -64,6 +66,7 @@ interface ControlPanelProps {
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
   mode,
+  esp32Online,
   activeScreen,
   oledScheme,
   playlist,
@@ -170,22 +173,34 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
                 Auto Mode
               </button>
               <button
-                onClick={() => onChangeMode('user')}
-                className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
-                  mode === 'user'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
+                type="button"
+                disabled={!esp32Online}
+                onClick={() => esp32Online && onChangeMode('user')}
+                title={
+                  esp32Online
+                    ? 'Switch to User Mode custom playlist'
+                    : 'ESP32 Offline — User Mode is locked until WiFi reconnects'
+                }
+                className={`inline-flex items-center gap-1 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+                  !esp32Online
+                    ? 'text-slate-400 cursor-not-allowed opacity-60'
+                    : mode === 'user'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
+                {!esp32Online && <Lock className="w-3 h-3" />}
                 User Mode
               </button>
             </div>
           </div>
 
           <p className="text-xs text-slate-600 mt-3 leading-relaxed">
-            {mode === 'auto'
-              ? 'Auto Mode cycles Watch UI, live WiFi weather (with automatic cold-weather shivering reactions), time-based personal greetings, and all 25 animated faces.'
-              : 'User Mode follows your custom screen playlist below, holding each selected screen or face for the exact duration you specify.'}
+            {!esp32Online
+              ? 'ESP32 Bot is Offline — User Mode is locked. Bot automatically runs Auto Mode using previously synced weather, alarms, clock, and face reactions until WiFi reconnects.'
+              : mode === 'auto'
+                ? 'Auto Mode cycles Watch UI, live WiFi weather (with automatic cold-weather shivering reactions), time-based personal greetings, and all 25 animated faces.'
+                : 'User Mode follows your custom screen playlist below, holding each selected screen or face for the exact duration you specify.'}
           </p>
 
           <div className="flex flex-wrap items-center gap-2 mt-4 pt-4 border-t border-slate-100">
@@ -281,10 +296,22 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           </div>
           {mode !== 'user' && (
             <button
-              onClick={() => onChangeMode('user')}
-              className="px-3 py-1.5 text-xs font-semibold text-blue-600 border border-blue-200 hover:bg-blue-50 rounded-lg transition-colors whitespace-nowrap"
+              type="button"
+              disabled={!esp32Online}
+              onClick={() => esp32Online && onChangeMode('user')}
+              title={
+                esp32Online
+                  ? 'Activate User Mode custom playlist'
+                  : 'ESP32 Offline — Connect WiFi to unlock User Mode'
+              }
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border rounded-lg transition-colors whitespace-nowrap ${
+                esp32Online
+                  ? 'text-blue-600 border-blue-200 hover:bg-blue-50'
+                  : 'text-slate-400 border-slate-200 bg-slate-50 cursor-not-allowed'
+              }`}
             >
-              Activate User Mode
+              {!esp32Online && <Lock className="w-3 h-3" />}
+              {esp32Online ? 'Activate User Mode' : 'User Mode Locked (Offline)'}
             </button>
           )}
         </div>

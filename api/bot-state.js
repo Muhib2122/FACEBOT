@@ -6,7 +6,7 @@
 // - Server computes smooth live Focus Timer MM:SS from timerEndAtMs on every ESP32 GET so ESP32 never freezes even if browser sleeps!
 
 const deviceStore = new Map();
-const ESP32_OFFLINE_THRESHOLD_MS = 10000; // Offline if ESP32 hasn't polled for >10s
+const ESP32_OFFLINE_THRESHOLD_MS = 30000; // 30s grace window prevents false 10s timeouts during TLS/weather fetches
 
 function createDefaultState(deviceId) {
   return {

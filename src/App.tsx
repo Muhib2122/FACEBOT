@@ -9,6 +9,7 @@ import {
   Cpu,
   Film,
   Image as ImageIcon,
+  Lock,
   LogIn,
   LogOut,
   Menu,
@@ -389,11 +390,13 @@ export default function App() {
   );
   const isOnlineRef = useRef<boolean>(isOnline);
   isOnlineRef.current = isOnline;
-  // Real Physical ESP32 Bot WiFi Online / Offline State (from live /api/bot-state polling heartbeat)
+  // Real Physical ESP32 Bot WiFi Online / Offline State (with 30s anti-flap & cold-lambda shield — ZERO 10s false timeouts!)
   const [esp32Online, setEsp32Online] = useState<boolean>(false);
   const [esp32LastSeenAt, setEsp32LastSeenAt] = useState<number>(0);
   const esp32OnlineRef = useRef<boolean>(false);
   const esp32StatusInitializedRef = useRef<boolean>(false);
+  const lastConfirmedEsp32SeenAtRef = useRef<number>(0);
+  const missedHeartbeatCountRef = useRef<number>(0);
   const [wifiOverlay, setWifiOverlay] = useState<{ connected: boolean; secondsLeft: number } | null>(null);
   const wifiOverlayIntervalRef = useRef<number | null>(null);
   const [globalSyncing, setGlobalSyncing] = useState(false);
@@ -1433,15 +1436,35 @@ export default function App() {
     });
   }, []);
 
-  // Apply REAL ESP32 Bot Online / Offline State Transition (triggers 10s WiFi Emoji on real ESP32 connect/disconnect!)
+  // Apply REAL ESP32 Bot Online / Offline State Transition (triggers 5s Priority WiFi OLED + 5s Buzzer!)
   const applyEsp32OnlineState = useCallback(
-    (nextOnline: boolean, lastSeenAt?: number) => {
-      if (typeof lastSeenAt === 'number' && lastSeenAt > 0) {
-        setEsp32LastSeenAt(lastSeenAt);
+    (nextOnline: boolean, lastSeenAt?: number, forceImmediate = false) => {
+      const nowMs = Date.now();
+      if (nextOnline) {
+        lastConfirmedEsp32SeenAtRef.current = nowMs;
+        missedHeartbeatCountRef.current = 0;
+        if (typeof lastSeenAt === 'number' && lastSeenAt > 0) {
+          setEsp32LastSeenAt(lastSeenAt);
+        } else {
+          setEsp32LastSeenAt(nowMs);
+        }
+      } else if (!forceImmediate && esp32OnlineRef.current) {
+        // Anti-flap & Vercel multi-instance shield: never drop offline after a single 10s hiccup or cold lambda!
+        missedHeartbeatCountRef.current += 1;
+        const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
+        if (msSinceConfirmed < 28000 || missedHeartbeatCountRef.current < 5) {
+          return;
+        }
       }
+
       const prevOnline = esp32OnlineRef.current;
       esp32OnlineRef.current = nextOnline;
       setEsp32Online(nextOnline);
+
+      if (!nextOnline) {
+        // Strictly lock bot into Auto Mode while ESP32 WiFi is offline (cached weather & alarms remain active)
+        setMode('auto');
+      }
 
       if (!esp32StatusInitializedRef.current) {
         esp32StatusInitializedRef.current = true;
@@ -1455,17 +1478,24 @@ export default function App() {
     [triggerWifiStatusScreen]
   );
 
-  // Poll Real ESP32 Bot Heartbeat from /api/bot-state?source=portal (Online when ESP32 polled within 10s, Offline when WiFi drops)
+  // Strict Offline Auto-Mode Lock: prevent User Mode from ever staying active while ESP32 is Offline
+  useEffect(() => {
+    if (!esp32Online && mode !== 'auto') {
+      setMode('auto');
+    }
+  }, [esp32Online, mode]);
+
+  // Poll Real ESP32 Bot Heartbeat from /api/bot-state?source=portal (30s grace window — ZERO false 10s timeouts!)
   const pollEsp32Heartbeat = useCallback(async () => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       isOnlineRef.current = false;
       setIsOnline(false);
-      applyEsp32OnlineState(false);
+      applyEsp32OnlineState(false, 0, true);
       return false;
     }
 
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 3500);
+    const timeoutId = window.setTimeout(() => controller.abort(), 4500);
     try {
       const endpoint = getBotStateEndpoint('source=portal');
       const res = await fetch(endpoint, {
@@ -1483,7 +1513,7 @@ export default function App() {
         const online = Boolean(data?.esp32Online);
         const lastSeen = typeof data?.esp32LastSeenAt === 'number' ? data.esp32LastSeenAt : 0;
         applyEsp32OnlineState(online, lastSeen);
-        return online;
+        return esp32OnlineRef.current;
       }
     } catch {
       window.clearTimeout(timeoutId);
@@ -1505,7 +1535,7 @@ export default function App() {
       setIsOnline(false);
       applyEsp32OnlineState(false);
     }
-    return false;
+    return esp32OnlineRef.current;
   }, [getBotStateEndpoint, hardware.esp32Ip, applyEsp32OnlineState]);
 
   // Automatic Real-Time ESP32 Bot WiFi Online / Offline Monitor (2.5s heartbeat + browser online/offline listeners)
@@ -1615,6 +1645,12 @@ export default function App() {
 
   const handleGlobalModeSwitch = useCallback(
     (nextMode: BotMode) => {
+      // Strictly block User Mode while ESP32 Bot WiFi is Offline
+      if (nextMode === 'user' && !esp32OnlineRef.current) {
+        playShortClick(hardware.buzzerMuted);
+        setMode('auto');
+        return;
+      }
       if (mode === nextMode) return;
       setMode(nextMode);
       playShortClick(hardware.buzzerMuted);
@@ -2295,9 +2331,14 @@ export default function App() {
       const faceDef = FACE_DEFINITIONS.find((f) => f.id === clampedFace);
 
       if (action.targetMode === 'auto' || action.targetMode === 'user') {
-        setMode(action.targetMode);
-        sendToEsp32(`/api/mode?mode=${action.targetMode}`);
-        badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
+        if (action.targetMode === 'user' && !esp32OnlineRef.current) {
+          setMode('auto');
+          badges.push('User Mode Locked (ESP32 Offline)');
+        } else {
+          setMode(action.targetMode);
+          sendToEsp32(`/api/mode?mode=${action.targetMode}`);
+          badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
+        }
       }
 
       if (action.screenKind === 'sleep') {
@@ -3147,13 +3188,22 @@ export default function App() {
                 </button>
                 <button
                   type="button"
+                  disabled={!esp32Online}
                   onClick={() => handleGlobalModeSwitch('user')}
-                  className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
-                    mode === 'user'
-                      ? 'bg-slate-900 text-white shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
+                  title={
+                    esp32Online
+                      ? 'Switch to User Mode custom playlist'
+                      : 'ESP32 Offline — User Mode is locked until WiFi reconnects'
+                  }
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+                    !esp32Online
+                      ? 'text-slate-400 cursor-not-allowed opacity-60'
+                      : mode === 'user'
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
+                  {!esp32Online && <Lock className="w-3 h-3" />}
                   User Mode
                 </button>
               </div>
@@ -3366,16 +3416,12 @@ export default function App() {
 
               <ControlPanel
                 mode={mode}
+                esp32Online={esp32Online}
                 activeScreen={activeScreen}
                 oledScheme={hardware.oledScheme}
                 playlist={playlist}
                 customReactions={customReactions}
-                onChangeMode={(nextMode) => {
-                  setMode(nextMode);
-                  setActiveScreen((prev) => ({ ...prev, locked: false }));
-                  sendToEsp32(`/api/mode?mode=${nextMode}`);
-                  logInteraction('oled-face', `Switched to ${nextMode.toUpperCase()} Mode`, 'portal');
-                }}
+                onChangeMode={handleGlobalModeSwitch}
                 onSelectFace={handleSelectFace}
                 onSelectSpecialScreen={handleSelectSpecialScreen}
                 onSendQuickText={handleSendQuickText}
