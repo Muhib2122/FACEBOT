@@ -172,7 +172,7 @@ app.options('/api/bot-state', (_req, res) => {
   res.status(200).end();
 });
 
-const ESP32_OFFLINE_THRESHOLD_MS = 16000;
+const ESP32_OFFLINE_THRESHOLD_MS = 12000;
 
 function createDefaultDeviceState(deviceId: string): Record<string, unknown> {
   return {

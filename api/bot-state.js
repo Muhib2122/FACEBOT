@@ -5,8 +5,40 @@
 // - Portal polls GET /api/bot-state?device=<id>&source=portal to inspect live ESP32 Online/Offline status without faking a heartbeat.
 // - Server computes smooth live Focus Timer MM:SS from timerEndAtMs on every ESP32 GET so ESP32 never freezes even if browser sleeps!
 
+import fs from 'node:fs';
+
 const deviceStore = new Map();
-const ESP32_OFFLINE_THRESHOLD_MS = 16000; // 16s grace window: survives TLS/weather fetches with zero 10s false drops, detects real WiFi OFF fast
+const ESP32_OFFLINE_THRESHOLD_MS = 12000; // 12s grace window (~10 missed 1.2s polls): zero false timeouts, fast real WiFi OFF detection
+
+function getTmpStatePath(deviceId) {
+  const safe = String(deviceId || 'muhib-bot-1').replace(/[^a-zA-Z0-9_-]/g, '');
+  return `/tmp/facebot_state_${safe || 'default'}.json`;
+}
+
+function loadDeviceState(deviceId) {
+  const mem = deviceStore.get(deviceId);
+  if (mem) return mem;
+  try {
+    const raw = fs.readFileSync(getTmpStatePath(deviceId), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      deviceStore.set(deviceId, parsed);
+      return parsed;
+    }
+  } catch {
+    // Cold start or no cached file yet
+  }
+  return null;
+}
+
+function saveDeviceState(deviceId, state) {
+  deviceStore.set(deviceId, state);
+  try {
+    fs.writeFileSync(getTmpStatePath(deviceId), JSON.stringify(state), 'utf8');
+  } catch {
+    // Ignore read-only fs errors
+  }
+}
 
 function createDefaultState(deviceId) {
   return {
@@ -106,7 +138,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Malformed JSON body.' });
     }
 
-    const prev = deviceStore.get(deviceId) || createDefaultState(deviceId);
+    const prev = loadDeviceState(deviceId) || createDefaultState(deviceId);
     const payload = {
       ...prev,
       ...body,
@@ -116,7 +148,7 @@ export default async function handler(req, res) {
       esp32PollCount: prev.esp32PollCount || 0,
       updatedAt: nowMs,
     };
-    deviceStore.set(deviceId, payload);
+    saveDeviceState(deviceId, payload);
 
     const esp32Online =
       payload.esp32LastSeenAt > 0 && nowMs - payload.esp32LastSeenAt < ESP32_OFFLINE_THRESHOLD_MS;
@@ -133,17 +165,17 @@ export default async function handler(req, res) {
   const source = String((req.query && req.query.source) || '').toLowerCase();
   const isPortalStatusCheck = source === 'portal';
 
-  let existing = deviceStore.get(deviceId);
+  let existing = loadDeviceState(deviceId);
   if (!existing) {
     existing = createDefaultState(deviceId);
-    deviceStore.set(deviceId, existing);
+    saveDeviceState(deviceId, existing);
   }
 
   // Record REAL ESP32 heartbeat ONLY when the ESP32 hardware polls (not portal status checks)
   if (!isPortalStatusCheck) {
     existing.esp32LastSeenAt = nowMs;
     existing.esp32PollCount = (existing.esp32PollCount || 0) + 1;
-    deviceStore.set(deviceId, existing);
+    saveDeviceState(deviceId, existing);
   }
 
   const resolved = resolveLiveTimerState(existing, nowMs);

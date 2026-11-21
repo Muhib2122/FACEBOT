@@ -41,7 +41,7 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
     <div
       role="status"
       aria-live="polite"
-      className="fixed bottom-4 right-4 z-50 w-[300px] sm:w-[324px] bg-slate-950 text-white border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden"
+      className="fixed bottom-4 right-4 z-[70] w-[300px] sm:w-[324px] bg-slate-950 text-white border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden"
     >
       <div className="px-3.5 py-2.5 flex items-center justify-between gap-2 border-b border-slate-800">
         <div className="flex items-center gap-2 min-w-0">

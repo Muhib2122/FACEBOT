@@ -62,7 +62,7 @@ export function generateEsp32Firmware(
     ? safeFirebaseUrl
     : `${safeCloudBase}/api/bot-state?device=${safeDeviceId}`;
   const otaVersionUrl = `${safeCloudBase}/ota/version.json`;
-  const fwVersion = (hardware.firmwareVersion || '4.0.0').replace(/"/g, '');
+  const fwVersion = (hardware.firmwareVersion || '4.1.0').replace(/"/g, '');
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -155,29 +155,33 @@ int       ringingAlarmIdx  = -1;
 int       lastTriggeredMin = -1;
 
 // -------- Shared Bot Runtime State (Synced via Vercel Cloud & Local LAN) --------
-String botMode          = "auto";
-String activeScreen     = "face";
-String customLine1      = "Hi ${safeUser}!";
-String customLine2      = "";
-String greenLedMode     = "auto"; // "auto", "on", "off", "blink"
-int    currentFace      = 0;
-int    frameCount       = 0;
-bool   screenLocked     = false;
-bool   isSleeping       = false;
-bool   buzzerActiveMode = false;
+String botMode              = "auto";
+String preferredOnlineMode  = "auto"; // Automatically restored when WiFi reconnects!
+String activeScreen         = "face";
+String customLine1          = "Hi ${safeUser}!";
+String customLine2          = "";
+String greenLedMode         = "auto"; // "auto", "on", "off", "blink"
+int    currentFace          = 0;
+int    frameCount           = 0;
+bool   screenLocked         = false;
+bool   isSleeping           = false;
+bool   buzzerActiveMode     = false;
 
 // Pending buzzer trigger from Core 0 Cloud Sync -> executed smoothly on Core 1
 volatile bool pendingBuzzer = false;
 String pendingBuzzerMode    = "tone";
 
 // -------- #1 TOP-PRIORITY 5-Second WiFi ON/OFF Hardware Alert (OLED + Buzzer + Green LED) --------
-volatile int  wifiEventPending    = 0;     // 0=none, 1=WiFi ON, 2=WiFi OFF (set from WiFi.onEvent)
-volatile bool wifiWasConnected    = false;
-bool          wifiAlertActive     = false;
-bool          wifiAlertConnected  = false;
-unsigned long wifiAlertStartMs    = 0;
-unsigned long wifiAlertUntilMs    = 0;
-unsigned long lastWifiAlertBeepMs = 0;
+volatile int  wifiEventPending      = 0;     // 0=none, 1=WiFi ON, 2=WiFi OFF (set from WiFi.onEvent)
+volatile bool wifiWasConnected      = false;
+bool          lastLoopWifiConnected = false;
+bool          wifiAlertActive       = false;
+bool          wifiAlertConnected    = false;
+unsigned long wifiAlertStartMs      = 0;
+unsigned long wifiAlertUntilMs      = 0;
+unsigned long lastWifiAlertBeepMs   = 0;
+unsigned long lastWifiAlertFiredMs  = 0;
+bool          lastWifiAlertState    = false;
 
 // -------- Native 24-FPS Smooth Focus Timer State (Zero 1.2s Stutter!) --------
 bool          localTimerActive    = false;
@@ -281,34 +285,59 @@ void onEsp32WifiEvent(WiFiEvent_t event) {
   }
 }
 
+// Forward declarations so triggerWifiAlert5s can paint OLED + LED at millisecond 0!
+void updateGreenLed();
+void drawWifiStatusOled(bool connected, int frame);
+
 void triggerWifiAlert5s(bool connected) {
+  unsigned long nowMs = millis();
+  // Deduplicate if both WiFi.onEvent and 250ms loop watcher detect the exact same transition
+  if (lastWifiAlertFiredMs > 0 && lastWifiAlertState == connected && (nowMs - lastWifiAlertFiredMs) < 1500UL) {
+    return;
+  }
+  lastWifiAlertFiredMs = nowMs;
+  lastWifiAlertState   = connected;
+  lastLoopWifiConnected = connected;
+
   if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     wifiAlertActive     = true;
     wifiAlertConnected  = connected;
-    wifiAlertStartMs    = millis();
-    wifiAlertUntilMs    = wifiAlertStartMs + 5000UL;
+    wifiAlertStartMs    = nowMs;
+    wifiAlertUntilMs    = nowMs + 5000UL;
     lastWifiAlertBeepMs = 0;
     isSleeping          = false;
     if (!connected) {
-      // WiFi OFF -> strictly lock ESP32 into Auto Mode using cached weather, alarms & clock!
+      // WiFi OFF -> remember previous mode & strictly lock ESP32 into Auto Mode using cached weather/alarms!
+      if (botMode == "user") preferredOnlineMode = "user";
       botMode      = "auto";
       screenLocked = false;
+    } else {
+      // WiFi ON -> unlock User Mode & automatically restore previous mode if it was User Mode!
+      botMode = preferredOnlineMode;
     }
     xSemaphoreGive(stateMutex);
   } else {
     wifiAlertActive     = true;
     wifiAlertConnected  = connected;
-    wifiAlertStartMs    = millis();
-    wifiAlertUntilMs    = wifiAlertStartMs + 5000UL;
+    wifiAlertStartMs    = nowMs;
+    wifiAlertUntilMs    = nowMs + 5000UL;
     lastWifiAlertBeepMs = 0;
     isSleeping          = false;
     if (!connected) {
+      if (botMode == "user") preferredOnlineMode = "user";
       botMode      = "auto";
       screenLocked = false;
+    } else {
+      botMode = preferredOnlineMode;
     }
   }
+
+  // Paint OLED + flash Green LED at millisecond 0 (before first buzzer beep!)
+  updateGreenLed();
+  drawWifiStatusOled(connected, frameCount);
+
   if (connected) {
-    Serial.println("[WiFi ALERT 5s] CONNECTED! IP=" + WiFi.localIP().toString() + " -> User Mode Unlocked");
+    Serial.println("[WiFi ALERT 5s] CONNECTED! IP=" + WiFi.localIP().toString() + " -> Mode=" + botMode);
   } else {
     Serial.println("[WiFi ALERT 5s] WIFI OFF! -> Auto Mode Active (Using Synced Cache)");
   }
@@ -1079,8 +1108,9 @@ void pollVercelCloudOnce(WiFiClientSecure& sharedClient) {
         bool profileChanged = (newUser != userName || newCity != cityName);
 
         if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
-          botMode      = newMode;
-          activeScreen = newScreen;
+          botMode             = newMode;
+          preferredOnlineMode = newMode;
+          activeScreen        = newScreen;
           currentFace  = constrain(newFace, 0, 24);
           if (newL1.length() > 0) customLine1 = newL1;
           customLine2  = newL2;
@@ -1185,6 +1215,7 @@ void cloudSyncTask(void* param) {
 
   unsigned long lastWeatherMs = 0;
   unsigned long lastReconnectAttemptMs = millis();
+  int reconnectCycle = 0;
   bool otaCheckedOnce = false;
 
   for (;;) {
@@ -1198,15 +1229,23 @@ void cloudSyncTask(void* param) {
         botMode = "auto";
         screenLocked = false;
       }
-      // Clean non-destructive reconnect every 8s (snaps back online the instant router returns!)
-      if (millis() - lastReconnectAttemptMs >= 8000UL) {
+      // Resilient reconnect every 6s: alternates WiFi.reconnect() + WiFi.begin() channel re-scan
+      // so router power-cycle ALWAYS reconnects cleanly without ever dropping active sessions!
+      if (millis() - lastReconnectAttemptMs >= 6000UL) {
         lastReconnectAttemptMs = millis();
-        Serial.println("[WiFi] Waiting for SSID: " + wifiSsid + " (Auto-reconnecting...)");
-        WiFi.reconnect();
+        reconnectCycle++;
+        if (reconnectCycle % 2 == 1) {
+          Serial.println("[WiFi] Auto-reconnecting to SSID: " + wifiSsid);
+          WiFi.reconnect();
+        } else {
+          Serial.println("[WiFi] Re-scanning channel for SSID: " + wifiSsid);
+          WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+        }
       }
-      vTaskDelay(pdMS_TO_TICKS(800));
+      vTaskDelay(pdMS_TO_TICKS(600));
       continue;
     }
+    reconnectCycle = 0;
 
     // Ensure NTP clock is configured whenever WiFi comes online
     if (!ntpConfigured) {
@@ -1271,6 +1310,7 @@ void setupLocalApi() {
       String reqMode = server.arg("mode");
       if (WiFi.status() == WL_CONNECTED && (reqMode == "auto" || reqMode == "user")) {
         botMode = reqMode;
+        preferredOnlineMode = reqMode;
         if (reqMode == "auto") screenLocked = false;
         logEspInteraction();
       } else {
@@ -1481,11 +1521,22 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
 void loop() {
   server.handleClient();
 
-  // 1. Handle instant hardware WiFi ON / OFF event (0ms latency!)
+  // 1A. Handle instant hardware WiFi ON / OFF interrupt event (0ms latency!)
   int ev = wifiEventPending;
   if (ev != 0) {
     wifiEventPending = 0;
     triggerWifiAlert5s(ev == 1);
+  }
+
+  // 1B. Redundant 250ms WiFi.status() watcher (100% immune to any ESP32 Arduino Core event quirks!)
+  static unsigned long lastWifiPollMs = 0;
+  if (millis() - lastWifiPollMs >= 250UL) {
+    lastWifiPollMs = millis();
+    bool curWifi = (WiFi.status() == WL_CONNECTED);
+    if (curWifi != lastLoopWifiConnected) {
+      wifiWasConnected = curWifi;
+      triggerWifiAlert5s(curWifi);
+    }
   }
 
   // 2. Manage 5-second top-priority WiFi ON / OFF notification (OLED + Buzzer + Green LED together!)
