@@ -35,7 +35,7 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
     paintBufferToCanvas(ctx, bufferRef.current, oledScheme, 2, true);
   }, [connected, frame, oledScheme]);
 
-  const progressPct = Math.max(0, Math.min(100, (secondsLeft / 5) * 100));
+  const progressPct = Math.max(0, Math.min(100, (secondsLeft / 3) * 100));
 
   return (
     <div
@@ -56,7 +56,7 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
           )}
           <div className="min-w-0">
             <div className="text-xs font-bold tracking-tight truncate">
-              {connected ? 'WiFi ON · User Mode Unlocked' : 'WiFi OFF · Auto Mode Only'}
+              {connected ? 'WiFi Connected · Auto Mode' : 'WiFi Offline · Auto Mode'}
             </div>
             <div className="flex items-center gap-1.5 text-[11px] text-slate-400 tabular-nums">
               <span
@@ -66,7 +66,7 @@ export const WifiStatusOledToast: React.FC<WifiStatusOledToastProps> = ({
                     : 'bg-emerald-950'
                 }`}
               />
-              <span>OLED + LED + Buzzer · {secondsLeft}s</span>
+              <span>OLED + LED Blink + Buzzer · {secondsLeft}s</span>
             </div>
           </div>
         </div>

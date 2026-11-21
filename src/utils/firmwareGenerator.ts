@@ -62,7 +62,7 @@ export function generateEsp32Firmware(
     ? safeFirebaseUrl
     : `${safeCloudBase}/api/bot-state?device=${safeDeviceId}`;
   const otaVersionUrl = `${safeCloudBase}/ota/version.json`;
-  const fwVersion = (hardware.firmwareVersion || '4.1.0').replace(/"/g, '');
+  const fwVersion = (hardware.firmwareVersion || '4.2.0').replace(/"/g, '');
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -74,14 +74,14 @@ export function generateEsp32Firmware(
   return `/*
  * =========================================================================
  * FaceBot — Always-On AI Agent Dual-Core ESP32 Firmware (Muhib Creation · v${fwVersion})
- * Zero WiFi Timeout · Instant 5s WiFi ON/OFF OLED + Buzzer + Green LED Alerts
+ * Zero WiFi Timeout · Default Auto Mode · 3s WiFi Connected OLED + Buzzer + LED Blink
  * =========================================================================
  * ARCHITECTURE (Maximum Efficiency & Butter-Smooth 24-FPS Animations):
- *   - Core 1 (loop)         : 24-FPS silky-smooth OLED + 5s Priority WiFi Alert + Timer + LED + Buzzer
+ *   - Core 1 (loop)         : 24-FPS silky-smooth OLED + 3s WiFi Connected Alert + Timer + LED + Buzzer
  *   - Core 0 (FreeRTOS Task): Persistent-TLS 1.2s Vercel Cloud Sync + Auto OTA + Open-Meteo Weather
  *   - Always-Connected WiFi : Modem-sleep OFF (WIFI_PS_NONE), Max TX Power, Persistent SSL (zero timeout!)
- *   - Offline AI Auto Mode  : Instant 5s WiFi OFF OLED+Buzzer+LED -> Auto Mode with NVS-cached weather/alarms
- *   - Online User Unlock    : Instant 5s WiFi ON OLED+Buzzer+LED -> User Mode & Cloud Sync auto-unlocked!
+ *   - Offline Auto Mode     : Silent switch to Auto Mode with NVS-cached weather/alarms (no WiFi OFF alert)
+ *   - Online WiFi Connected : Instant 3s WiFi Connected OLED + 3s Buzzer + 3s Green LED Blink (default Auto Mode)
  *
  * Required Arduino Libraries (ONLY 3):
  *   1. Adafruit SSD1306
@@ -289,58 +289,60 @@ void onEsp32WifiEvent(WiFiEvent_t event) {
 void updateGreenLed();
 void drawWifiStatusOled(bool connected, int frame);
 
-void triggerWifiAlert5s(bool connected) {
+void triggerWifiAlert3s(bool connected) {
   unsigned long nowMs = millis();
   // Deduplicate if both WiFi.onEvent and 250ms loop watcher detect the exact same transition
   if (lastWifiAlertFiredMs > 0 && lastWifiAlertState == connected && (nowMs - lastWifiAlertFiredMs) < 1500UL) {
     return;
   }
-  lastWifiAlertFiredMs = nowMs;
-  lastWifiAlertState   = connected;
+  lastWifiAlertFiredMs  = nowMs;
+  lastWifiAlertState    = connected;
   lastLoopWifiConnected = connected;
 
+  // WiFi OFF -> NO OLED/Buzzer/LED notification! Silently default to Auto Mode with NVS-cached data!
+  if (!connected) {
+    if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      wifiAlertActive = false;
+      botMode         = "auto";
+      screenLocked    = false;
+      xSemaphoreGive(stateMutex);
+    } else {
+      wifiAlertActive = false;
+      botMode         = "auto";
+      screenLocked    = false;
+    }
+    digitalWrite(PIN_BUZZER, LOW);
+    updateGreenLed();
+    Serial.println("[WiFi] Offline -> Silent Auto Mode active (using synced NVS cache)");
+    return;
+  }
+
+  // WiFi CONNECTED -> Exact 3-second OLED + 3s Buzzer + 3s Green LED Blink, default mode = Auto Mode!
   if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     wifiAlertActive     = true;
-    wifiAlertConnected  = connected;
+    wifiAlertConnected  = true;
     wifiAlertStartMs    = nowMs;
-    wifiAlertUntilMs    = nowMs + 5000UL;
+    wifiAlertUntilMs    = nowMs + 3000UL;
     lastWifiAlertBeepMs = 0;
     isSleeping          = false;
-    if (!connected) {
-      // WiFi OFF -> remember previous mode & strictly lock ESP32 into Auto Mode using cached weather/alarms!
-      if (botMode == "user") preferredOnlineMode = "user";
-      botMode      = "auto";
-      screenLocked = false;
-    } else {
-      // WiFi ON -> unlock User Mode & automatically restore previous mode if it was User Mode!
-      botMode = preferredOnlineMode;
-    }
+    botMode             = "auto";
+    screenLocked        = false;
     xSemaphoreGive(stateMutex);
   } else {
     wifiAlertActive     = true;
-    wifiAlertConnected  = connected;
+    wifiAlertConnected  = true;
     wifiAlertStartMs    = nowMs;
-    wifiAlertUntilMs    = nowMs + 5000UL;
+    wifiAlertUntilMs    = nowMs + 3000UL;
     lastWifiAlertBeepMs = 0;
     isSleeping          = false;
-    if (!connected) {
-      if (botMode == "user") preferredOnlineMode = "user";
-      botMode      = "auto";
-      screenLocked = false;
-    } else {
-      botMode = preferredOnlineMode;
-    }
+    botMode             = "auto";
+    screenLocked        = false;
   }
 
   // Paint OLED + flash Green LED at millisecond 0 (before first buzzer beep!)
   updateGreenLed();
-  drawWifiStatusOled(connected, frameCount);
-
-  if (connected) {
-    Serial.println("[WiFi ALERT 5s] CONNECTED! IP=" + WiFi.localIP().toString() + " -> Mode=" + botMode);
-  } else {
-    Serial.println("[WiFi ALERT 5s] WIFI OFF! -> Auto Mode Active (Using Synced Cache)");
-  }
+  drawWifiStatusOled(true, frameCount);
+  Serial.println("[WiFi CONNECTED 3s] IP=" + WiFi.localIP().toString() + " -> Default Auto Mode");
 }
 
 void logEspInteraction() {
@@ -919,12 +921,12 @@ void drawWifiStatusOled(bool connected, int frame) {
     display.print("CACHED SYNC");
   }
 
-  // Live 5-second countdown progress bar across the bottom
+  // Live 3-second countdown progress bar across the bottom
   unsigned long nowMs = millis();
   long remMs = (long)(wifiAlertUntilMs - nowMs);
   if (remMs < 0) remMs = 0;
-  if (remMs > 5000) remMs = 5000;
-  int barW = (int)((remMs * 114L) / 5000L);
+  if (remMs > 3000) remMs = 3000;
+  int barW = (int)((remMs * 114L) / 3000L);
   display.drawRect(6, 48, 116, 10, SSD1306_WHITE);
   if (barW > 0) {
     display.fillRect(7, 49, barW, 8, SSD1306_WHITE);
@@ -1502,13 +1504,16 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiWasConnected = true;
-    wifiEventPending = 0; // We trigger the 5s connected alert cleanly right below!
+    wifiEventPending = 0; // We trigger the 3s WiFi Connected alert cleanly right below!
     ntpConfigured = true;
     configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
-    triggerWifiAlert5s(true);
+    triggerWifiAlert3s(true);
   } else {
-    Serial.println("[WiFi] Offline at boot -> 5s WiFi OFF Alert + Cached Auto Mode!");
-    triggerWifiAlert5s(false);
+    // Booted without WiFi -> Silent Auto Mode with NVS-cached weather/alarms (no WiFi OFF notification!)
+    Serial.println("[WiFi] Offline at boot -> Silent Auto Mode (NVS Cache)");
+    botMode = "auto";
+    screenLocked = false;
+    lastLoopWifiConnected = false;
   }
 
   setupLocalApi();
@@ -1525,7 +1530,7 @@ void loop() {
   int ev = wifiEventPending;
   if (ev != 0) {
     wifiEventPending = 0;
-    triggerWifiAlert5s(ev == 1);
+    triggerWifiAlert3s(ev == 1);
   }
 
   // 1B. Redundant 250ms WiFi.status() watcher (100% immune to any ESP32 Arduino Core event quirks!)
@@ -1535,18 +1540,18 @@ void loop() {
     bool curWifi = (WiFi.status() == WL_CONNECTED);
     if (curWifi != lastLoopWifiConnected) {
       wifiWasConnected = curWifi;
-      triggerWifiAlert5s(curWifi);
+      triggerWifiAlert3s(curWifi);
     }
   }
 
-  // 2. Manage 5-second top-priority WiFi ON / OFF notification (OLED + Buzzer + Green LED together!)
+  // 2. Manage 3-second top-priority WiFi Connected notification (OLED + Buzzer + Green LED blink together!)
   if (wifiAlertActive) {
     if ((long)(millis() - wifiAlertUntilMs) >= 0) {
       wifiAlertActive = false;
       digitalWrite(PIN_BUZZER, LOW);
     } else if (lastWifiAlertBeepMs == 0 || millis() - lastWifiAlertBeepMs >= 1000UL) {
       lastWifiAlertBeepMs = millis();
-      playWifiAlertPulse(wifiAlertConnected);
+      playWifiAlertPulse(true);
     }
   }
 

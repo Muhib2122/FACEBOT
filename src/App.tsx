@@ -70,7 +70,7 @@ import {
   playBuzzerTest,
   playShortClick,
   playWakeChime,
-  playWifiStatusBuzzer5Sec,
+  playWifiConnectedBuzzer3Sec,
   stopBuzzerAudio,
   unlockBuzzerAudio,
 } from './utils/buzzerAudio';
@@ -136,7 +136,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '4.1.0',
+  firmwareVersion: '4.2.0',
   otaAutoCheck: true,
 };
 
@@ -335,11 +335,10 @@ export default function App() {
 
   const [navSection, setNavSection] = useState<NavSection>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [mode, setMode] = useState<BotMode>(saved?.mode ?? 'auto');
+  // Default mode is ALWAYS Auto Mode (whether WiFi is ON or OFF; user can manually switch to User Mode when WiFi is ON)
+  const [mode, setMode] = useState<BotMode>('auto');
   const modeRef = useRef<BotMode>(mode);
   modeRef.current = mode;
-  // Remembers preferred online mode ('user' or 'auto') so WiFi reconnect automatically restores User Mode!
-  const preferredOnlineModeRef = useRef<BotMode>(saved?.mode === 'user' ? 'user' : 'auto');
   const [settings, setSettings] = useState<BotSettings>({
     ...DEFAULT_SETTINGS,
     ...(saved?.settings ?? {}),
@@ -578,7 +577,8 @@ export default function App() {
               if (!docSnap.exists()) return;
               const d = docSnap.data();
               skipNextWorkspaceSyncRef.current = true;
-              if (d.mode === 'auto' || d.mode === 'user') setMode(d.mode);
+              // Always default to Auto Mode regardless of WiFi ON/OFF (user manually switches to User Mode when online)
+              setMode('auto');
               setSettings((prev) => ({
                 ...prev,
                 userName: typeof d.userName === 'string' ? d.userName : prev.userName,
@@ -1285,20 +1285,26 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
 
-  // #1 TOP PRIORITY 5-second WiFi ON / OFF OLED Screen + 5-second Buzzer + 5-second Green LED (overrides Auto/User mode & every page!)
+  // #1 TOP PRIORITY 3-second WiFi CONNECTED OLED Screen + 3s Buzzer + 3s Green LED Blink
+  // (No notification when WiFi turns OFF — silent switch to Auto Mode!)
   const triggerWifiStatusScreen = useCallback(
     (connected: boolean, forceReplay = false) => {
+      // Never show OLED/Buzzer/LED notification when WiFi goes OFF
+      if (!connected) {
+        return;
+      }
+
       const nowMs = Date.now();
-      // Deduplicate simultaneous browser-event + fetch-error triggers for the same state within 1.5s
+      // Deduplicate simultaneous browser-event + heartbeat triggers within 1.5s
       if (
         !forceReplay &&
         lastWifiAlertMetaRef.current.atMs > 0 &&
-        lastWifiAlertMetaRef.current.connected === connected &&
+        lastWifiAlertMetaRef.current.connected === true &&
         nowMs - lastWifiAlertMetaRef.current.atMs < 1500
       ) {
         return;
       }
-      lastWifiAlertMetaRef.current = { connected, atMs: nowMs };
+      lastWifiAlertMetaRef.current = { connected: true, atMs: nowMs };
 
       if (wifiStatusTimerRef.current) {
         window.clearTimeout(wifiStatusTimerRef.current);
@@ -1317,30 +1323,33 @@ export default function App() {
         bootLogoTimerRef.current = null;
       }
 
-      // Snapshot previous active screen so it resumes smoothly after the 5-second WiFi priority page
+      // Snapshot previous active screen so it resumes cleanly after the 3-second WiFi Connected page
       if (activeScreenRef.current.kind !== 'wifi-status') {
         prevScreenBeforeWifiRef.current = activeScreenRef.current;
       }
 
-      const durationMs = 5000;
+      const durationMs = 3000;
       const expiresAt = Date.now() + durationMs;
       wifiPriorityUntilMsRef.current = expiresAt;
 
       setIsSleeping(false);
+      // Default mode on WiFi Connected is ALWAYS Auto Mode (User Mode is unlocked for manual selection)
+      setMode('auto');
+      sendToEsp32('/api/mode?mode=auto');
 
-      // 5-Second Piezo Buzzer Alert on BOTH WiFi ON & WiFi OFF (Portal speaker + Physical ESP32 GPIO 14)
-      playWifiStatusBuzzer5Sec(connected, hardware.buzzerMuted);
-      const hwBuzzerMode = connected ? 'happy' : 'alarm';
+      // 3-Second Piezo Buzzer + 3-Second Green LED Blink on WiFi Connected (Portal + Physical ESP32)
+      playWifiConnectedBuzzer3Sec(hardware.buzzerMuted);
+      sendToEsp32('/api/led?green=blink');
       const triggerEsp32BuzzerPulse = () => {
-        lastBuzzerModeRef.current = hwBuzzerMode;
+        lastBuzzerModeRef.current = 'happy';
         buzzerSeqRef.current += 1;
         setCloudEventSeq((s) => s + 1);
-        sendToEsp32(`/api/buzzer?mode=${hwBuzzerMode}`);
+        sendToEsp32('/api/buzzer?mode=happy');
       };
       triggerEsp32BuzzerPulse();
       let pulseCount = 1;
       wifiBuzzerIntervalRef.current = window.setInterval(() => {
-        if (pulseCount >= 4 || Date.now() >= expiresAt - 200) {
+        if (pulseCount >= 3 || Date.now() >= expiresAt - 150) {
           if (wifiBuzzerIntervalRef.current) {
             window.clearInterval(wifiBuzzerIntervalRef.current);
             wifiBuzzerIntervalRef.current = null;
@@ -1349,28 +1358,23 @@ export default function App() {
         }
         pulseCount += 1;
         triggerEsp32BuzzerPulse();
-      }, 1250);
+      }, 1000);
 
-      // Push 128x64 WiFi ON / OFF emoji bitmap to ESP32 with #1 top priority
-      postBitmapToEsp32(generateWifiStatusPixels(connected));
+      // Push 128x64 WiFi Connected emoji bitmap to ESP32 with #1 top priority
+      postBitmapToEsp32(generateWifiStatusPixels(true));
 
-      if (!connected) {
-        // WiFi lost -> automatically switch bot to AUTO mode while keeping cached weather, alarms & clock
-        setMode('auto');
-      } else {
-        // WiFi restored -> refresh weather immediately
-        void refreshWeather();
-      }
+      // Refresh live weather immediately on WiFi connect
+      void refreshWeather();
 
       setActiveScreen({
         kind: 'wifi-status',
-        faceId: connected ? 1 : 9,
-        wifiConnected: connected,
+        faceId: 1,
+        wifiConnected: true,
         locked: true,
       });
 
-      // Show live 5-second OLED WiFi Emoji overlay on EVERY page
-      setWifiOverlay({ connected, secondsLeft: 5 });
+      // Show live 3-second OLED WiFi Connected + LED Blink + Buzzer overlay on EVERY page
+      setWifiOverlay({ connected: true, secondsLeft: 3 });
       wifiOverlayIntervalRef.current = window.setInterval(() => {
         const rem = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
         if (rem <= 0) {
@@ -1380,19 +1384,17 @@ export default function App() {
           }
           setWifiOverlay(null);
         } else {
-          setWifiOverlay({ connected, secondsLeft: rem });
+          setWifiOverlay({ connected: true, secondsLeft: rem });
         }
       }, 150);
 
       logInteraction(
         'hardware',
-        connected
-          ? 'WiFi Connected · 5s Priority OLED + 5s Buzzer'
-          : 'WiFi OFF · Auto Mode · 5s Priority OLED + 5s Buzzer',
+        'WiFi Connected · 3s Priority OLED + LED Blink + Buzzer (Auto Mode)',
         'esp32'
       );
 
-      // Hold WiFi ON / OFF page at #1 priority for exactly 5 seconds, then stop buzzer & restore previous page/mode
+      // Hold WiFi Connected page + LED blink + Buzzer for exactly 3 seconds, then resume Auto Mode cleanly
       wifiStatusTimerRef.current = window.setTimeout(() => {
         wifiPriorityUntilMsRef.current = 0;
         setWifiOverlay(null);
@@ -1405,6 +1407,8 @@ export default function App() {
           wifiBuzzerIntervalRef.current = null;
         }
         stopBuzzerAudio();
+        sendToEsp32(`/api/led?green=${hardware.greenLedMode}`);
+        setCloudEventSeq((s) => s + 1);
 
         const previous = prevScreenBeforeWifiRef.current;
         prevScreenBeforeWifiRef.current = null;
@@ -1424,11 +1428,11 @@ export default function App() {
           if (previous && previous.kind !== 'boot-logo' && previous.kind !== 'wifi-status') {
             return previous;
           }
-          return { kind: 'face', faceId: connected ? 1 : 0, locked: false };
+          return { kind: 'face', faceId: 1, locked: false };
         });
       }, durationMs);
     },
-    [hardware.buzzerMuted, refreshWeather, postBitmapToEsp32, logInteraction, sendToEsp32]
+    [hardware.buzzerMuted, hardware.greenLedMode, refreshWeather, postBitmapToEsp32, logInteraction, sendToEsp32]
   );
 
   const dismissWifiOverlay = useCallback(() => {
@@ -1446,6 +1450,7 @@ export default function App() {
       wifiBuzzerIntervalRef.current = null;
     }
     stopBuzzerAudio();
+    sendToEsp32(`/api/led?green=${hardware.greenLedMode}`);
     setWifiOverlay(null);
     const previous = prevScreenBeforeWifiRef.current;
     prevScreenBeforeWifiRef.current = null;
@@ -1466,10 +1471,12 @@ export default function App() {
       }
       return { kind: 'face', faceId: 0, locked: false };
     });
-  }, []);
+  }, [hardware.greenLedMode, sendToEsp32]);
 
   // Centralized Unified Connectivity Transition Engine:
-  // Handles BOTH Physical ESP32 WiFi ON/OFF AND Portal Network WiFi ON/OFF automatically!
+  // - Default mode on BOTH WiFi ON & WiFi OFF is ALWAYS Auto Mode!
+  // - WiFi OFF: silent switch to Auto Mode (NO OLED/Buzzer/LED notification, User Mode locked)
+  // - WiFi ON: 3-second WiFi Connected OLED + Buzzer + Green LED Blink, default Auto Mode (User Mode unlocked)
   const applyConnectivityTransition = useCallback(
     (
       nextNetOnline: boolean,
@@ -1504,9 +1511,6 @@ export default function App() {
           missedHeartbeatCountRef.current = 0;
           setEsp32LastSeenAt(typeof lastSeenAt === 'number' && lastSeenAt > 0 ? lastSeenAt : nowMs);
         } else if (resolvedEverSeen && resolvedHwOnline) {
-          // Smart offline detection:
-          // - If warm server explicitly reports lastSeenAt > 0 & esp32Online === false (>=12s elapsed), go offline IMMEDIATELY!
-          // - Only debounce 3 polls (~6s) if lastSeenAt === 0 (cold Vercel serverless instance shield)
           const confirmedStaleByWarmServer = typeof lastSeenAt === 'number' && lastSeenAt > 0;
           if (forceImmediate || confirmedStaleByWarmServer) {
             resolvedHwOnline = false;
@@ -1531,34 +1535,26 @@ export default function App() {
 
       if (prevEffectiveOnline !== nextEffectiveOnline) {
         if (!nextEffectiveOnline) {
-          // WiFi OFF -> remember active mode, automatically switch to Auto Mode, lock User Mode & fire 5s OLED+Buzzer+LED!
-          if (modeRef.current === 'user') {
-            preferredOnlineModeRef.current = 'user';
-          }
+          // WiFi OFF -> silently switch to Auto Mode & lock User Mode (NO notification!)
+          dismissWifiOverlay();
           setMode('auto');
-          triggerWifiStatusScreen(false);
         } else {
-          // WiFi ON -> unlock User Mode, automatically restore preferred User Mode if active before, & fire 5s OLED+Buzzer+LED!
-          if (preferredOnlineModeRef.current === 'user') {
-            setMode('user');
-            sendToEsp32('/api/mode?mode=user');
-          }
+          // WiFi ON -> default to Auto Mode, unlock User Mode, & trigger 3-second WiFi Connected OLED + LED Blink + Buzzer!
+          setMode('auto');
           triggerWifiStatusScreen(true);
         }
       } else if (justPairedPhysicalEsp32) {
-        // Physical ESP32 just connected to WiFi & checked into Cloud for the first time -> fire 5s WiFi ON alert!
+        // Physical ESP32 just connected to WiFi for the first time -> 3s WiFi Connected OLED + LED Blink + Buzzer!
+        setMode('auto');
         triggerWifiStatusScreen(true);
       }
     },
-    [triggerWifiStatusScreen, sendToEsp32]
+    [triggerWifiStatusScreen, dismissWifiOverlay]
   );
 
   // Strict Offline Auto-Mode Lock: prevent User Mode from ever staying active while WiFi/ESP32 is Offline
   useEffect(() => {
     if (!esp32Online && mode !== 'auto') {
-      if (mode === 'user') {
-        preferredOnlineModeRef.current = 'user';
-      }
       setMode('auto');
     }
   }, [esp32Online, mode]);
@@ -1682,7 +1678,6 @@ export default function App() {
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       applyConnectivityTransition(false, false, 0, true);
-      triggerWifiStatusScreen(false, true);
       setGlobalSyncFeedback('Offline · Auto Mode');
       setGlobalSyncing(false);
       window.setTimeout(() => setGlobalSyncFeedback(null), 2600);
@@ -1748,7 +1743,6 @@ export default function App() {
         setMode('auto');
         return;
       }
-      preferredOnlineModeRef.current = nextMode;
       if (mode === nextMode) return;
       setMode(nextMode);
       playShortClick(hardware.buzzerMuted);
@@ -2434,7 +2428,6 @@ export default function App() {
           setMode('auto');
           badges.push('User Mode Locked (Offline)');
         } else {
-          preferredOnlineModeRef.current = action.targetMode;
           setMode(action.targetMode);
           sendToEsp32(`/api/mode?mode=${action.targetMode}`);
           badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
@@ -3212,15 +3205,17 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   void pollEsp32Heartbeat().then((liveOnline) => {
-                    triggerWifiStatusScreen(liveOnline, true);
+                    if (liveOnline) {
+                      triggerWifiStatusScreen(true, true);
+                    }
                   });
                 }}
                 title={
                   esp32Online
                     ? esp32EverSeen
-                      ? 'ESP32 Bot is connected to WiFi & syncing live. Click to preview 5s Priority WiFi Connected OLED + Buzzer + LED.'
-                      : 'WiFi Online & Ready. Click to preview 5s Priority WiFi Connected OLED + Buzzer + LED.'
-                    : 'WiFi / ESP32 Offline — Auto Mode Active & User Mode Locked. Click to re-check & preview 5s WiFi OFF OLED.'
+                      ? 'ESP32 Bot is connected to WiFi. Click to preview 3s WiFi Connected OLED + LED Blink + Buzzer.'
+                      : 'WiFi Online & Ready. Click to preview 3s WiFi Connected OLED + LED Blink + Buzzer.'
+                    : 'WiFi / ESP32 Offline — Running in Auto Mode (User Mode Locked). Click to re-check WiFi.'
                 }
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap ${
                   esp32Online
@@ -3358,18 +3353,10 @@ export default function App() {
               <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span>
                 {!isOnline
-                  ? 'Portal WiFi Offline — Bot running in Auto Mode with cached weather & alarms.'
-                  : 'ESP32 Bot Offline — Waiting for ESP32 WiFi connection. Bot runs offline Auto Mode with cached weather & alarms until WiFi reconnects.'}
+                  ? 'WiFi Offline — Running in default Auto Mode with synced weather & alarms.'
+                  : 'ESP32 Offline — Running in default Auto Mode with synced weather & alarms until WiFi reconnects.'}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => triggerWifiStatusScreen(false, true)}
-              className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 whitespace-nowrap"
-            >
-              <Wifi className="w-3 h-3" />
-              Show 5s WiFi OFF OLED
-            </button>
           </div>
         )}
 
