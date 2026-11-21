@@ -34,6 +34,7 @@ function createDefaultState(deviceId) {
     timerEndEpochSec: 0,
     timerDurationSec: 0,
     wifiOfflineAuto: true,
+    wifiPriorityUntilMs: 0,
     esp32LastSeenAt: 0,
     esp32PollCount: 0,
     updatedAt: 0,
@@ -41,6 +42,11 @@ function createDefaultState(deviceId) {
 }
 
 function resolveLiveTimerState(state, nowMs) {
+  // WiFi ON / OFF 5-second page has #1 top priority over timer & every other screen
+  if (Number(state.wifiPriorityUntilMs) > nowMs) {
+    return state;
+  }
+
   if (!state.timerActive || !state.timerEndAtMs) {
     return state;
   }

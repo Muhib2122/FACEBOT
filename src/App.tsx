@@ -69,6 +69,7 @@ import {
   playBuzzerTest,
   playShortClick,
   playWakeChime,
+  playWifiStatusBuzzer5Sec,
   stopBuzzerAudio,
   unlockBuzzerAudio,
 } from './utils/buzzerAudio';
@@ -419,8 +420,13 @@ export default function App() {
     faceId: 1,
     locked: true,
   });
+  const activeScreenRef = useRef<ActiveScreenState>(activeScreen);
+  activeScreenRef.current = activeScreen;
   const bootLogoTimerRef = useRef<number | null>(null);
   const wifiStatusTimerRef = useRef<number | null>(null);
+  const wifiBuzzerIntervalRef = useRef<number | null>(null);
+  const wifiPriorityUntilMsRef = useRef<number>(0);
+  const prevScreenBeforeWifiRef = useRef<ActiveScreenState | null>(null);
   const bootDayKeyRef = useRef<string>(getTodayKey());
 
   const [activeAlarm, setActiveAlarm] = useState<AlarmItem | null>(null);
@@ -1081,6 +1087,8 @@ export default function App() {
       timerEndEpochSec: pomodoroRunning ? Math.round(pomodoroEndAtMsRef.current / 1000) : 0,
       timerDurationSec: pomodoroTotalSec,
       wifiOfflineAuto: true,
+      wifiPriorityUntilMs:
+        wifiPriorityUntilMsRef.current > Date.now() ? wifiPriorityUntilMsRef.current : 0,
       updatedAt: Date.now(),
     };
   }, [
@@ -1254,26 +1262,69 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
 
-  // Show 10-second WiFi Connected / WiFi OFF pixel-art emoji screen + Offline Auto-Mode switch
+  // #1 TOP PRIORITY 5-second WiFi ON / OFF OLED Screen + 5-second Buzzer (overrides Auto/User mode & every page!)
   const triggerWifiStatusScreen = useCallback(
     (connected: boolean) => {
       if (wifiStatusTimerRef.current) {
         window.clearTimeout(wifiStatusTimerRef.current);
+        wifiStatusTimerRef.current = null;
       }
       if (wifiOverlayIntervalRef.current) {
         window.clearInterval(wifiOverlayIntervalRef.current);
+        wifiOverlayIntervalRef.current = null;
+      }
+      if (wifiBuzzerIntervalRef.current) {
+        window.clearInterval(wifiBuzzerIntervalRef.current);
+        wifiBuzzerIntervalRef.current = null;
+      }
+      if (bootLogoTimerRef.current) {
+        window.clearTimeout(bootLogoTimerRef.current);
+        bootLogoTimerRef.current = null;
       }
 
+      // Snapshot previous active screen so it resumes smoothly after the 5-second WiFi priority page
+      if (activeScreenRef.current.kind !== 'wifi-status') {
+        prevScreenBeforeWifiRef.current = activeScreenRef.current;
+      }
+
+      const durationMs = 5000;
+      const expiresAt = Date.now() + durationMs;
+      wifiPriorityUntilMsRef.current = expiresAt;
+
       setIsSleeping(false);
+
+      // 5-Second Piezo Buzzer Alert on BOTH WiFi ON & WiFi OFF (Portal speaker + Physical ESP32 GPIO 14)
+      playWifiStatusBuzzer5Sec(connected, hardware.buzzerMuted);
+      const hwBuzzerMode = connected ? 'happy' : 'alarm';
+      const triggerEsp32BuzzerPulse = () => {
+        lastBuzzerModeRef.current = hwBuzzerMode;
+        buzzerSeqRef.current += 1;
+        setCloudEventSeq((s) => s + 1);
+        sendToEsp32(`/api/buzzer?mode=${hwBuzzerMode}`);
+      };
+      triggerEsp32BuzzerPulse();
+      let pulseCount = 1;
+      wifiBuzzerIntervalRef.current = window.setInterval(() => {
+        if (pulseCount >= 4 || Date.now() >= expiresAt - 200) {
+          if (wifiBuzzerIntervalRef.current) {
+            window.clearInterval(wifiBuzzerIntervalRef.current);
+            wifiBuzzerIntervalRef.current = null;
+          }
+          return;
+        }
+        pulseCount += 1;
+        triggerEsp32BuzzerPulse();
+      }, 1250);
+
+      // Push 128x64 WiFi ON / OFF emoji bitmap to ESP32 with #1 top priority
+      postBitmapToEsp32(generateWifiStatusPixels(connected));
+
       if (!connected) {
         // WiFi lost -> automatically switch bot to AUTO mode while keeping cached weather, alarms & clock
         setMode('auto');
-        playShortClick(hardware.buzzerMuted);
       } else {
-        // WiFi restored -> auto-reconnect, refresh weather, push WiFi Connected emoji bitmap to ESP32
-        playWakeChime(hardware.buzzerMuted);
+        // WiFi restored -> refresh weather immediately
         void refreshWeather();
-        postBitmapToEsp32(generateWifiStatusPixels(true));
       }
 
       setActiveScreen({
@@ -1283,9 +1334,8 @@ export default function App() {
         locked: true,
       });
 
-      // Show live 10-second OLED WiFi Emoji overlay on EVERY page
-      const expiresAt = Date.now() + 10000;
-      setWifiOverlay({ connected, secondsLeft: 10 });
+      // Show live 5-second OLED WiFi Emoji overlay on EVERY page
+      setWifiOverlay({ connected, secondsLeft: 5 });
       wifiOverlayIntervalRef.current = window.setInterval(() => {
         const rem = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
         if (rem <= 0) {
@@ -1297,37 +1347,57 @@ export default function App() {
         } else {
           setWifiOverlay({ connected, secondsLeft: rem });
         }
-      }, 250);
+      }, 150);
 
       logInteraction(
         'hardware',
         connected
-          ? 'WiFi Reconnected · Auto Sync Restored (10s OLED Banner)'
-          : 'WiFi Disconnected · Switched to Offline Auto Mode (10s OLED Banner)',
+          ? 'WiFi Connected · 5s Priority OLED + 5s Buzzer'
+          : 'WiFi OFF · Auto Mode · 5s Priority OLED + 5s Buzzer',
         'esp32'
       );
 
-      // Hold the WiFi Connected / Disconnected emoji on OLED for exactly 10 seconds, then resume normal display
+      // Hold WiFi ON / OFF page at #1 priority for exactly 5 seconds, then stop buzzer & restore previous page/mode
       wifiStatusTimerRef.current = window.setTimeout(() => {
+        wifiPriorityUntilMsRef.current = 0;
         setWifiOverlay(null);
         if (wifiOverlayIntervalRef.current) {
           window.clearInterval(wifiOverlayIntervalRef.current);
           wifiOverlayIntervalRef.current = null;
         }
-        setActiveScreen((prev) =>
-          prev.kind === 'wifi-status'
-            ? { kind: 'face', faceId: connected ? 1 : 0, locked: false }
-            : prev
-        );
-        if (connected) {
-          sendToEsp32('/api/mode?mode=auto');
+        if (wifiBuzzerIntervalRef.current) {
+          window.clearInterval(wifiBuzzerIntervalRef.current);
+          wifiBuzzerIntervalRef.current = null;
         }
-      }, 10000);
+        stopBuzzerAudio();
+
+        const previous = prevScreenBeforeWifiRef.current;
+        prevScreenBeforeWifiRef.current = null;
+
+        setActiveScreen((prev) => {
+          if (prev.kind !== 'wifi-status') return prev;
+          if (pomodoroEndAtMsRef.current > Date.now()) {
+            return {
+              kind: 'timer',
+              faceId: 0,
+              timerLabel: previous?.timerLabel || 'FOCUS',
+              timerEndAtMs: pomodoroEndAtMsRef.current,
+              timerTotalSec: previous?.timerTotalSec || 25 * 60,
+              locked: true,
+            };
+          }
+          if (previous && previous.kind !== 'boot-logo' && previous.kind !== 'wifi-status') {
+            return previous;
+          }
+          return { kind: 'face', faceId: connected ? 1 : 0, locked: false };
+        });
+      }, durationMs);
     },
     [hardware.buzzerMuted, refreshWeather, postBitmapToEsp32, logInteraction, sendToEsp32]
   );
 
   const dismissWifiOverlay = useCallback(() => {
+    wifiPriorityUntilMsRef.current = 0;
     if (wifiStatusTimerRef.current) {
       window.clearTimeout(wifiStatusTimerRef.current);
       wifiStatusTimerRef.current = null;
@@ -1336,10 +1406,31 @@ export default function App() {
       window.clearInterval(wifiOverlayIntervalRef.current);
       wifiOverlayIntervalRef.current = null;
     }
+    if (wifiBuzzerIntervalRef.current) {
+      window.clearInterval(wifiBuzzerIntervalRef.current);
+      wifiBuzzerIntervalRef.current = null;
+    }
+    stopBuzzerAudio();
     setWifiOverlay(null);
-    setActiveScreen((prev) =>
-      prev.kind === 'wifi-status' ? { kind: 'face', faceId: 0, locked: false } : prev
-    );
+    const previous = prevScreenBeforeWifiRef.current;
+    prevScreenBeforeWifiRef.current = null;
+    setActiveScreen((prev) => {
+      if (prev.kind !== 'wifi-status') return prev;
+      if (pomodoroEndAtMsRef.current > Date.now()) {
+        return {
+          kind: 'timer',
+          faceId: 0,
+          timerLabel: previous?.timerLabel || 'FOCUS',
+          timerEndAtMs: pomodoroEndAtMsRef.current,
+          timerTotalSec: previous?.timerTotalSec || 25 * 60,
+          locked: true,
+        };
+      }
+      if (previous && previous.kind !== 'boot-logo' && previous.kind !== 'wifi-status') {
+        return previous;
+      }
+      return { kind: 'face', faceId: 0, locked: false };
+    });
   }, []);
 
   // Apply REAL ESP32 Bot Online / Offline State Transition (triggers 10s WiFi Emoji on real ESP32 connect/disconnect!)
@@ -1448,6 +1539,9 @@ export default function App() {
       }
       if (wifiOverlayIntervalRef.current) {
         window.clearInterval(wifiOverlayIntervalRef.current);
+      }
+      if (wifiBuzzerIntervalRef.current) {
+        window.clearInterval(wifiBuzzerIntervalRef.current);
       }
     };
   }, [pollEsp32Heartbeat, applyEsp32OnlineState]);
@@ -1601,8 +1695,12 @@ export default function App() {
       const remaining = Math.max(0, Math.ceil((pomodoroEndAtMsRef.current - Date.now()) / 1000));
       setPomodoroSecondsLeft((prev) => (prev === remaining ? prev : remaining));
 
-      // Push exact 1s update over local LAN only if esp32Ip is configured (cloud server computes MM:SS automatically!)
-      if (remaining > 0 && remaining !== lastSyncedTimerSecRef.current) {
+      // Push exact 1s update over local LAN only if esp32Ip is configured and WiFi priority banner isn't active
+      if (
+        remaining > 0 &&
+        remaining !== lastSyncedTimerSecRef.current &&
+        wifiPriorityUntilMsRef.current <= Date.now()
+      ) {
         lastSyncedTimerSecRef.current = remaining;
         const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
         const ss = String(remaining % 60).padStart(2, '0');
@@ -1851,6 +1949,10 @@ export default function App() {
   };
 
   const triggerFiveSecBootLogo = useCallback(() => {
+    // Never interrupt active 5-second top-priority WiFi ON/OFF alert page
+    if (wifiPriorityUntilMsRef.current > Date.now()) {
+      return;
+    }
     if (bootLogoTimerRef.current) {
       window.clearTimeout(bootLogoTimerRef.current);
       bootLogoTimerRef.current = null;
@@ -2974,8 +3076,8 @@ export default function App() {
                 }}
                 title={
                   esp32Online
-                    ? 'ESP32 Bot is connected to WiFi & syncing live. Click to show 10s WiFi Connected OLED emoji.'
-                    : 'ESP32 Bot WiFi is offline (not polling cloud). Click to re-check & show 10s WiFi OFF OLED emoji.'
+                    ? 'ESP32 Bot is connected to WiFi & syncing live. Click to show 5s Priority WiFi Connected OLED + Buzzer.'
+                    : 'ESP32 Bot WiFi is offline (not polling cloud). Click to re-check & show 5s Priority WiFi OFF OLED + Buzzer.'
                 }
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap ${
                   esp32Online
@@ -3106,7 +3208,7 @@ export default function App() {
               className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 whitespace-nowrap"
             >
               <Wifi className="w-3 h-3" />
-              Show 10s WiFi OFF OLED
+              Show 5s WiFi OFF OLED
             </button>
           </div>
         )}

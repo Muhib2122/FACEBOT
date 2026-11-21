@@ -125,8 +125,8 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     if (activeScreen.kind === 'boot-logo') return 'Muhib Creation · Startup Logo (5s)';
     if (activeScreen.kind === 'wifi-status') {
       return activeScreen.wifiConnected
-        ? 'WiFi Connected · Auto Sync (10s)'
-        : 'WiFi Disconnected · Auto Mode (10s)';
+        ? 'WiFi Connected · Priority (5s)'
+        : 'WiFi Disconnected · Priority (5s)';
     }
     if (activeScreen.kind === 'timer') {
       return `${activeScreen.timerLabel || 'Focus'} Timer${activeScreen.timerPausedSec !== undefined ? ' (Paused)' : ''}`;

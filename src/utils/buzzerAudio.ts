@@ -119,3 +119,22 @@ export function playShortClick(muted: boolean) {
   if (muted) return;
   playTone(1200, 30, 0, 0.06, 'triangle');
 }
+
+// 5-second unmistakable Piezo Buzzer alert when WiFi connects (ON) or disconnects (OFF)
+export function playWifiStatusBuzzer5Sec(connected: boolean, muted: boolean) {
+  if (muted) return;
+  stopBuzzerAudio();
+  for (let sec = 0; sec < 5; sec++) {
+    const baseOffset = sec * 1.0;
+    if (connected) {
+      // WiFi ON: bright ascending double-beep each second for 5 full seconds
+      playTone(1550, 140, baseOffset + 0.0, 0.2, 'square');
+      playTone(2200, 220, baseOffset + 0.2, 0.22, 'square');
+    } else {
+      // WiFi OFF: clear alert double-beep each second for 5 full seconds
+      playTone(2100, 160, baseOffset + 0.0, 0.22, 'square');
+      playTone(1250, 240, baseOffset + 0.22, 0.24, 'square');
+    }
+  }
+}
+

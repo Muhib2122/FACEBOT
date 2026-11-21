@@ -1143,6 +1143,12 @@ export function renderScreenToBuffer(
   activeAlarm?: { time: string; label: string } | null,
   savedGifs?: SavedGifItem[]
 ) {
+  // TOP PRIORITY: WiFi ON / OFF 5-second alert page overrides every mode & screen
+  if (screen.kind === 'wifi-status') {
+    drawWifiStatusScreen(buffer, Boolean(screen.wifiConnected), frame);
+    return;
+  }
+
   if (screen.kind === 'alarm' && activeAlarm) {
     drawAlarmScreen(buffer, activeAlarm.label, activeAlarm.time, frame);
     return;
@@ -1151,9 +1157,6 @@ export function renderScreenToBuffer(
   switch (screen.kind) {
     case 'boot-logo':
       drawBootLogoScreen(buffer, frame);
-      break;
-    case 'wifi-status':
-      drawWifiStatusScreen(buffer, Boolean(screen.wifiConnected), frame);
       break;
     case 'timer': {
       const isPaused = screen.timerPausedSec !== undefined;
