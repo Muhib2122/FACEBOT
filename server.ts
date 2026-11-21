@@ -57,6 +57,49 @@ function createAiClient() {
   });
 }
 
+const ALLOWED_TTS_VOICES = new Set(['Kore', 'Zephyr', 'Puck', 'Charon', 'Fenrir']);
+const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function formatFriendlyGeminiError(err: unknown, fallbackMsg: string): { status: number; message: string } {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const lower = raw.toLowerCase();
+  if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return {
+      status: 429,
+      message: 'Free Gemini API rate limit sesh hoye geche — 20–30 second por abr try koro!',
+    };
+  }
+  if (lower.includes('api_key') || lower.includes('403') || lower.includes('permission_denied')) {
+    return {
+      status: 403,
+      message: 'Gemini API key invalid ba active noy. API key configuration check koro.',
+    };
+  }
+  return { status: 500, message: fallbackMsg };
+}
+
+function parseBilingualSearchReply(rawText: string | undefined, userName: string) {
+  const clean = String(rawText || '').trim();
+  if (!clean) {
+    return {
+      reply: `Sorry ${userName}, kono info pai ni.`,
+      spokenBn: `সরি ${userName}, কোনো তথ্য পাইনি।`,
+    };
+  }
+  const bnMatch = clean.match(/BANGLA:\s*(.+)$/is);
+  const bgMatch = clean.match(/BANGLISH:\s*([\s\S]*?)(?=BANGLA:|$)/i);
+  if (bgMatch && bnMatch) {
+    return {
+      reply: bgMatch[1].trim(),
+      spokenBn: bnMatch[1].trim(),
+    };
+  }
+  return {
+    reply: clean.replace(/^BANGLISH:\s*/i, '').trim(),
+    spokenBn: '',
+  };
+}
+
 // =========================================================================
 // 1. CLOUD STATE BRIDGE (/api/bot-state) — Mirrors Vercel Serverless API
 // =========================================================================
@@ -164,9 +207,10 @@ app.post('/api/agent/chat', async (req, res) => {
     const systemInstruction = `You are FaceBot, ${userName}'s personal ESP32 voice AI agent (created by Muhib Creation) with a 0.96" SSD1306 OLED, a Piezo Buzzer (GPIO 14), and 1x Green LED (GPIO 26).
 
 STRICT RESPONSE RULES (MUST FOLLOW EVERY TIME):
-1. ALWAYS reply ONLY in natural Banglish (Bengali written in plain English letters, NO Bengali script characters, NO long English paragraphs). Example: "Thik ache Muhib, happy face dekhiye dilam!" or "Ekhon Dhaka te 26 degree, weather besh bhalo."
-2. Keep every reply SUPER SHORT, basic, and conversational — strictly 1 short sentence (max 15 words) so it sounds fast and crisp on the speaker!
-3. UNKNOWN / UNABLE FALLBACK: If you do not understand the message, if it is gibberish/unclear, or if ${userName} asks for something you cannot physically do (like making tea, opening a real door, calling someone, controlling unsupported hardware like servo/fan/AC), ALWAYS start with "Sorry Muhib" (e.g. "Sorry Muhib, eta ami bujhte parini." or "Sorry Muhib, eta ami korte parbo na.") and set faceId to 11 (Dizzy) or 17 (Thinking) and screenKind to "face".
+1. "reply" MUST be natural Banglish (Bengali written in plain English letters, NO Bengali script characters). Keep it SUPER SHORT and conversational — strictly 1 crisp sentence (max 18 words).
+2. "spokenBn" MUST be the EXACT same short sentence written in clean, natural Bengali script (বাংলা) so the neural voice speaks with crystal-clear native Bangladeshi pronunciation. Example: reply="Thik ache Muhib, happy face dekhiye dilam!" -> spokenBn="ঠিক আছে মুহিব, হ্যাপি ফেস দেখিয়ে দিলাম!"
+3. UNKNOWN / UNABLE FALLBACK: If you do not understand the message or cannot physically do it, ALWAYS start with "Sorry ${userName}" (spokenBn: "সরি মুহিব, এটা আমি বুঝতে পারিনি।") and set faceId to 11 (Dizzy) or 17 (Thinking) and screenKind to "face".
+4. Answer general knowledge questions accurately and concisely in Banglish too!
 
 Live Bot Status:
 - Owner: ${userName}
@@ -215,6 +259,7 @@ Hardware Control Rules:
       type: Type.OBJECT,
       properties: {
         reply: { type: Type.STRING },
+        spokenBn: { type: Type.STRING },
         screenKind: {
           type: Type.STRING,
           enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
@@ -240,6 +285,7 @@ Hardware Control Rules:
       },
       required: [
         'reply',
+        'spokenBn',
         'screenKind',
         'faceId',
         'oledLine1',
@@ -253,14 +299,13 @@ Hardware Control Rules:
       ],
     };
 
-    const runChatModel = async (model: string, minimalThinking: boolean) => {
+    const runChatModel = async (model: string, thinkingLevel?: ThinkingLevel) => {
       const resp = await ai.models.generateContent({
         model,
         contents: cleanedContents,
         config: {
           systemInstruction,
-          maxOutputTokens: 280,
-          ...(minimalThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } } : {}),
+          ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
           responseMimeType: 'application/json',
           responseSchema,
         },
@@ -275,17 +320,19 @@ Hardware Control Rules:
     };
 
     try {
-      const parsed = await runChatModel('gemini-4-hydrogen', true);
+      // gemini-4-hydrogen supports ThinkingLevel.LOW (MINIMAL is invalid on Gemini 4)
+      const parsed = await runChatModel('gemini-4-hydrogen', ThinkingLevel.LOW);
       res.json(parsed);
     } catch (primaryErr) {
       console.warn('Primary chat failed, falling back to gemini-3.1-flash-lite:', primaryErr);
-      const fallback = await runChatModel('gemini-3.1-flash-lite', false);
+      await waitMs(450);
+      const fallback = await runChatModel('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
       res.json(fallback);
     }
   } catch (err) {
     console.error('AI Agent error:', err);
-    const msg = err instanceof Error ? err.message : 'AI Agent request failed.';
-    res.status(500).json({ error: msg });
+    const friendly = formatFriendlyGeminiError(err, 'AI server e ektu busy lagche, abr try koro.');
+    res.status(friendly.status).json({ error: friendly.message });
   }
 });
 
@@ -307,30 +354,50 @@ app.post('/api/agent/search', async (req, res) => {
       return;
     }
 
-    const searchInstruction = `You are FaceBot, ${userName}'s desktop AI agent. Answer the user's real-time web query using Google Search results ONLY in very short, simple Banglish (1-2 crisp sentences, plain English letters, no Bengali script). If you cannot find the answer, say "Sorry ${userName}, eta Google e khuje pai ni."`;
+    const searchInstruction = `You are FaceBot, ${userName}'s smart assistant.
+Answer concisely in 1–2 short, clear sentences.
+ALWAYS output strictly in these 2 lines:
+BANGLISH: <same answer in natural Banglish using plain English letters>
+BANGLA: <exact same answer in clean Bengali script for clear voice pronunciation>
+If not found, output:
+BANGLISH: Sorry ${userName}, eta khuje pai ni.
+BANGLA: সরি মুহিব, এটা খুঁজে পাইনি।`;
 
     let response;
+    let searchFallback = false;
     try {
       response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents: query,
         config: {
           systemInstruction: searchInstruction,
-          maxOutputTokens: 220,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           tools: [{ googleSearch: {} }],
         },
       });
     } catch {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: query,
-        config: {
-          systemInstruction: searchInstruction,
-          maxOutputTokens: 220,
-          tools: [{ googleSearch: {} }],
-        },
-      });
+      await waitMs(400);
+      try {
+        response = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: query,
+          config: {
+            systemInstruction: searchInstruction,
+            tools: [{ googleSearch: {} }],
+          },
+        });
+      } catch {
+        await waitMs(400);
+        searchFallback = true;
+        response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: query,
+          config: {
+            systemInstruction: searchInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
+      }
     }
 
     const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
@@ -342,19 +409,23 @@ app.post('/api/agent/search', async (req, res) => {
         uri: c.web?.uri || '',
       }));
 
+    const { reply, spokenBn } = parseBilingualSearchReply(response.text, userName);
+
     res.json({
-      reply: (response.text || `Sorry ${userName}, kono info pai ni.`).trim(),
+      reply,
+      spokenBn,
       sources,
+      searchFallback,
     });
   } catch (err) {
     console.error('Search Grounding error:', err);
-    const msg = err instanceof Error ? err.message : 'Google Search grounding failed.';
-    res.status(500).json({ error: msg });
+    const friendly = formatFriendlyGeminiError(err, 'Web search korte ektu problem holo, abr try koro.');
+    res.status(friendly.status).json({ error: friendly.message });
   }
 });
 
 // =========================================================================
-// 4. AUDIO TRANSCRIPTION (gemini-3.5-transcribe)
+// 4. AUDIO TRANSCRIPTION (gemini-3.5-transcribe with multimodal fallback)
 // =========================================================================
 app.post('/api/agent/transcribe', async (req, res) => {
   try {
@@ -371,28 +442,103 @@ app.post('/api/agent/transcribe', async (req, res) => {
       return;
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-transcribe',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType,
-              data: audioBase64,
-            },
-          },
-          {
-            text: 'Transcribe this audio accurately. If spoken in Bengali/Banglish or English, return only the clean spoken text.',
-          },
-        ],
+    const parts = [
+      {
+        inlineData: {
+          mimeType,
+          data: audioBase64,
+        },
       },
-    });
+      {
+        text: 'Transcribe this audio accurately. If spoken in Bengali/Banglish or English, return only the clean spoken text.',
+      },
+    ];
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: { parts },
+      });
+    } catch {
+      response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: { parts },
+        config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+      });
+    }
 
     res.json({ text: (response.text || '').trim() });
   } catch (err) {
     console.error('Transcribe error:', err);
-    const msg = err instanceof Error ? err.message : 'Audio transcription failed.';
-    res.status(500).json({ error: msg });
+    const friendly = formatFriendlyGeminiError(err, 'Voice transcribe korte problem holo — aro clear kore bolo.');
+    res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// =========================================================================
+// 4B. CRYSTAL-CLEAR NEURAL TTS (gemini-3.8-flash-lite-tts · Free Tier WAV)
+// =========================================================================
+app.post('/api/agent/tts', async (req, res) => {
+  try {
+    const ai = createAiClient();
+    if (!ai) {
+      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+      return;
+    }
+
+    const spokenBn = typeof req.body?.spokenBn === 'string' ? req.body.spokenBn.trim() : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    const speechText = (spokenBn || text).slice(0, 420);
+    if (!speechText) {
+      res.status(400).json({ error: 'Text is required.' });
+      return;
+    }
+
+    const requestedVoice = typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Kore';
+    const voiceName = ALLOWED_TTS_VOICES.has(requestedVoice) ? requestedVoice : 'Kore';
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: speechText,
+              speechMetadata: {
+                style:
+                  'Crystal-clear, warm, friendly Bangladeshi Bengali and English voice assistant speaking calmly at a steady, easy-to-understand pace with crisp enunciation',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+      res.status(502).json({ error: 'No audio returned by Gemini TTS.' });
+      return;
+    }
+
+    res.json({
+      audioBase64: base64Audio,
+      mimeType: 'audio/wav',
+      voiceName,
+    });
+  } catch (err) {
+    console.error('TTS error:', err);
+    const friendly = formatFriendlyGeminiError(err, 'Neural TTS temporarily unavailable.');
+    res.status(friendly.status).json({ error: friendly.message });
   }
 });
 
@@ -454,6 +600,8 @@ function attachLiveVoiceWebSocket(server: http.Server) {
     const urlObj = new URL(req.url || '/ws/live', `http://${req.headers.host || 'localhost'}`);
     const userName = (urlObj.searchParams.get('user') || 'Muhib').slice(0, 24);
     const city = (urlObj.searchParams.get('city') || 'Dhaka').slice(0, 24);
+    const requestedVoice = urlObj.searchParams.get('voice') || 'Kore';
+    const voiceName = ALLOWED_TTS_VOICES.has(requestedVoice) ? requestedVoice : 'Kore';
 
     let liveSession: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
 
@@ -463,15 +611,17 @@ function attachLiveVoiceWebSocket(server: http.Server) {
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           tools: [{ functionDeclarations: [controlFaceBotDeclaration] }],
           systemInstruction: `You are FaceBot, ${userName}'s friendly ESP32 voice companion living in ${city} (by Muhib Creation).
-Speak ONLY in very short, natural Bengali/Banglish sentences (1 short sentence max!).
-Whenever ${userName} asks to change face, show clock/weather/text on OLED, control Green LED, ring buzzer, sleep, wake up, or set an alarm, ALWAYS call the controlFaceBot tool right away.
-If you don't understand or cannot do something, politely say "Sorry ${userName}, eta ami bujhte parini" or "Sorry ${userName}, eta ami korte parbo na."`,
+SPEECH CLARITY RULES:
+- Speak clearly, calmly, and distinctly at a natural, unhurried pace with crisp Bangladeshi Bengali/Banglish pronunciation so every single word is super easy to understand.
+- Keep replies concise (1 short sentence max).
+- Whenever ${userName} asks to change face, show clock/weather/text on OLED, control Green LED, ring buzzer, sleep, wake up, or set an alarm, ALWAYS call the controlFaceBot tool right away.
+- If you don't understand or cannot do something, politely say "Sorry ${userName}, eta ami bujhte parini" or "Sorry ${userName}, eta ami korte parbo na."`,
         },
         callbacks: {
           onopen: () => {

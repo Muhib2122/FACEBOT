@@ -1,9 +1,25 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+
+function formatFriendlyError(err) {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const lower = raw.toLowerCase();
+  if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return {
+      status: 429,
+      message: 'Free Gemini API rate limit sesh hoye geche — 20 second por abr record koro.',
+    };
+  }
+  return {
+    status: 500,
+    message: 'Voice transcribe korte problem holo — aro clear kore bolo.',
+  };
+}
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -21,18 +37,31 @@ export default async function handler(req, res) {
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
     });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-transcribe',
-      contents: {
-        parts: [
-          { inlineData: { mimeType, data: audioBase64 } },
-          { text: 'Transcribe this audio accurately. Return only the spoken text.' },
-        ],
+    const parts = [
+      { inlineData: { mimeType, data: audioBase64 } },
+      {
+        text: 'Transcribe this audio accurately. If spoken in Bengali/Banglish or English, return ONLY the clean spoken text with no extra notes.',
       },
-    });
+    ];
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: { parts },
+      });
+    } catch {
+      response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: { parts },
+        config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+      });
+    }
 
     return res.status(200).json({ text: (response.text || '').trim() });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Transcribe error' });
+    console.error('Transcribe error:', err);
+    const friendly = formatFriendlyError(err);
+    return res.status(friendly.status).json({ error: friendly.message });
   }
 }

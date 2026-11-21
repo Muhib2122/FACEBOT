@@ -5,9 +5,7 @@ import {
   BellOff,
   CloudCheck,
   CloudSun,
-  Code2,
   Cpu,
-  Download,
   Image as ImageIcon,
   LogIn,
   LogOut,
@@ -60,7 +58,6 @@ import {
   playShortClick,
   playWakeChime,
 } from './utils/buzzerAudio';
-import { generateEsp32Firmware } from './utils/firmwareGenerator';
 import { DashboardPanel } from './components/DashboardPanel';
 import { OledHardwareStage } from './components/OledHardwareStage';
 import { AiAgentPanel } from './components/AiAgentPanel';
@@ -70,7 +67,6 @@ import { GalleryPanel } from './components/GalleryPanel';
 import { WeatherProfilePanel } from './components/WeatherProfilePanel';
 import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
-import { FirmwarePanel } from './components/FirmwarePanel';
 
 const STORAGE_KEY = 'facebot_esp32_portal_v1';
 const INTERACTIONS_STORAGE_KEY = 'facebot_daily_interactions_v1';
@@ -171,7 +167,6 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'weather', label: 'Weather & Profile', icon: CloudSun },
       { id: 'hardware', label: 'WiFi & Hardware', icon: Cpu },
-      { id: 'firmware', label: 'ESP32 Firmware', icon: Code2 },
     ],
   },
 ];
@@ -1631,7 +1626,7 @@ export default function App() {
       );
     } else {
       setWifiSaveStatus(
-        `Saved Home WiFi "${ssid}" locally and updated your downloadable ESP32 .ino firmware.`
+        `Saved Home WiFi "${ssid}" locally and synced with your cloud profile.`
       );
     }
     logInteraction('hardware', `Updated WiFi SSID: ${ssid}`, 'portal');
@@ -1652,27 +1647,6 @@ export default function App() {
     } catch {
       setPingStatus('Could not reach ESP32 IP. Verify WiFi connection and IP address.');
     }
-  };
-
-  const handleQuickExportIno = () => {
-    const code = generateEsp32Firmware(
-      settings,
-      location,
-      hardware,
-      alarms,
-      playlist,
-      customReactions,
-      weather?.utcOffsetSeconds ?? 21600
-    );
-    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `FaceBot_ESP32_${(settings.userName || 'Muhib').replace(/\s+/g, '')}.ino`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const currentSectionMeta = ALL_NAV_ITEMS.find((n) => n.id === navSection);
@@ -1805,20 +1779,12 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleGoogleSignIn}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0"
               >
-                <LogIn className="w-3.5 h-3.5 text-blue-600" />
+                <LogIn className="w-3.5 h-3.5" />
                 Sign in with Google
               </button>
             )}
-
-            <button
-              onClick={handleQuickExportIno}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
-            >
-              <Download className="w-3.5 h-3.5" />
-              Export ESP32 .ino
-            </button>
           </div>
         </header>
 
@@ -2120,19 +2086,6 @@ export default function App() {
               cloudSyncStatus={cloudSyncStatus}
             />
           )}
-
-          {/* 8. Dedicated ESP32 Firmware */}
-          {navSection === 'firmware' && (
-            <FirmwarePanel
-              settings={settings}
-              location={location}
-              hardware={hardware}
-              alarms={alarms}
-              playlist={playlist}
-              customReactions={customReactions}
-              utcOffsetSeconds={weather?.utcOffsetSeconds ?? 21600}
-            />
-          )}
         </main>
 
         {/* Quiet Professional Footer — Muhib Creation */}
@@ -2165,10 +2118,10 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => setNavSection('firmware')}
+                onClick={() => setNavSection('gallery')}
                 className="hover:text-slate-900 transition-colors"
               >
-                Firmware
+                Gallery
               </button>
             </div>
           </div>

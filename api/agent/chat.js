@@ -11,7 +11,15 @@ const FACE_CATALOG = [
 const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    reply: { type: Type.STRING },
+    reply: {
+      type: Type.STRING,
+      description: 'Short 1-sentence friendly Banglish reply in plain English letters (max 18 words).',
+    },
+    spokenBn: {
+      type: Type.STRING,
+      description:
+        'The EXACT same short reply written in natural Bengali script (বাংলা) so the voice synthesizer pronounces every word with crystal-clear native Bangladeshi accent.',
+    },
     screenKind: {
       type: Type.STRING,
       enum: ['face', 'watch', 'weather', 'greeting', 'custom-text', 'sleep', 'wake', 'none'],
@@ -28,6 +36,7 @@ const RESPONSE_SCHEMA = {
   },
   required: [
     'reply',
+    'spokenBn',
     'screenKind',
     'faceId',
     'oledLine1',
@@ -41,23 +50,19 @@ const RESPONSE_SCHEMA = {
   ],
 };
 
-// Enforce strict alternating user -> model -> user conversation contents (never start with model!)
 function buildCleanContents(rawHistory, currentMessage) {
   const cleaned = [];
   for (const item of Array.isArray(rawHistory) ? rawHistory.slice(-8) : []) {
     const text = typeof item?.text === 'string' ? item.text.trim() : '';
     if (!text) continue;
     const role = item.role === 'model' ? 'model' : 'user';
-    // Never start conversation history with a synthetic model greeting
     if (cleaned.length === 0 && role === 'model') continue;
-    // Merge consecutive same-role turns so alternation is guaranteed
     if (cleaned.length > 0 && cleaned[cleaned.length - 1].role === role) {
       cleaned[cleaned.length - 1].parts[0].text += ` ${text}`;
     } else {
       cleaned.push({ role, parts: [{ text }] });
     }
   }
-  // If last history item is already 'user', append to it; otherwise push new user turn
   if (cleaned.length > 0 && cleaned[cleaned.length - 1].role === 'user') {
     cleaned[cleaned.length - 1].parts[0].text += `\n${currentMessage}`;
   } else {
@@ -74,6 +79,29 @@ function parseJsonSafe(rawText) {
     .trim();
   return JSON.parse(stripped);
 }
+
+function formatFriendlyError(err) {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const lower = raw.toLowerCase();
+  if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return {
+      status: 429,
+      message: 'Free Gemini API rate limit sesh hoye geche — 20–30 second por abr try koro!',
+    };
+  }
+  if (lower.includes('api_key') || lower.includes('403') || lower.includes('permission_denied')) {
+    return {
+      status: 403,
+      message: 'Gemini API key invalid ba active noy. Vercel Environment Variables check koro.',
+    };
+  }
+  return {
+    status: 500,
+    message: 'AI server e ektu busy lagche, abr try koro.',
+  };
+}
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -101,23 +129,23 @@ export default async function handler(req, res) {
 
     const systemInstruction = `You are FaceBot, ${userName}'s personal ESP32 voice AI agent (created by Muhib Creation) with a 0.96" SSD1306 OLED, a Piezo Buzzer (GPIO 14), and 1x Green LED (GPIO 26).
 STRICT RULES:
-1. ALWAYS reply ONLY in natural Banglish (Bengali written in plain English letters, no Bengali script).
-2. Keep every reply SUPER SHORT and basic — strictly 1 short sentence (max 15 words).
-3. If you don't understand or cannot do it, ALWAYS start with "Sorry Muhib" (e.g. "Sorry Muhib, eta ami bujhte parini.") and set faceId 11 or 17.
+1. "reply" MUST be natural Banglish (Bengali written in plain English letters, no Bengali script), SUPER SHORT (1 crisp sentence, max 18 words).
+2. "spokenBn" MUST be the exact same short sentence written in clean, natural Bengali script (বাংলা) so the neural voice speaks with crystal-clear pronunciation. Example: reply="Bhalo achi Muhib, happy face dekhiye dilam!" -> spokenBn="ভালো আছি মুহিব, হ্যাপি ফেস দেখিয়ে দিলাম!"
+3. If you don't understand or cannot do something, ALWAYS start with "Sorry ${userName}" (spokenBn: "সরি মুহিব, এটা আমি বুঝতে পারিনি।") and set faceId 11 or 17.
+4. Answer general knowledge questions accurately and concisely in Banglish too!
 Context: City=${ctx.city || 'Dhaka'}, Temp=${ctx.temperatureC ?? 'Unknown'}C, Time=${ctx.localTime || 'Unknown'}, Mode=${ctx.mode || 'auto'}, GreenLED=${ctx.greenLedMode || 'auto'}.
 Faces: ${FACE_CATALOG}`;
 
     const contents = buildCleanContents(body.history, message);
 
-    const callModel = async (modelName, useMinimalThinking) => {
+    const callModel = async (modelName, thinkingLevel) => {
       const config = {
         systemInstruction,
-        maxOutputTokens: 280,
         responseMimeType: 'application/json',
         responseSchema: RESPONSE_SCHEMA,
       };
-      if (useMinimalThinking) {
-        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+      if (thinkingLevel) {
+        config.thinkingConfig = { thinkingLevel };
       }
       const resp = await ai.models.generateContent({
         model: modelName,
@@ -129,15 +157,18 @@ Faces: ${FACE_CATALOG}`;
     };
 
     try {
-      const parsed = await callModel('gemini-4-hydrogen', true);
+      // gemini-4-hydrogen supports ThinkingLevel.LOW (NOT MINIMAL!)
+      const parsed = await callModel('gemini-4-hydrogen', ThinkingLevel.LOW);
       return res.status(200).json(parsed);
     } catch (primaryErr) {
-      // Fast automatic fallback to free gemini-3.1-flash-lite if primary hits transient 429/503/timeout
       console.warn('Primary gemini-4-hydrogen failed, trying gemini-3.1-flash-lite:', primaryErr?.message);
-      const fallbackParsed = await callModel('gemini-3.1-flash-lite', false);
+      await wait(500);
+      const fallbackParsed = await callModel('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
       return res.status(200).json(fallbackParsed);
     }
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Agent error' });
+    console.error('Chat API error:', err);
+    const friendly = formatFriendlyError(err);
+    return res.status(friendly.status).json({ error: friendly.message });
   }
 }

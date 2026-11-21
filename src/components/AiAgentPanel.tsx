@@ -8,7 +8,9 @@ import {
   Mic,
   PhoneCall,
   PhoneOff,
+  RotateCcw,
   Send,
+  Sliders,
   Square,
   Trash2,
   Volume2,
@@ -52,6 +54,22 @@ interface AiAgentPanelProps {
   onTestBuzzer: () => void;
 }
 
+type StudioVoiceName = 'Kore' | 'Zephyr' | 'Puck' | 'Charon' | 'Fenrir';
+
+const STUDIO_VOICES: { id: StudioVoiceName; label: string; tone: string }[] = [
+  { id: 'Kore', label: 'Kore', tone: 'Crystal Clear' },
+  { id: 'Zephyr', label: 'Zephyr', tone: 'Warm & Smooth' },
+  { id: 'Puck', label: 'Puck', tone: 'Friendly' },
+  { id: 'Charon', label: 'Charon', tone: 'Calm Deep' },
+  { id: 'Fenrir', label: 'Fenrir', tone: 'Bold Crisp' },
+];
+
+const VOICE_SPEEDS: { value: number; label: string }[] = [
+  { value: 0.88, label: '0.88x' },
+  { value: 1.0, label: '1.0x' },
+  { value: 1.15, label: '1.15x' },
+];
+
 const QUICK_PROMPTS = [
   { label: 'Kemon acho?', prompt: 'Hi FaceBot, kemon acho? Happy face dekhao!', search: false },
   { label: 'Ajker Weather', prompt: 'Ajker weather kemon? OLED te weather dekhao.', search: false },
@@ -62,7 +80,6 @@ const QUICK_PROMPTS = [
   { label: 'Good Night', prompt: 'Good night FaceBot, ghumiye poro r LED off koro.', search: false },
 ];
 
-// Convert Float32 PCM [-1, 1] -> Int16Array -> Base64 (16kHz Live API input)
 function float32ToBase64Pcm16(input: Float32Array): string {
   const int16 = new Int16Array(input.length);
   for (let i = 0; i < input.length; i++) {
@@ -78,7 +95,6 @@ function float32ToBase64Pcm16(input: Float32Array): string {
   return btoa(binary);
 }
 
-// Convert Base64 Int16 PCM (24kHz Live API output) -> Float32Array
 function base64Pcm16ToFloat32(base64: string): Float32Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -106,6 +122,26 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+function cleanErrorMessage(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return 'Free Gemini API rate limit reach hoye geche — 20–30 second por Retry click koro!';
+  }
+  if (trimmed.startsWith('{') && trimmed.includes('"error"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed?.error?.code === 429) {
+        return 'Free Gemini API rate limit reach hoye geche — 20–30 second por Retry click koro!';
+      }
+      if (parsed?.error?.message) return String(parsed.error.message).slice(0, 140);
+    } catch {
+      // fall through
+    }
+  }
+  return trimmed.slice(0, 160) || 'AI server e ektu busy lagche, abr try koro.';
+}
+
 export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   settings,
   location,
@@ -129,9 +165,10 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     {
       id: 'welcome-1',
       role: 'model',
-      text: `Assalamu Alaikum ${settings.userName || 'Muhib'}! Live Voice call, Voice Transcribe, ba Google Search use kore kotha bolo — ami ready.`,
+      text: `Assalamu Alaikum ${settings.userName || 'Muhib'}! HD Neural Voice, Live Voice, ba Web Search use kore kotha bolo — ami ready.`,
+      spokenBn: `আসসালামু আলাইকুম ${settings.userName || 'মুহিব'}! এইচডি ভয়েস বা ওয়েব সার্চ দিয়ে কথা বলো, আমি রেডি।`,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      executedBadges: ['Live Voice', 'Google Search', 'Audio Transcribe', 'OLED + Buzzer + LED'],
+      executedBadges: ['HD Neural Voice', 'Live Voice', 'Web Search', 'OLED Sync'],
     },
   ]);
 
@@ -139,18 +176,23 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   const [loading, setLoading] = useState(false);
   const [searchMode, setSearchMode] = useState(false);
 
-  // Speaker & Mic States
+  // Pro Voice Studio Controls
   const [speakerEnabled, setSpeakerEnabled] = useState(true);
+  const [voiceName, setVoiceName] = useState<StudioVoiceName>('Kore');
+  const [voiceSpeed, setVoiceSpeed] = useState<number>(1.0);
   const [speaking, setSpeaking] = useState(false);
+  const [synthesizingVoice, setSynthesizingVoice] = useState(false);
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
+  const [voiceEngineLabel, setVoiceEngineLabel] = useState<'HD Neural' | 'Device'>('HD Neural');
   const [micLevel, setMicLevel] = useState(0);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
 
-  // 1. Gemini 3.8 Live Real-Time Bidirectional Voice Call States
+  // Live Voice States
   const [liveStatus, setLiveStatus] = useState<'idle' | 'connecting' | 'connected'>('idle');
   const [liveInputDraft, setLiveInputDraft] = useState('');
   const [liveOutputDraft, setLiveOutputDraft] = useState('');
 
-  // 2. Gemini 3.5 Audio Transcribe Recording States
+  // Audio Transcribe Recording States
   const [isRecordingClip, setIsRecordingClip] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
 
@@ -158,7 +200,9 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bufferRef = useRef<SSD1306Buffer>(new SSD1306Buffer());
 
-  // Refs for Live WebSocket + Audio Pipelines (avoid stale closures in audio/ws callbacks)
+  // Audio & WebSocket Refs
+  const activeHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeTtsAbortRef = useRef<AbortController | null>(null);
   const liveWsRef = useRef<WebSocket | null>(null);
   const liveStreamRef = useRef<MediaStream | null>(null);
   const liveInputCtxRef = useRef<AudioContext | null>(null);
@@ -168,21 +212,25 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const liveInputBufRef = useRef<string>('');
   const liveOutputBufRef = useRef<string>('');
+
   const speakerEnabledRef = useRef(speakerEnabled);
+  const voiceNameRef = useRef(voiceName);
+  const voiceSpeedRef = useRef(voiceSpeed);
   const loadingRef = useRef(loading);
   const executeActionRef = useRef(onExecuteAgentAction);
 
-  // Refs for MediaRecorder (Gemini 3.5 Transcribe) & Request Timeout
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordStreamRef = useRef<MediaStream | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
   const activeFetchAbortRef = useRef<AbortController | null>(null);
 
   speakerEnabledRef.current = speakerEnabled;
+  voiceNameRef.current = voiceName;
+  voiceSpeedRef.current = voiceSpeed;
   loadingRef.current = loading;
   executeActionRef.current = onExecuteAgentAction;
 
-  // Render live compact 0.96" OLED monitor inside AI Agent page (smooth 24-FPS)
+  // Render smooth 24-FPS compact 0.96" OLED monitor
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -219,7 +267,29 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     }
   }, [messages, loading, liveInputDraft, liveOutputDraft]);
 
-  // Stop all queued 24kHz Live PCM audio nodes (used on interruption or disconnect)
+  // Stop any playing HD Neural Audio or Browser Speech
+  const stopCurrentSpeech = useCallback(() => {
+    if (activeTtsAbortRef.current) {
+      activeTtsAbortRef.current.abort();
+      activeTtsAbortRef.current = null;
+    }
+    if (activeHtmlAudioRef.current) {
+      try {
+        activeHtmlAudioRef.current.pause();
+        activeHtmlAudioRef.current.currentTime = 0;
+      } catch {
+        // ignore
+      }
+      activeHtmlAudioRef.current = null;
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setSynthesizingVoice(false);
+    setSpeaking(false);
+    setPlayingMessageId(null);
+  }, []);
+
   const clearLiveAudioQueue = useCallback(() => {
     for (const src of activeSourcesRef.current) {
       try {
@@ -235,7 +305,6 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     setSpeaking(false);
   }, []);
 
-  // Cleanly stop Gemini Live WebSocket & audio streams
   const stopLiveVoice = useCallback(() => {
     if (liveProcessorRef.current) {
       try {
@@ -274,46 +343,175 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     setLiveStatus('idle');
   }, [clearLiveAudioQueue]);
 
-  // Cleanup everything on unmount
   useEffect(() => {
     return () => {
       stopLiveVoice();
+      stopCurrentSpeech();
       if (recordStreamRef.current) {
         recordStreamRef.current.getTracks().forEach((t) => t.stop());
       }
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
     };
-  }, [stopLiveVoice]);
+  }, [stopLiveVoice, stopCurrentSpeech]);
 
-  // Speak short Banglish reply through the logged-in device's speaker (for text/search replies)
-  const speakReply = useCallback((text: string) => {
-    if (!speakerEnabledRef.current || typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
-    }
-    try {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      const voices = window.speechSynthesis.getVoices();
-      const preferred =
-        voices.find((v) => v.lang.toLowerCase().includes('en-in')) ||
-        voices.find((v) => v.lang.toLowerCase().includes('en-gb')) ||
-        voices.find((v) => v.lang.toLowerCase().startsWith('en'));
-      if (preferred) utter.voice = preferred;
-      utter.lang = preferred?.lang || 'en-IN';
-      utter.rate = 1.04;
-      utter.onstart = () => setSpeaking(true);
-      utter.onend = () => setSpeaking(false);
-      utter.onerror = () => setSpeaking(false);
-      window.speechSynthesis.speak(utter);
-    } catch {
-      setSpeaking(false);
-    }
-  }, []);
+  // Play WAV Base64 cleanly via HTMLAudioElement with configurable playback speed
+  const playWavBase64 = useCallback(
+    async (base64Wav: string, messageId: string | null) => {
+      stopCurrentSpeech();
+      const audio = new Audio(`data:audio/wav;base64,${base64Wav}`);
+      audio.playbackRate = voiceSpeedRef.current;
+      audio.volume = 1.0;
+      activeHtmlAudioRef.current = audio;
+
+      audio.onplay = () => {
+        setVoiceEngineLabel('HD Neural');
+        setSpeaking(true);
+        setPlayingMessageId(messageId);
+      };
+      audio.onended = () => {
+        if (activeHtmlAudioRef.current === audio) {
+          activeHtmlAudioRef.current = null;
+        }
+        setSpeaking(false);
+        setPlayingMessageId(null);
+      };
+      audio.onerror = () => {
+        if (activeHtmlAudioRef.current === audio) {
+          activeHtmlAudioRef.current = null;
+        }
+        setSpeaking(false);
+        setPlayingMessageId(null);
+      };
+
+      await audio.play();
+    },
+    [stopCurrentSpeech]
+  );
+
+  // Fallback Browser Speech (prefers native Bengali bn-BD / bn-IN voice first!)
+  const speakBrowserFallback = useCallback(
+    (text: string, spokenBn: string | undefined, messageId: string | null) => {
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+      try {
+        window.speechSynthesis.cancel();
+        const voices = window.speechSynthesis.getVoices();
+        const bnVoice =
+          voices.find((v) => v.lang.toLowerCase().includes('bn-bd')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('bn'));
+        const enVoice =
+          voices.find((v) => v.lang.toLowerCase().includes('en-in')) ||
+          voices.find((v) => v.lang.toLowerCase().includes('en-gb')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('en'));
+
+        const chosenVoice = bnVoice && spokenBn ? bnVoice : enVoice;
+        const utter = new SpeechSynthesisUtterance(bnVoice && spokenBn ? spokenBn : text);
+        if (chosenVoice) utter.voice = chosenVoice;
+        utter.lang = chosenVoice?.lang || (spokenBn ? 'bn-BD' : 'en-IN');
+        utter.rate = Math.max(0.85, Math.min(1.15, voiceSpeedRef.current * 0.96));
+        utter.pitch = 1.0;
+
+        utter.onstart = () => {
+          setVoiceEngineLabel('Device');
+          setSpeaking(true);
+          setPlayingMessageId(messageId);
+        };
+        utter.onend = () => {
+          setSpeaking(false);
+          setPlayingMessageId(null);
+        };
+        utter.onerror = () => {
+          setSpeaking(false);
+          setPlayingMessageId(null);
+        };
+        window.speechSynthesis.speak(utter);
+      } catch {
+        setSpeaking(false);
+        setPlayingMessageId(null);
+      }
+    },
+    []
+  );
 
   // =========================================================================
-  // 1. MULTI-TURN BANGLISH CHAT & GOOGLE SEARCH GROUNDING (gemini-4-hydrogen)
+  // CRYSTAL-CLEAR HD NEURAL VOICE ENGINE (Gemini 3.8 Flash Lite TTS)
+  // =========================================================================
+  const speakReply = useCallback(
+    async (
+      text: string,
+      opts?: {
+        spokenBn?: string;
+        messageId?: string | null;
+        cachedAudioBase64?: string;
+        forcePlay?: boolean;
+      }
+    ) => {
+      const msgId = opts?.messageId ?? null;
+      if (!opts?.forcePlay && !speakerEnabledRef.current) return;
+
+      // Toggle stop if user clicked Replay on the currently playing bubble
+      if (msgId && playingMessageId === msgId && speaking) {
+        stopCurrentSpeech();
+        return;
+      }
+
+      stopCurrentSpeech();
+
+      // Instant replay from cached WAV if already synthesized
+      if (opts?.cachedAudioBase64) {
+        try {
+          await playWavBase64(opts.cachedAudioBase64, msgId);
+          return;
+        } catch {
+          // fall through to regenerate/fallback
+        }
+      }
+
+      const controller = new AbortController();
+      activeTtsAbortRef.current = controller;
+      const ttsTimeout = window.setTimeout(() => controller.abort(), 9500);
+      setSynthesizingVoice(true);
+
+      try {
+        const res = await fetch('/api/agent/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            text,
+            spokenBn: opts?.spokenBn || '',
+            voiceName: voiceNameRef.current,
+          }),
+        });
+
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.audioBase64) {
+          throw new Error(data?.error || 'Neural TTS unavailable');
+        }
+
+        // Cache generated audio on the message for instant zero-latency replays
+        if (msgId) {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === msgId ? { ...m, audioBase64: data.audioBase64 } : m))
+          );
+        }
+
+        setSynthesizingVoice(false);
+        await playWavBase64(data.audioBase64, msgId);
+      } catch (err) {
+        setSynthesizingVoice(false);
+        if (err instanceof Error && err.name === 'AbortError') return;
+        speakBrowserFallback(text, opts?.spokenBn, msgId);
+      } finally {
+        window.clearTimeout(ttsTimeout);
+        if (activeTtsAbortRef.current === controller) {
+          activeTtsAbortRef.current = null;
+        }
+      }
+    },
+    [playingMessageId, speaking, stopCurrentSpeech, playWavBase64, speakBrowserFallback]
+  );
+
+  // =========================================================================
+  // 1. MULTI-TURN BANGLISH CHAT & WEB SEARCH (Gemini 4 Hydrogen)
   // =========================================================================
   const sendMessage = useCallback(
     async (
@@ -326,6 +524,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
       const useSearch = forceSearch !== undefined ? forceSearch : searchMode;
       setStatusNotice(null);
+      stopCurrentSpeech();
 
       const userMsg: AgentChatMessage = {
         id: `u-${Date.now()}`,
@@ -344,10 +543,9 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       setLoading(true);
       loadingRef.current = true;
 
-      // 16-second client timeout so "FaceBot bhabche..." can NEVER hang forever on slow networks
       const controller = new AbortController();
       activeFetchAbortRef.current = controller;
-      const timeoutId = window.setTimeout(() => controller.abort(), 16000);
+      const timeoutId = window.setTimeout(() => controller.abort(), 18000);
 
       const parseResponseSafe = async (res: Response) => {
         const rawText = await res.text();
@@ -379,37 +577,42 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           }
 
           const replyText = String(data.reply || `Sorry ${settings.userName || 'Muhib'}, info pai ni.`);
+          const spokenBn = typeof data.spokenBn === 'string' ? data.spokenBn : '';
           const sources = Array.isArray(data.sources) ? data.sources : [];
+          const usedFallback = Boolean(data.searchFallback);
 
           const badges = executeActionRef.current(
             {
               reply: replyText,
+              spokenBn,
               screenKind: 'custom-text',
               faceId: 12,
-              oledLine1: 'WEB SEARCH OK',
-              oledLine2: sources.length > 0 ? `${sources.length} SRC` : 'DONE',
+              oledLine1: usedFallback ? 'AI ANSWER' : 'WEB SEARCH OK',
+              oledLine2: sources.length > 0 ? `${sources.length} SRC` : 'READY',
               greenLed: 'unchanged',
               buzzerSound: 'beep',
               alarmTime: '',
               alarmLabel: '',
               targetMode: 'unchanged',
-              actionSummary: `Google Search: ${trimmed.slice(0, 24)}`,
+              actionSummary: `Web Search: ${trimmed.slice(0, 24)}`,
             },
             source
           );
 
+          const msgId = `m-${Date.now()}`;
           setMessages((prev) => [
             ...prev,
             {
-              id: `m-${Date.now()}`,
+              id: msgId,
               role: 'model',
               text: replyText,
+              spokenBn,
               timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              executedBadges: ['Google Search', ...badges],
+              executedBadges: [usedFallback ? 'AI Knowledge' : 'Google Search', ...badges],
               sources,
             },
           ]);
-          speakReply(replyText);
+          void speakReply(replyText, { spokenBn, messageId: msgId });
         } else {
           const res = await fetch('/api/agent/chat', {
             method: 'POST',
@@ -447,33 +650,35 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
           const action = data as AgentActionResponse;
           const badges = executeActionRef.current(action, source);
+          const msgId = `m-${Date.now()}`;
 
           setMessages((prev) => [
             ...prev,
             {
-              id: `m-${Date.now()}`,
+              id: msgId,
               role: 'model',
               text: action.reply,
+              spokenBn: action.spokenBn || '',
               timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
               actionSummary: action.actionSummary,
               executedBadges: badges,
             },
           ]);
-          speakReply(action.reply);
+          void speakReply(action.reply, { spokenBn: action.spokenBn, messageId: msgId });
         }
       } catch (err) {
         const isAbort = err instanceof Error && err.name === 'AbortError';
         const errMsg = isAbort
           ? 'Response time besi laglo, abr send koro.'
-          : err instanceof Error
-            ? err.message
-            : 'Failed to reach FaceBot AI Agent.';
+          : cleanErrorMessage(err instanceof Error ? err.message : 'Failed to reach FaceBot AI.');
         setMessages((prev) => [
           ...prev,
           {
             id: `e-${Date.now()}`,
             role: 'model',
-            text: `Sorry ${settings.userName || 'Muhib'}, ektu problem holo. (${errMsg})`,
+            text: `Sorry ${settings.userName || 'Muhib'}, ${errMsg}`,
+            retryPrompt: trimmed,
+            retrySearch: useSearch,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             error: true,
           },
@@ -503,6 +708,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       alarmCount,
       todayInteractions,
       speakReply,
+      stopCurrentSpeech,
     ]
   );
 
@@ -515,16 +721,16 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       return;
     }
 
+    stopCurrentSpeech();
     setStatusNotice(null);
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setStatusNotice('Browser microphone API unavailable. Allow mic permissions in HTTPS.');
+      setStatusNotice('Browser microphone unavailable. Allow mic permission in HTTPS.');
       return;
     }
 
     setLiveStatus('connecting');
 
     try {
-      // 1. Capture device microphone at 16kHz mono
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -550,25 +756,23 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       if (inputCtx.state === 'suspended') await inputCtx.resume();
       if (outputCtx.state === 'suspended') await outputCtx.resume();
 
-      // 2. Open WebSocket to /ws/live
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${proto}//${window.location.host}/ws/live?user=${encodeURIComponent(
         settings.userName || 'Muhib'
-      )}&city=${encodeURIComponent(location.city || 'Dhaka')}`;
+      )}&city=${encodeURIComponent(location.city || 'Dhaka')}&voice=${encodeURIComponent(
+        voiceNameRef.current
+      )}`;
 
       const ws = new WebSocket(wsUrl);
       liveWsRef.current = ws;
 
       ws.onopen = () => {
-        // Stream 16kHz PCM chunks to server
         const source = inputCtx.createMediaStreamSource(stream);
         const processor = inputCtx.createScriptProcessor(4096, 1, 1);
         liveProcessorRef.current = processor;
 
         processor.onaudioprocess = (event) => {
           const channelData = event.inputBuffer.getChannelData(0);
-
-          // Live mic amplitude level for visual meter
           let sumSq = 0;
           for (let i = 0; i < channelData.length; i += 8) {
             sumSq += channelData[i] * channelData[i];
@@ -592,12 +796,12 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
           if (msg.ready) {
             setLiveStatus('connected');
-            setStatusNotice('Live Voice active (Gemini 3.8 Live) — directly talk in Banglish!');
+            setStatusNotice(`Live Voice active (${voiceNameRef.current}) — naturally kotha bolo!`);
             return;
           }
 
           if (msg.error) {
-            setStatusNotice(`Live Voice notice: ${msg.error}`);
+            setStatusNotice(`Live Voice notice: ${cleanErrorMessage(msg.error)}`);
             stopLiveVoice();
             return;
           }
@@ -679,7 +883,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                 role: 'model',
                 text: mText,
                 timestamp: ts,
-                executedBadges: ['Gemini 3.8 Live'],
+                executedBadges: ['Live Voice'],
               });
             }
             if (appended.length > 0) {
@@ -697,7 +901,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
       ws.onerror = () => {
         setStatusNotice(
-          'Live Voice WebSocket unavailable on this host — use "Record & Transcribe" (Gemini 3.5) right next to the input box!'
+          'Vercel serverless host-e WebSocket off thake — niche "Voice Mic" button diye kotha bolo, HD Neural Voice-e crystal-clear reply pabe!'
         );
         stopLiveVoice();
       };
@@ -710,16 +914,16 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
       setStatusNotice(`Could not start Live Voice: ${msg}`);
       stopLiveVoice();
     }
-  }, [liveStatus, stopLiveVoice, clearLiveAudioQueue, settings.userName, location.city]);
+  }, [liveStatus, stopLiveVoice, stopCurrentSpeech, clearLiveAudioQueue, settings.userName, location.city]);
 
   // =========================================================================
-  // 3. AUDIO TRANSCRIPTION (gemini-3.5-transcribe via POST /api/agent/transcribe)
+  // 3. VOICE RECORD & TRANSCRIBE (Works on Vercel HTTPS + Mobile + Desktop!)
   // =========================================================================
   const handleToggleRecordTranscribe = useCallback(async () => {
     setStatusNotice(null);
+    stopCurrentSpeech();
 
     if (isRecordingClip) {
-      // Stop recording -> triggers onstop -> sends to /api/agent/transcribe
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
       }
@@ -737,7 +941,13 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       recordStreamRef.current = stream;
       recordChunksRef.current = [];
 
@@ -783,11 +993,11 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             setInput(transcript);
             await sendMessage(transcript, 'voice');
           } else {
-            setStatusNotice('Sorry Muhib, kono voice shona jay ni. Abr try koro.');
+            setStatusNotice('Sorry Muhib, kono voice shona jay ni. Aro clear kore bolo.');
           }
         } catch (err) {
           setStatusNotice(
-            err instanceof Error ? err.message : 'Audio transcription request failed.'
+            cleanErrorMessage(err instanceof Error ? err.message : 'Audio transcription failed.')
           );
         } finally {
           setTranscribing(false);
@@ -796,29 +1006,37 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
       recorder.start();
       setIsRecordingClip(true);
-      setStatusNotice('Recording audio clip... Click Stop to transcribe with Gemini 3.5!');
+      setStatusNotice('Listening... Kotha bola sesh hole Stop click koro!');
     } catch {
-      setStatusNotice('Microphone permission blocked. Allow mic in browser settings.');
+      setStatusNotice('Microphone permission blocked. Browser settings theke Mic allow koro.');
     }
-  }, [isRecordingClip, liveStatus, stopLiveVoice, sendMessage]);
+  }, [isRecordingClip, liveStatus, stopLiveVoice, stopCurrentSpeech, sendMessage]);
 
   const handleTestSpeaker = () => {
     setSpeakerEnabled(true);
     speakerEnabledRef.current = true;
-    speakReply(`Assalamu Alaikum ${settings.userName || 'Muhib'}! Speaker thik thak kaj korteche.`);
+    void speakReply(
+      `Assalamu Alaikum ${settings.userName || 'Muhib'}! Amar HD voice ekhon ekdom clear shona jacche.`,
+      {
+        spokenBn: `আসসালামু আলাইকুম ${settings.userName || 'মুহিব'}! আমার এইচডি ভয়েস এখন একদম ক্লিয়ার শোনা যাচ্ছে।`,
+        forcePlay: true,
+      }
+    );
   };
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    sendMessage(input, 'portal');
+    void sendMessage(input, 'portal');
   };
 
   const handleClearChat = () => {
+    stopCurrentSpeech();
     setMessages([
       {
         id: `reset-${Date.now()}`,
         role: 'model',
         text: `Chat clear kore dilam ${settings.userName || 'Muhib'}. Ekhon bolo ki korbo?`,
+        spokenBn: `চ্যাট ক্লিয়ার করে দিলাম ${settings.userName || 'মুহিব'}। এখন বলো কী করবো?`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
     ]);
@@ -826,36 +1044,34 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-      {/* Left Column: Full Free Gemini Voice, Transcribe, Search & Banglish Console */}
+      {/* Left Column: Pro Voice Studio + Chat & Web Search Console */}
       <section className="xl:col-span-8 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col">
         {/* Top Agent Control Header */}
         <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
-              FaceBot Free AI Agent · Live Voice + Search + Transcribe
+              FaceBot Pro AI Voice Agent
             </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Voice:{' '}
+            <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
               {liveStatus === 'connected'
-                ? 'Live Connected'
-                : liveStatus === 'connecting'
-                  ? 'Connecting...'
-                  : isRecordingClip
-                    ? 'Recording Clip'
-                    : 'Ready'}
+                ? 'Live Call Active'
+                : synthesizingVoice
+                  ? `Generating ${voiceName} HD Voice...`
+                  : speaking
+                    ? `Speaking (${voiceEngineLabel} · ${voiceName})`
+                    : isRecordingClip
+                      ? 'Recording Mic...'
+                      : `HD Neural Voice · ${voiceName}`}
               <span className="mx-1.5" aria-hidden="true">·</span>
-              Speaker: {speakerEnabled ? (speaking ? 'Speaking' : 'ON') : 'Muted'}
-              <span className="mx-1.5" aria-hidden="true">·</span>
-              {searchMode ? 'Google Search ON' : 'Banglish Hardware Mode'}
+              {searchMode ? 'Web Search ON' : 'Banglish Hardware Mode'}
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {/* 1. Gemini 3.8 Live Real-Time Bidirectional Voice Call */}
             <button
               type="button"
               onClick={startLiveVoice}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 liveStatus !== 'idle'
                   ? 'bg-red-600 hover:bg-red-700 text-white'
                   : 'bg-blue-600 hover:bg-blue-700 text-white'
@@ -864,21 +1080,20 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
               {liveStatus !== 'idle' ? (
                 <>
                   <PhoneOff className="w-3.5 h-3.5" />
-                  End Live Voice
+                  End Call
                 </>
               ) : (
                 <>
                   <PhoneCall className="w-3.5 h-3.5" />
-                  Start Live Voice
+                  Live Voice
                 </>
               )}
             </button>
 
-            {/* 2. Google Search Grounding Toggle (Gemini 4 Hydrogen + googleSearch) */}
             <button
               type="button"
               onClick={() => setSearchMode((s) => !s)}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                 searchMode
                   ? 'border-blue-600 bg-blue-50 text-blue-700'
                   : 'border-slate-200 text-slate-700 hover:bg-slate-50'
@@ -888,62 +1103,159 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
               {searchMode ? 'Web Search: ON' : 'Web Search'}
             </button>
 
-            {/* Speaker Toggle */}
             <button
               type="button"
-              onClick={() => setSpeakerEnabled((s) => !s)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
+              onClick={() => {
+                if (speaking || synthesizingVoice) {
+                  stopCurrentSpeech();
+                } else {
+                  setSpeakerEnabled((s) => !s);
+                }
+              }}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                speaking
+                  ? 'border-blue-600 bg-blue-50 text-blue-700'
+                  : 'border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
             >
-              {speakerEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
-              {speakerEnabled ? 'Speaker ON' : 'Muted'}
+              {speaking ? (
+                <>
+                  <Square className="w-3 h-3 fill-current" />
+                  Stop Audio
+                </>
+              ) : speakerEnabled ? (
+                <>
+                  <Volume2 className="w-3.5 h-3.5" />
+                  Speaker ON
+                </>
+              ) : (
+                <>
+                  <VolumeX className="w-3.5 h-3.5" />
+                  Muted
+                </>
+              )}
             </button>
 
             <button
               type="button"
               onClick={handleClearChat}
-              className="p-1.5 text-slate-500 border border-slate-200 hover:bg-slate-50 hover:text-slate-800 rounded-lg transition-colors"
-              title="Clear chat"
+              className="p-2 text-slate-500 border border-slate-200 hover:bg-slate-50 hover:text-slate-800 rounded-lg transition-colors shrink-0"
+              title="Clear conversation"
+              aria-label="Clear conversation"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
 
-        {/* Live Voice Meter / Notice Strip */}
-        {(liveStatus !== 'idle' || isRecordingClip || transcribing || statusNotice) && (
-          <div className="px-5 py-2.5 bg-slate-50 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs">
+        {/* Pro Voice Studio Tuning Bar (Persona + Speed + Test Clarity) */}
+        <div className="px-5 py-2.5 bg-slate-50 border-b border-slate-200/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="inline-flex items-center gap-1.5 text-slate-600 font-medium">
+              <Sliders className="w-3.5 h-3.5 text-slate-400" />
+              <span>Voice:</span>
+              <select
+                value={voiceName}
+                onChange={(e) => {
+                  const next = e.target.value as StudioVoiceName;
+                  setVoiceName(next);
+                  voiceNameRef.current = next;
+                  // Clear cached WAVs so replays regenerate with newly chosen persona
+                  setMessages((prev) => prev.map((m) => ({ ...m, audioBase64: undefined })));
+                }}
+                aria-label="Select AI studio voice"
+                className="bg-white border border-slate-200 rounded-md px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/25"
+              >
+                {STUDIO_VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label} ({v.tone})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-lg">
+              {VOICE_SPEEDS.map((sp) => (
+                <button
+                  key={sp.value}
+                  type="button"
+                  onClick={() => {
+                    setVoiceSpeed(sp.value);
+                    voiceSpeedRef.current = sp.value;
+                    if (activeHtmlAudioRef.current) {
+                      activeHtmlAudioRef.current.playbackRate = sp.value;
+                    }
+                  }}
+                  className={`px-2 py-1 text-[11px] font-semibold font-mono rounded-md transition-colors whitespace-nowrap ${
+                    voiceSpeed === sp.value
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {sp.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleTestSpeaker}
+            disabled={synthesizingVoice}
+            className="inline-flex items-center gap-1.5 text-blue-600 hover:text-blue-700 font-semibold whitespace-nowrap disabled:opacity-50"
+          >
+            {synthesizingVoice ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Headphones className="w-3.5 h-3.5" />
+            )}
+            Test HD Voice
+          </button>
+        </div>
+
+        {/* Live Status / Voice Visualizer Strip */}
+        {(liveStatus !== 'idle' || isRecordingClip || transcribing || speaking || statusNotice) && (
+          <div className="px-5 py-2.5 bg-blue-50/60 border-b border-blue-100 flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2.5 flex-1 min-w-[200px]">
               {liveStatus === 'connected' ? (
                 <>
                   <AudioLines className="w-3.5 h-3.5 text-blue-600 shrink-0" />
                   <span className="font-medium text-slate-800 whitespace-nowrap">
-                    {speaking ? 'FaceBot Speaking...' : 'Listening Live (16kHz PCM)'}
+                    {speaking ? 'FaceBot Speaking Live...' : 'Listening (16kHz Studio Mic)'}
                   </span>
-                  <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden max-w-[180px]">
+                  <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden max-w-[160px]">
                     <div
                       className="h-full bg-blue-600 transition-all duration-75"
-                      style={{ width: `${Math.max(5, micLevel)}%` }}
+                      style={{ width: `${Math.max(8, micLevel)}%` }}
                     />
                   </div>
                 </>
+              ) : speaking ? (
+                <div className="inline-flex items-center gap-2 text-blue-800 font-medium">
+                  <AudioLines className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span>
+                    Speaking clearly via {voiceEngineLabel} Voice ({voiceName} · {voiceSpeed}x)
+                  </span>
+                </div>
               ) : transcribing ? (
                 <span className="inline-flex items-center gap-1.5 text-blue-700 font-medium">
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  Transcribing your audio clip with Gemini 3.5...
+                  Transcribing your voice...
                 </span>
               ) : (
                 <span className="text-slate-700">{statusNotice}</span>
               )}
             </div>
 
-            <button
-              type="button"
-              onClick={handleTestSpeaker}
-              className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium whitespace-nowrap"
-            >
-              <Headphones className="w-3.5 h-3.5" />
-              Test Speaker
-            </button>
+            {speaking && (
+              <button
+                type="button"
+                onClick={stopCurrentSpeech}
+                className="text-xs font-semibold text-red-600 hover:text-red-700 whitespace-nowrap"
+              >
+                Stop
+              </button>
+            )}
           </div>
         )}
 
@@ -954,7 +1266,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
               key={item.label}
               type="button"
               disabled={loading || transcribing}
-              onClick={() => sendMessage(item.prompt, 'portal', item.search)}
+              onClick={() => void sendMessage(item.prompt, 'portal', item.search)}
               className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 hover:border-slate-400 hover:text-slate-900 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               {item.label}
@@ -962,24 +1274,25 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           ))}
         </div>
 
-        {/* Chat & Live Voice Transcript */}
+        {/* Chat & Voice Transcript */}
         <div
           ref={scrollRef}
-          className="p-5 space-y-4 h-[370px] overflow-y-auto bg-slate-50/40"
+          className="p-5 space-y-4 h-[380px] overflow-y-auto bg-slate-50/50"
         >
           {messages.map((msg) => {
             const isUser = msg.role === 'user';
+            const isThisPlaying = playingMessageId === msg.id && speaking;
             return (
               <div
                 key={msg.id}
                 className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
               >
                 <div
-                  className={`max-w-[85%] rounded-xl px-4 py-3 text-sm leading-relaxed ${
+                  className={`max-w-[88%] rounded-xl px-4 py-3 text-sm leading-relaxed ${
                     isUser
                       ? 'bg-slate-900 text-white'
                       : msg.error
-                        ? 'bg-red-50 border border-red-200 text-red-800'
+                        ? 'bg-red-50 border border-red-200 text-red-900'
                         : 'bg-white border border-slate-200 text-slate-800'
                   }`}
                 >
@@ -989,7 +1302,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                   {!isUser && msg.sources && msg.sources.length > 0 && (
                     <div className="mt-2.5 pt-2 border-t border-slate-100 space-y-1">
                       <div className="text-[11px] font-semibold text-slate-500">
-                        Google Search Sources
+                        Web Sources
                       </div>
                       <div className="flex flex-wrap gap-x-3 gap-y-1">
                         {msg.sources.map((src) => (
@@ -1008,20 +1321,67 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                     </div>
                   )}
 
-                  {/* Clean Metadata Line */}
+                  {/* Footer Metadata + Replay Voice / Retry Action */}
                   <div
-                    className={`mt-2 text-[11px] tabular-nums ${
-                      isUser ? 'text-slate-400 text-right' : 'text-slate-500'
+                    className={`mt-2.5 flex flex-wrap items-center justify-between gap-3 text-[11px] tabular-nums ${
+                      isUser ? 'text-slate-400' : 'text-slate-500'
                     }`}
                   >
-                    <span>{msg.timestamp}</span>
-                    {!isUser && msg.executedBadges && msg.executedBadges.length > 0 && (
-                      <>
-                        <span className="mx-1.5" aria-hidden="true">·</span>
-                        <span className="font-mono text-slate-600">
-                          {msg.executedBadges.join(' · ')}
-                        </span>
-                      </>
+                    <div>
+                      <span>{msg.timestamp}</span>
+                      {!isUser && msg.executedBadges && msg.executedBadges.length > 0 && (
+                        <>
+                          <span className="mx-1.5" aria-hidden="true">·</span>
+                          <span className="font-mono text-slate-600">
+                            {msg.executedBadges.join(' · ')}
+                          </span>
+                        </>
+                      )}
+                    </div>
+
+                    {!isUser && !msg.error && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void speakReply(msg.text, {
+                            spokenBn: msg.spokenBn,
+                            messageId: msg.id,
+                            cachedAudioBase64: msg.audioBase64,
+                            forcePlay: true,
+                          })
+                        }
+                        className={`inline-flex items-center gap-1 font-semibold transition-colors whitespace-nowrap ${
+                          isThisPlaying
+                            ? 'text-blue-600'
+                            : 'text-slate-500 hover:text-slate-900'
+                        }`}
+                      >
+                        {isThisPlaying ? (
+                          <>
+                            <Square className="w-2.5 h-2.5 fill-current" />
+                            Stop
+                          </>
+                        ) : (
+                          <>
+                            <Volume2 className="w-3 h-3" />
+                            Listen
+                          </>
+                        )}
+                      </button>
+                    )}
+
+                    {msg.error && msg.retryPrompt && (
+                      <button
+                        type="button"
+                        disabled={loading}
+                        onClick={() =>
+                          void sendMessage(msg.retryPrompt || '', 'portal', msg.retrySearch)
+                        }
+                        className="inline-flex items-center gap-1 font-semibold text-red-700 hover:text-red-900 underline underline-offset-2 whitespace-nowrap disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        Retry
+                      </button>
                     )}
                   </div>
                 </div>
@@ -1029,7 +1389,6 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             );
           })}
 
-          {/* Streaming Live Voice Draft Bubbles */}
           {liveInputDraft && (
             <div className="flex flex-col items-end">
               <div className="max-w-[85%] rounded-xl px-4 py-2.5 text-sm bg-slate-800 text-slate-100">
@@ -1050,7 +1409,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             <div className="flex items-start">
               <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 inline-flex items-center gap-3">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
-                <span>{searchMode ? 'Google e khujche...' : 'FaceBot bhabche...'}</span>
+                <span>{searchMode ? 'Web e khujche...' : 'FaceBot bhabche...'}</span>
                 <button
                   type="button"
                   onClick={() => activeFetchAbortRef.current?.abort()}
@@ -1063,7 +1422,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
           )}
         </div>
 
-        {/* Composer Row: Audio Transcribe Mic + Text Input + Send */}
+        {/* Composer Row: Voice Mic + Input + Send */}
         <form
           onSubmit={handleFormSubmit}
           className="p-4 bg-white border-t border-slate-200 flex items-center gap-2.5"
@@ -1074,8 +1433,8 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             disabled={loading || transcribing}
             title={
               isRecordingClip
-                ? 'Stop recording & transcribe with Gemini 3.5'
-                : 'Record voice clip & transcribe (Gemini 3.5)'
+                ? 'Stop recording & send voice command'
+                : 'Speak in Banglish / Bengali (HD Mic)'
             }
             className={`inline-flex items-center gap-1.5 px-3 py-2.5 rounded-lg border text-xs font-semibold transition-colors shrink-0 ${
               isRecordingClip
@@ -1093,7 +1452,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             ) : (
               <>
                 <Mic className="w-4 h-4" />
-                <span className="hidden sm:inline">Transcribe</span>
+                <span className="hidden sm:inline">Voice Mic</span>
               </>
             )}
           </button>
@@ -1105,10 +1464,10 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
             disabled={loading || transcribing}
             placeholder={
               searchMode
-                ? 'Google Search mode ON — ask live news, cricket, weather, facts...'
-                : 'Banglish e likho ba Voice use koro... e.g. "Happy face dekhao"'
+                ? 'Web Search ON — news, facts, cricket, weather jiggesh koro...'
+                : 'Banglish e likho ba Voice Mic use koro...'
             }
-            className="flex-1 px-3.5 py-2.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:bg-slate-50"
+            className="flex-1 min-w-0 px-3.5 py-2.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:bg-slate-50"
           />
 
           <button
@@ -1127,7 +1486,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div>
             <h3 className="text-sm font-semibold text-slate-900">Live OLED Monitor</h3>
-            <p className="text-xs text-slate-500">24-FPS smooth sync to Vercel Cloud</p>
+            <p className="text-xs text-slate-500">24-FPS smooth sync to ESP32</p>
           </div>
           <span className="text-xs font-mono text-slate-500">0.96&quot; I2C</span>
         </div>
@@ -1171,7 +1530,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
                   key={m}
                   type="button"
                   onClick={() => onChangeGreenLedMode(m)}
-                  className={`py-1.5 text-xs font-semibold rounded-md border uppercase transition-colors ${
+                  className={`py-2 text-xs font-semibold rounded-md border uppercase transition-colors ${
                     hardware.greenLedMode === m
                       ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -1196,7 +1555,7 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
               onClick={handleTestSpeaker}
               className="py-2 text-xs font-semibold text-slate-800 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors"
             >
-              Test Speaker
+              Test HD Voice
             </button>
           </div>
 
@@ -1208,7 +1567,10 @@ export const AiAgentPanel: React.FC<AiAgentPanelProps> = ({
               </span>
             </div>
             <div>
-              Free Gemini Suite: Live Voice (3.8), Banglish Chat &amp; Google Search (4 Hydrogen), Audio Transcribe (3.5).
+              Voice Engine:{' '}
+              <span className="font-medium text-slate-700">
+                HD Neural Bengali/Banglish ({voiceName})
+              </span>
             </div>
           </div>
         </div>

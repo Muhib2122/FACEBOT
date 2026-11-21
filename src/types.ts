@@ -8,8 +8,7 @@ export type NavSection =
   | 'gallery'
   | 'weather'
   | 'alarms'
-  | 'hardware'
-  | 'firmware';
+  | 'hardware';
 
 export type InteractionCategory = 'ai-voice' | 'oled-face' | 'hardware' | 'alarm';
 
@@ -144,6 +143,7 @@ export interface HardwareConfig {
 
 export interface AgentActionResponse {
   reply: string;
+  spokenBn?: string;
   screenKind: 'face' | 'watch' | 'weather' | 'greeting' | 'custom-text' | 'sleep' | 'wake' | 'none';
   faceId: number;
   oledLine1: string;
@@ -160,6 +160,10 @@ export interface AgentChatMessage {
   id: string;
   role: 'user' | 'model';
   text: string;
+  spokenBn?: string;
+  audioBase64?: string;
+  retryPrompt?: string;
+  retrySearch?: boolean;
   timestamp: string;
   actionSummary?: string;
   executedBadges?: string[];

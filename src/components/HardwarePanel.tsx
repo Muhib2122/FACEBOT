@@ -104,7 +104,7 @@ export const HardwarePanel: React.FC<HardwarePanelProps> = ({
                 type="url"
                 value={hardware.cloudPortalUrl}
                 onChange={(e) => onUpdateHardware({ cloudPortalUrl: e.target.value })}
-                placeholder="https://muhib-facebot.vercel.app"
+                placeholder="https://myfacebot.vercel.app"
                 className="flex-1 px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg"
               />
               <button
