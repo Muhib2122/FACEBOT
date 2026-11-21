@@ -198,6 +198,8 @@ export interface SavedGifItem {
   frameDelayMs: number;
   /** Array of 2048-char hex strings (each = 1024 bytes = 128x64 1-bit SSD1306 frame) */
   framesHex: string[];
+  threshold?: number;
+  inverted?: boolean;
   createdAt: number;
 }
 

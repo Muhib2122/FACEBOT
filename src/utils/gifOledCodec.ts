@@ -4,6 +4,7 @@ import { drawHeart, drawStar, OLED_HEIGHT, OLED_WIDTH, SSD1306Buffer } from './o
 
 export interface DecodedGifResult {
   framesHex: string[];
+  packedFrames: Uint8Array[]; // Each Uint8Array is exactly 1024 bytes (128x64 1-bit MSB-first) for ESP32 SSD1306
   recommendedDelayMs: number;
   originalFrameCount: number;
   width: number;
@@ -34,6 +35,20 @@ export function hex2048ToPackedBytes(hex: string): Uint8Array {
   return out;
 }
 
+export function writePackedBytesToBuffer(bytes: Uint8Array, buffer: SSD1306Buffer): void {
+  buffer.clearDisplay();
+  if (!bytes || bytes.length < 1024) return;
+  for (let i = 0; i < 1024; i++) {
+    const byteVal = bytes[i];
+    const y = Math.floor(i / 16);
+    const xb = i % 16;
+    const rowBase = y * OLED_WIDTH + xb * 8;
+    for (let bit = 0; bit < 8; bit++) {
+      buffer.pixels[rowBase + bit] = (byteVal >> (7 - bit)) & 1;
+    }
+  }
+}
+
 export function writeHex2048ToBuffer(hex: string, buffer: SSD1306Buffer): void {
   buffer.clearDisplay();
   if (!hex || hex.length < 2048) return;
@@ -48,6 +63,14 @@ export function writeHex2048ToBuffer(hex: string, buffer: SSD1306Buffer): void {
   }
 }
 
+export function packedFramesToBinaryBlob(packedFrames: Uint8Array[]): Blob {
+  const totalBytes = new Uint8Array(packedFrames.length * 1024);
+  packedFrames.forEach((frameBytes, idx) => {
+    totalBytes.set(frameBytes.subarray(0, 1024), idx * 1024);
+  });
+  return new Blob([totalBytes], { type: 'application/octet-stream' });
+}
+
 export function framesHexToBinaryBlob(framesHex: string[]): Blob {
   const totalBytes = new Uint8Array(framesHex.length * 1024);
   framesHex.forEach((hex, idx) => {
@@ -57,7 +80,8 @@ export function framesHexToBinaryBlob(framesHex: string[]): Blob {
 }
 
 /**
- * Decode any animated GIF ArrayBuffer into 128x64 1-bit monochrome frames (1024 bytes / 2048 hex chars each).
+ * Decode any animated GIF ArrayBuffer using omggif into 128x64 1-bit monochrome frames
+ * packed into the 1024-byte (16 bytes/row × 64 rows, MSB-first) format expected by ESP32 SSD1306 firmware.
  * Handles GIF frame disposal methods properly so delta/transparent GIFs animate cleanly.
  */
 export function decodeGifToOledFrames(
@@ -105,6 +129,7 @@ export function decodeGifToOledFrames(
   }
 
   const framesHex: string[] = [];
+  const packedFrames: Uint8Array[] = [];
   const rawFrameRgba = new Uint8ClampedArray(width * height * 4);
   let delaySum = 0;
   let delayCount = 0;
@@ -164,6 +189,7 @@ export function decodeGifToOledFrames(
         }
       }
 
+      packedFrames.push(packed);
       framesHex.push(packedBytesToHex2048(packed));
     }
 
@@ -182,6 +208,7 @@ export function decodeGifToOledFrames(
 
   return {
     framesHex,
+    packedFrames,
     recommendedDelayMs,
     originalFrameCount: numFrames,
     width,
