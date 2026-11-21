@@ -53,7 +53,7 @@ export function generateEsp32Firmware(
   const safePass = (hardware.wifiPassword || '12345678').replace(/"/g, '');
   const safeUser = (settings.userName || 'Muhib').replace(/"/g, '');
   const safeDeviceId = (hardware.deviceId || 'muhib-bot-1').replace(/"/g, '');
-  const safeCloudBase = (hardware.cloudPortalUrl || 'https://muhib-facebot.vercel.app')
+  const safeCloudBase = (hardware.cloudPortalUrl || 'https://myfacebot.vercel.app')
     .replace(/\/$/, '')
     .replace(/"/g, '');
   const safeFirebaseUrl = (hardware.firebaseDbUrl || '').replace(/"/g, '');
@@ -133,7 +133,7 @@ float  coldThresholdC = ${settings.coldThresholdC.toFixed(1)};
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
-portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t stateMutex = NULL;
 
 // -------- Multi-Alarm Schedule --------
 struct AlarmSlot {
@@ -168,13 +168,13 @@ bool   buzzerActiveMode = false;
 volatile bool pendingBuzzer = false;
 String pendingBuzzerMode    = "tone";
 
-// Cloud deduplication counters
-long lastCloudUpdatedAt  = 0;
-int  lastBuzzerSeq       = 0;
-int  lastBitmapSeq       = 0;
-int  lastAlarmDismissSeq = 0;
-int  lastOtaTriggerSeq   = 0;
-bool cloudOnline         = false;
+// Cloud deduplication counters (64-bit int64_t for JS Date.now() ms!)
+int64_t lastCloudUpdatedAt = 0;
+int  lastBuzzerSeq         = 0;
+int  lastBitmapSeq         = 0;
+int  lastAlarmDismissSeq   = 0;
+int  lastOtaTriggerSeq     = 0;
+bool cloudOnline           = false;
 
 // Screen durations (seconds)
 int watchDurSec   = ${watchDur};
@@ -725,83 +725,87 @@ void pollVercelCloudOnce() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(client, CLOUD_URL);
-  http.setTimeout(3500);
+  http.setTimeout(4000);
   int code = http.GET();
   if (code == 200) {
     cloudOnline = true;
     String body = http.getString();
     JsonDocument doc;
     if (!deserializeJson(doc, body)) {
-      long upd = doc["updatedAt"] | 0L;
+      int64_t upd = doc["updatedAt"] | (int64_t)0;
       if (upd > 0 && upd != lastCloudUpdatedAt) {
         lastCloudUpdatedAt = upd;
         logEspInteraction();
 
-        String newMode   = doc["mode"] | botMode;
-        String newScreen = doc["screen"] | activeScreen;
+        String newMode   = String(doc["mode"] | "auto");
+        String newScreen = String(doc["screen"] | "auto");
         int    newFace   = doc["faceId"] | currentFace;
-        String newL1     = doc["textLine1"] | "";
-        String newL2     = doc["textLine2"] | "";
-        String newLed    = doc["greenLed"] | greenLedMode;
-        String newUser   = doc["userName"] | userName;
-        String newCity   = doc["city"] | cityName;
+        String newL1     = String(doc["textLine1"] | "");
+        String newL2     = String(doc["textLine2"] | "");
+        String newLed    = String(doc["greenLed"] | "auto");
+        String newUser   = String(doc["userName"] | "Muhib");
+        String newCity   = String(doc["city"] | "Dhaka");
+        int    buzSeq    = doc["buzzerSeq"] | 0;
+        String buzMode   = String(doc["buzzerMode"] | "tone");
+        int    bmpSeq    = doc["bitmapSeq"] | 0;
+        String bmpHex    = String(doc["bitmapHex"] | "");
+        int    disSeq    = doc["alarmDismissSeq"] | 0;
+        int    otaSeq    = doc["otaTriggerSeq"] | 0;
 
-        portENTER_CRITICAL(&stateMux);
-        botMode      = newMode;
-        activeScreen = newScreen;
-        currentFace  = constrain(newFace, 0, 24);
-        if (newL1.length() > 0) customLine1 = newL1;
-        customLine2  = newL2;
-        greenLedMode = newLed;
-        userName     = newUser;
-        cityName     = newCity;
-        screenLocked = (newScreen != "auto");
-        isSleeping   = (newScreen == "face" && currentFace == 7);
-        portEXIT_CRITICAL(&stateMux);
+        if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
+          botMode      = newMode;
+          activeScreen = newScreen;
+          currentFace  = constrain(newFace, 0, 24);
+          if (newL1.length() > 0) customLine1 = newL1;
+          customLine2  = newL2;
+          greenLedMode = newLed;
+          userName     = newUser;
+          cityName     = newCity;
+          screenLocked = (newScreen != "auto");
+          isSleeping   = (newScreen == "face" && currentFace == 7);
 
-        int buzSeq = doc["buzzerSeq"] | 0;
-        if (buzSeq > lastBuzzerSeq) {
-          lastBuzzerSeq = buzSeq;
-          pendingBuzzerMode = doc["buzzerMode"] | "tone";
-          pendingBuzzer = true;
-        }
-
-        int bmpSeq = doc["bitmapSeq"] | 0;
-        if (bmpSeq > lastBitmapSeq) {
-          lastBitmapSeq = bmpSeq;
-          String hex = doc["bitmapHex"] | "";
-          if (hex.length() >= 2048) {
-            decodeHexBitmap(hex);
-            activeScreen = "bitmap";
-            screenLocked = true;
+          if (buzSeq > lastBuzzerSeq) {
+            lastBuzzerSeq = buzSeq;
+            pendingBuzzerMode = buzMode;
+            pendingBuzzer = true;
           }
-        }
 
-        int disSeq = doc["alarmDismissSeq"] | 0;
-        if (disSeq > lastAlarmDismissSeq) {
-          lastAlarmDismissSeq = disSeq;
-          alarmRinging = false;
-          ringingAlarmIdx = -1;
-        }
-
-        if (doc["alarms"].is<JsonArray>()) {
-          JsonArray arr = doc["alarms"].as<JsonArray>();
-          int idx = 0;
-          for (JsonObject a : arr) {
-            if (idx >= MAX_ALARMS) break;
-            alarms[idx].hour    = a["hour"] | 7;
-            alarms[idx].minute  = a["min"] | 0;
-            alarms[idx].enabled = a["on"] | false;
-            alarms[idx].faceId  = a["face"] | 1;
-            alarms[idx].melody  = a["melody"] | 0;
-            alarms[idx].label   = a["label"] | "Alarm";
-            idx++;
+          if (bmpSeq > lastBitmapSeq) {
+            lastBitmapSeq = bmpSeq;
+            if (bmpHex.length() >= 2048) {
+              decodeHexBitmap(bmpHex);
+              activeScreen = "bitmap";
+              screenLocked = true;
+            }
           }
-          alarmCount = idx;
+
+          if (disSeq > lastAlarmDismissSeq) {
+            lastAlarmDismissSeq = disSeq;
+            alarmRinging = false;
+            ringingAlarmIdx = -1;
+          }
+
+          if (doc["alarms"].is<JsonArray>()) {
+            JsonArray arr = doc["alarms"].as<JsonArray>();
+            int idx = 0;
+            for (JsonObject a : arr) {
+              if (idx >= MAX_ALARMS) break;
+              alarms[idx].hour    = a["hour"] | 7;
+              alarms[idx].minute  = a["min"] | 0;
+              alarms[idx].enabled = a["on"] | false;
+              alarms[idx].faceId  = a["face"] | 1;
+              alarms[idx].melody  = a["melody"] | 0;
+              alarms[idx].label   = String(a["label"] | "Alarm");
+              idx++;
+            }
+            alarmCount = idx;
+          }
+          xSemaphoreGive(stateMutex);
+          Serial.println("[Cloud Sync] screen=" + newScreen + " face=" + String(newFace) + " led=" + newLed);
         }
 
-        int otaSeq = doc["otaTriggerSeq"] | 0;
         if (otaSeq > lastOtaTriggerSeq) {
           lastOtaTriggerSeq = otaSeq;
           http.end();
@@ -812,6 +816,7 @@ void pollVercelCloudOnce() {
     }
   } else {
     cloudOnline = false;
+    Serial.println("[Cloud Sync] HTTP error: " + String(code));
   }
   http.end();
 }
@@ -1014,10 +1019,11 @@ ${alarmInitLines.length > 0 ? alarmInitLines.join('\n') : '  alarms[0] = { 7, 0,
     delay(1200);
   }
 
+  stateMutex = xSemaphoreCreateMutex();
   setupLocalApi();
 
   // Launch Core 0 Background Cloud Sync Task (leaves Core 1 100% dedicated to smooth OLED!)
-  xTaskCreatePinnedToCore(cloudSyncTask, "CloudSync", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(cloudSyncTask, "CloudSync", 10240, NULL, 1, NULL, 0);
   lastCycleSwitchMs = millis();
 }
 
@@ -1079,26 +1085,29 @@ void loop() {
     lastFrameMs = millis();
     frameCount++;
 
-    if (alarmRinging && ringingAlarmIdx >= 0) {
-      drawAlarmOled(ringingAlarmIdx, frameCount);
-    } else if (activeScreen == "watch") {
-      drawWatchOled();
-    } else if (activeScreen == "weather") {
-      if (liveTempC <= coldThresholdC && (frameCount % 96 < 48)) {
-        drawFace(3, frameCount);
+    if (!stateMutex || xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      if (alarmRinging && ringingAlarmIdx >= 0) {
+        drawAlarmOled(ringingAlarmIdx, frameCount);
+      } else if (activeScreen == "watch") {
+        drawWatchOled();
+      } else if (activeScreen == "weather") {
+        if (liveTempC <= coldThresholdC && (frameCount % 96 < 48)) {
+          drawFace(3, frameCount);
+        } else {
+          drawWeatherOled();
+        }
+      } else if (activeScreen == "greeting") {
+        drawGreetingOled();
+      } else if (activeScreen == "text") {
+        drawCustomTextOled();
+      } else if (activeScreen == "bitmap") {
+        display.clearDisplay();
+        display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
+        display.display();
       } else {
-        drawWeatherOled();
+        drawFace(currentFace, frameCount);
       }
-    } else if (activeScreen == "greeting") {
-      drawGreetingOled();
-    } else if (activeScreen == "text") {
-      drawCustomTextOled();
-    } else if (activeScreen == "bitmap") {
-      display.clearDisplay();
-      display.drawBitmap(0, 0, customTouchpadBitmap, 128, 64, SSD1306_WHITE);
-      display.display();
-    } else {
-      drawFace(currentFace, frameCount);
+      if (stateMutex) xSemaphoreGive(stateMutex);
     }
   }
 }
