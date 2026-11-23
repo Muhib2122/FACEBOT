@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 
 const deviceStore = new Map();
-const ESP32_OFFLINE_THRESHOLD_MS = 12000; // 12s grace window (~10 missed 1.2s polls): zero false timeouts, fast real WiFi OFF detection
+const ESP32_OFFLINE_THRESHOLD_MS = 18000; // 18s grace window (~7 polls at 2.5s): zero false timeouts, clean WiFi OFF detection
 
 function getTmpStatePath(deviceId) {
   const safe = String(deviceId || 'muhib-bot-1').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -44,7 +44,8 @@ function createDefaultState(deviceId) {
   return {
     deviceId,
     mode: 'auto',
-    screen: 'face',
+    modeSeq: 0,
+    screen: 'auto',
     faceId: 0,
     textLine1: '',
     textLine2: '',

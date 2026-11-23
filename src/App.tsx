@@ -86,7 +86,6 @@ import { AlarmsPanel } from './components/AlarmsPanel';
 import { HardwarePanel } from './components/HardwarePanel';
 import { IntroSplashScreen } from './components/IntroSplashScreen';
 import { WifiStatusOledToast } from './components/WifiStatusOledToast';
-import { generateBootLogoPixels, generateWifiStatusPixels } from './utils/oledRenderer';
 import { createStarterGifs } from './utils/gifOledCodec';
 
 const BRAND_LOGO_URL = '/assets/aistudio/image_d35aba0a.png';
@@ -136,7 +135,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '4.2.0',
+  firmwareVersion: '4.3.0',
   otaAutoCheck: true,
 };
 
@@ -454,7 +453,8 @@ export default function App() {
   const userStepRef = useRef(0);
   const skipNextWorkspaceSyncRef = useRef(false);
 
-  // Cloud event counters so ESP32 Core-0 1.2s poller deduplicates one-shot actions
+  // Cloud event counters so ESP32 Core-0 poller deduplicates one-shot actions & explicit mode toggles
+  const modeSeqRef = useRef(0);
   const buzzerSeqRef = useRef(0);
   const lastBuzzerModeRef = useRef('tone');
   const bitmapSeqRef = useRef(0);
@@ -577,8 +577,7 @@ export default function App() {
               if (!docSnap.exists()) return;
               const d = docSnap.data();
               skipNextWorkspaceSyncRef.current = true;
-              // Always default to Auto Mode regardless of WiFi ON/OFF (user manually switches to User Mode when online)
-              setMode('auto');
+              // Do NOT overwrite active session mode from Firestore snapshots (initial boot & WiFi transitions always default to Auto Mode; manual User Mode stays active until user switches or WiFi drops)
               setSettings((prev) => ({
                 ...prev,
                 userName: typeof d.userName === 'string' ? d.userName : prev.userName,
@@ -1042,21 +1041,21 @@ export default function App() {
     let textLine1 = activeScreen.textLine1 || '';
     let textLine2 = activeScreen.textLine2 || '';
 
-    if (activeScreen.locked) {
+    if (activeScreen.kind === 'timer') {
+      screenName = 'text';
+      const remSec =
+        activeScreen.timerPausedSec !== undefined
+          ? activeScreen.timerPausedSec
+          : activeScreen.timerEndAtMs
+            ? Math.max(0, Math.ceil((activeScreen.timerEndAtMs - Date.now()) / 1000))
+            : pomodoroSecondsLeftRef.current;
+      const mm = String(Math.floor(remSec / 60)).padStart(2, '0');
+      const ss = String(remSec % 60).padStart(2, '0');
+      textLine1 = `${(activeScreen.timerLabel || pomodoroLabel || 'FOCUS').toUpperCase()} TIMER`;
+      textLine2 = `${mm}:${ss}`;
+    } else if (mode === 'user' && activeScreen.locked) {
       if (activeScreen.kind === 'custom-text') {
         screenName = 'text';
-      } else if (activeScreen.kind === 'timer') {
-        screenName = 'text';
-        const remSec =
-          activeScreen.timerPausedSec !== undefined
-            ? activeScreen.timerPausedSec
-            : activeScreen.timerEndAtMs
-              ? Math.max(0, Math.ceil((activeScreen.timerEndAtMs - Date.now()) / 1000))
-              : pomodoroSecondsLeftRef.current;
-        const mm = String(Math.floor(remSec / 60)).padStart(2, '0');
-        const ss = String(remSec % 60).padStart(2, '0');
-        textLine1 = `${(activeScreen.timerLabel || pomodoroLabel || 'FOCUS').toUpperCase()} TIMER`;
-        textLine2 = `${mm}:${ss}`;
       } else if (
         activeScreen.kind === 'custom-bitmap' ||
         activeScreen.kind === 'boot-logo' ||
@@ -1067,6 +1066,9 @@ export default function App() {
       } else {
         screenName = activeScreen.kind;
       }
+    } else {
+      // In Auto Mode, ALWAYS send screen='auto' so ESP32 never locks into User Mode behavior!
+      screenName = 'auto';
     }
 
     const mappedAlarms = alarms.slice(0, 8).map((a) => {
@@ -1085,16 +1087,14 @@ export default function App() {
     return {
       deviceId: (hardware.deviceId || 'muhib-bot-1').trim(),
       mode,
+      modeSeq: modeSeqRef.current,
       screen: screenName,
       faceId: activeScreen.faceId,
       textLine1,
       textLine2,
       userName: settings.userName || 'Muhib',
       city: location.city || 'Dhaka',
-      greenLed:
-        activeScreen.kind === 'wifi-status' || wifiPriorityUntilMsRef.current > Date.now()
-          ? 'blink'
-          : hardware.greenLedMode,
+      greenLed: hardware.greenLedMode,
       buzzerSeq: buzzerSeqRef.current,
       buzzerMode: lastBuzzerModeRef.current,
       bitmapSeq: bitmapSeqRef.current,
@@ -1337,31 +1337,8 @@ export default function App() {
       setMode('auto');
       sendToEsp32('/api/mode?mode=auto');
 
-      // 3-Second Piezo Buzzer + 3-Second Green LED Blink on WiFi Connected (Portal + Physical ESP32)
+      // 3-Second Piezo Buzzer + OLED Toast on Portal (ESP32 v4.3.0 runs its own native 3s hardware alert without bitmap lock!)
       playWifiConnectedBuzzer3Sec(hardware.buzzerMuted);
-      sendToEsp32('/api/led?green=blink');
-      const triggerEsp32BuzzerPulse = () => {
-        lastBuzzerModeRef.current = 'happy';
-        buzzerSeqRef.current += 1;
-        setCloudEventSeq((s) => s + 1);
-        sendToEsp32('/api/buzzer?mode=happy');
-      };
-      triggerEsp32BuzzerPulse();
-      let pulseCount = 1;
-      wifiBuzzerIntervalRef.current = window.setInterval(() => {
-        if (pulseCount >= 3 || Date.now() >= expiresAt - 150) {
-          if (wifiBuzzerIntervalRef.current) {
-            window.clearInterval(wifiBuzzerIntervalRef.current);
-            wifiBuzzerIntervalRef.current = null;
-          }
-          return;
-        }
-        pulseCount += 1;
-        triggerEsp32BuzzerPulse();
-      }, 1000);
-
-      // Push 128x64 WiFi Connected emoji bitmap to ESP32 with #1 top priority
-      postBitmapToEsp32(generateWifiStatusPixels(true));
 
       // Refresh live weather immediately on WiFi connect
       void refreshWeather();
@@ -1432,7 +1409,7 @@ export default function App() {
         });
       }, durationMs);
     },
-    [hardware.buzzerMuted, hardware.greenLedMode, refreshWeather, postBitmapToEsp32, logInteraction, sendToEsp32]
+    [hardware.buzzerMuted, hardware.greenLedMode, refreshWeather, logInteraction, sendToEsp32]
   );
 
   const dismissWifiOverlay = useCallback(() => {
@@ -1519,7 +1496,7 @@ export default function App() {
           } else {
             missedHeartbeatCountRef.current += 1;
             const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
-            if (msSinceConfirmed >= 6000 && missedHeartbeatCountRef.current >= 3) {
+            if (msSinceConfirmed >= 16000 && missedHeartbeatCountRef.current >= 6) {
               resolvedHwOnline = false;
               esp32HardwareOnlineRef.current = false;
               setEsp32HardwareOnline(false);
@@ -1744,7 +1721,9 @@ export default function App() {
         return;
       }
       if (mode === nextMode) return;
+      modeSeqRef.current += 1;
       setMode(nextMode);
+      setCloudEventSeq((s) => s + 1);
       playShortClick(hardware.buzzerMuted);
       sendToEsp32(`/api/mode?mode=${nextMode}`);
       setActiveScreen((prev) =>
@@ -2089,8 +2068,6 @@ export default function App() {
     setIsSleeping(false);
     setActiveAlarm(null);
     setActiveScreen({ kind: 'boot-logo', faceId: 1, locked: true });
-    // Push 128x64 monochrome Muhib Creation logo bitmap to already-flashed ESP32 via Vercel Cloud!
-    postBitmapToEsp32(generateBootLogoPixels());
 
     bootLogoTimerRef.current = window.setTimeout(() => {
       bootLogoTimerRef.current = null;
@@ -2428,7 +2405,9 @@ export default function App() {
           setMode('auto');
           badges.push('User Mode Locked (Offline)');
         } else {
+          modeSeqRef.current += 1;
           setMode(action.targetMode);
+          setCloudEventSeq((s) => s + 1);
           sendToEsp32(`/api/mode?mode=${action.targetMode}`);
           badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
         }
