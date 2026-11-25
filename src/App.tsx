@@ -349,7 +349,10 @@ export default function App() {
   const [hardware, setHardware] = useState<HardwareConfig>({
     ...DEFAULT_HARDWARE,
     ...(saved?.hardware ?? {}),
-    greenLedMode: saved?.hardware?.greenLedMode ?? 'auto',
+    greenLedMode:
+      saved?.hardware?.greenLedMode === 'on' || saved?.hardware?.greenLedMode === 'off'
+        ? saved.hardware.greenLedMode
+        : 'auto',
   });
   const [playlist, setPlaylist] = useState<PlaylistItem[]>(
     Array.isArray(saved?.playlist) && saved.playlist.length > 0 ? saved.playlist : DEFAULT_PLAYLIST
@@ -444,6 +447,9 @@ export default function App() {
   const wifiStatusTimerRef = useRef<number | null>(null);
   const wifiBuzzerIntervalRef = useRef<number | null>(null);
   const wifiPriorityUntilMsRef = useRef<number>(0);
+  const [autoLedBlinkActive, setAutoLedBlinkActive] = useState<boolean>(false);
+  const ledBlinkUntilMsRef = useRef<number>(0);
+  const autoLedBlinkTimerRef = useRef<number | null>(null);
   const prevScreenBeforeWifiRef = useRef<ActiveScreenState | null>(null);
   const bootDayKeyRef = useRef<string>(getTodayKey());
 
@@ -606,7 +612,8 @@ export default function App() {
               setHardware((prev) => ({
                 ...prev,
                 wifiSsid: typeof d.wifiSsid === 'string' ? d.wifiSsid : prev.wifiSsid,
-                greenLedMode: d.greenLedMode || prev.greenLedMode,
+                greenLedMode:
+                  d.greenLedMode === 'on' || d.greenLedMode === 'off' ? d.greenLedMode : 'auto',
                 oledScheme: d.oledScheme || prev.oledScheme,
                 animationSpeed: d.animationSpeed || prev.animationSpeed,
                 esp32Ip: typeof d.esp32Ip === 'string' ? d.esp32Ip : prev.esp32Ip,
@@ -1086,6 +1093,19 @@ export default function App() {
       };
     });
 
+    const nowMs = Date.now();
+    const activeBlinkUntil = Math.max(ledBlinkUntilMsRef.current, wifiPriorityUntilMsRef.current);
+    const isBlinkWindowActive = autoLedBlinkActive || activeBlinkUntil > nowMs;
+    // In 'auto' Green LED mode, send 'blink' ONLY during the 3-second Auto Mode response,
+    // and 'off' afterwards so the already-flashed ESP32 v4.4.0 never blinks endlessly!
+    const effectiveCloudGreenLed = isBlinkWindowActive
+      ? 'blink'
+      : hardware.greenLedMode === 'on'
+        ? 'on'
+        : hardware.greenLedMode === 'blink'
+          ? 'blink'
+          : 'off';
+
     return {
       deviceId: (hardware.deviceId || 'muhib-bot-1').trim(),
       mode,
@@ -1096,7 +1116,8 @@ export default function App() {
       textLine2,
       userName: settings.userName || 'Muhib',
       city: location.city || 'Dhaka',
-      greenLed: hardware.greenLedMode,
+      greenLed: effectiveCloudGreenLed,
+      ledBlinkUntilMs: isBlinkWindowActive ? Math.max(activeBlinkUntil, nowMs + 500) : 0,
       buzzerSeq: buzzerSeqRef.current,
       buzzerMode: lastBuzzerModeRef.current,
       bitmapSeq: bitmapSeqRef.current,
@@ -1113,12 +1134,13 @@ export default function App() {
       timerDurationSec: pomodoroTotalSec,
       wifiOfflineAuto: true,
       wifiPriorityUntilMs:
-        wifiPriorityUntilMsRef.current > Date.now() ? wifiPriorityUntilMsRef.current : 0,
-      updatedAt: Date.now(),
+        wifiPriorityUntilMsRef.current > nowMs ? wifiPriorityUntilMsRef.current : 0,
+      updatedAt: nowMs,
     };
   }, [
     hardware.deviceId,
     hardware.greenLedMode,
+    autoLedBlinkActive,
     mode,
     activeScreen,
     settings.userName,
@@ -1330,6 +1352,45 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [refreshWeather]);
 
+  // 3-Second Buzzer + Green LED Blink Response whenever entering Auto Mode (via User or WiFi Connect)
+  const triggerAutoModeResponse3s = useCallback(() => {
+    if (autoLedBlinkTimerRef.current) {
+      window.clearTimeout(autoLedBlinkTimerRef.current);
+      autoLedBlinkTimerRef.current = null;
+    }
+
+    const durationMs = 3000;
+    const expiresAt = Date.now() + durationMs;
+    ledBlinkUntilMsRef.current = expiresAt;
+    setAutoLedBlinkActive(true);
+
+    // Trigger physical ESP32 happy chime + 3-second Green LED blink via Cloud & LAN
+    lastBuzzerModeRef.current = 'happy';
+    buzzerSeqRef.current += 1;
+    setCloudEventSeq((s) => s + 1);
+    sendToEsp32('/api/mode?mode=auto');
+    sendToEsp32('/api/led?green=blink');
+    sendToEsp32('/api/buzzer?mode=happy');
+
+    // Play 3-second buzzer response in portal
+    playWifiConnectedBuzzer3Sec(hardware.buzzerMuted);
+
+    autoLedBlinkTimerRef.current = window.setTimeout(() => {
+      autoLedBlinkTimerRef.current = null;
+      ledBlinkUntilMsRef.current = 0;
+      setAutoLedBlinkActive(false);
+      stopBuzzerAudio();
+      const restLed =
+        hardware.greenLedMode === 'on'
+          ? 'on'
+          : hardware.greenLedMode === 'blink'
+            ? 'blink'
+            : 'off';
+      sendToEsp32(`/api/led?green=${restLed}`);
+      setCloudEventSeq((s) => s + 1);
+    }, durationMs);
+  }, [hardware.buzzerMuted, hardware.greenLedMode, sendToEsp32]);
+
   // #1 TOP PRIORITY 3-second WiFi CONNECTED OLED Screen + 3s Buzzer + 3s Green LED Blink
   // (No notification when WiFi turns OFF — silent switch to Auto Mode!)
   const triggerWifiStatusScreen = useCallback(
@@ -1355,6 +1416,10 @@ export default function App() {
         window.clearTimeout(wifiStatusTimerRef.current);
         wifiStatusTimerRef.current = null;
       }
+      if (autoLedBlinkTimerRef.current) {
+        window.clearTimeout(autoLedBlinkTimerRef.current);
+        autoLedBlinkTimerRef.current = null;
+      }
       if (wifiOverlayIntervalRef.current) {
         window.clearInterval(wifiOverlayIntervalRef.current);
         wifiOverlayIntervalRef.current = null;
@@ -1376,15 +1441,21 @@ export default function App() {
       const durationMs = 3000;
       const expiresAt = Date.now() + durationMs;
       wifiPriorityUntilMsRef.current = expiresAt;
+      ledBlinkUntilMsRef.current = expiresAt;
+      setAutoLedBlinkActive(true);
 
       setIsSleeping(false);
       // Default mode on WiFi Connected is ALWAYS Auto Mode (User Mode is unlocked for manual selection)
+      modeSeqRef.current += 1;
       setMode('auto');
+      lastBuzzerModeRef.current = 'happy';
+      buzzerSeqRef.current += 1;
+      setCloudEventSeq((s) => s + 1);
       sendToEsp32('/api/mode?mode=auto');
       sendToEsp32('/api/led?green=blink');
       sendToEsp32('/api/buzzer?mode=happy');
 
-      // 3-Second Piezo Buzzer + OLED Toast on Portal (ESP32 v4.4.0 runs its own native 3s hardware alert without bitmap lock!)
+      // 3-Second Piezo Buzzer + OLED Toast on Portal
       playWifiConnectedBuzzer3Sec(hardware.buzzerMuted);
 
       // Refresh live weather immediately on WiFi connect
@@ -1418,9 +1489,11 @@ export default function App() {
         'esp32'
       );
 
-      // Hold WiFi Connected page + LED blink + Buzzer for exactly 3 seconds, then resume Auto Mode cleanly
+      // Hold WiFi Connected page + LED blink + Buzzer for exactly 3 seconds, then turn LED OFF & resume Auto Mode cleanly
       wifiStatusTimerRef.current = window.setTimeout(() => {
         wifiPriorityUntilMsRef.current = 0;
+        ledBlinkUntilMsRef.current = 0;
+        setAutoLedBlinkActive(false);
         setWifiOverlay(null);
         if (wifiOverlayIntervalRef.current) {
           window.clearInterval(wifiOverlayIntervalRef.current);
@@ -1431,7 +1504,13 @@ export default function App() {
           wifiBuzzerIntervalRef.current = null;
         }
         stopBuzzerAudio();
-        sendToEsp32(`/api/led?green=${hardware.greenLedMode}`);
+        const restLed =
+          hardware.greenLedMode === 'on'
+            ? 'on'
+            : hardware.greenLedMode === 'blink'
+              ? 'blink'
+              : 'off';
+        sendToEsp32(`/api/led?green=${restLed}`);
         setCloudEventSeq((s) => s + 1);
 
         const previous = prevScreenBeforeWifiRef.current;
@@ -1461,9 +1540,15 @@ export default function App() {
 
   const dismissWifiOverlay = useCallback(() => {
     wifiPriorityUntilMsRef.current = 0;
+    ledBlinkUntilMsRef.current = 0;
+    setAutoLedBlinkActive(false);
     if (wifiStatusTimerRef.current) {
       window.clearTimeout(wifiStatusTimerRef.current);
       wifiStatusTimerRef.current = null;
+    }
+    if (autoLedBlinkTimerRef.current) {
+      window.clearTimeout(autoLedBlinkTimerRef.current);
+      autoLedBlinkTimerRef.current = null;
     }
     if (wifiOverlayIntervalRef.current) {
       window.clearInterval(wifiOverlayIntervalRef.current);
@@ -1474,7 +1559,14 @@ export default function App() {
       wifiBuzzerIntervalRef.current = null;
     }
     stopBuzzerAudio();
-    sendToEsp32(`/api/led?green=${hardware.greenLedMode}`);
+    const restLed =
+      hardware.greenLedMode === 'on'
+        ? 'on'
+        : hardware.greenLedMode === 'blink'
+          ? 'blink'
+          : 'off';
+    sendToEsp32(`/api/led?green=${restLed}`);
+    setCloudEventSeq((s) => s + 1);
     setWifiOverlay(null);
     const previous = prevScreenBeforeWifiRef.current;
     prevScreenBeforeWifiRef.current = null;
@@ -1795,20 +1887,25 @@ export default function App() {
         setMode('auto');
         return;
       }
-      if (mode === nextMode) return;
+      if (mode === nextMode && nextMode !== 'auto') return;
       modeSeqRef.current += 1;
       setMode(nextMode);
-      setCloudEventSeq((s) => s + 1);
-      playShortClick(hardware.buzzerMuted);
-      sendToEsp32(`/api/mode?mode=${nextMode}`);
       setActiveScreen((prev) =>
         prev.kind === 'timer' || prev.kind === 'alarm' || prev.kind === 'wifi-status'
           ? prev
           : { ...prev, locked: false }
       );
+      if (nextMode === 'auto') {
+        // Switching to Auto Mode -> trigger 3-second Buzzer + Green LED Blink response (then LED OFF!)
+        triggerAutoModeResponse3s();
+      } else {
+        setCloudEventSeq((s) => s + 1);
+        playShortClick(hardware.buzzerMuted);
+        sendToEsp32(`/api/mode?mode=${nextMode}`);
+      }
       logInteraction('oled-face', `Switched to ${nextMode.toUpperCase()} Mode`, 'portal');
     },
-    [mode, hardware.buzzerMuted, sendToEsp32, logInteraction]
+    [mode, hardware.buzzerMuted, sendToEsp32, triggerAutoModeResponse3s, logInteraction]
   );
 
   // Smooth 24-FPS OLED Animation Frame Tick (Matches ESP32 Core-1 42ms frame loop)
@@ -2087,20 +2184,26 @@ export default function App() {
   ]);
 
   // Compute Single Green LED (GPIO 26) State (smoothly timed at 24-FPS, #1 priority blink on WiFi ON/OFF!)
+  // Compute Single Green LED (GPIO 26) State:
+  // - In 'auto' mode: blinks for 3 seconds ONLY when entering Auto Mode (via WiFi Connect or User switch), then turns OFF!
   const greenLedOn = useMemo(() => {
-    if (activeScreen.kind === 'wifi-status') return Math.floor(frame / 3) % 2 === 0;
+    if (activeScreen.kind === 'wifi-status' || autoLedBlinkActive) {
+      return Math.floor(frame / 3) % 2 === 0;
+    }
+    if (activeAlarm) return Math.floor(frame / 4) % 2 === 0;
     if (hardware.greenLedMode === 'on') return true;
     if (hardware.greenLedMode === 'off') return false;
     if (hardware.greenLedMode === 'blink') return Math.floor(frame / 7) % 2 === 0;
-    if (activeAlarm) return Math.floor(frame / 4) % 2 === 0;
-    return !isSleeping;
-  }, [activeScreen.kind, hardware.greenLedMode, frame, activeAlarm, isSleeping]);
+    return false;
+  }, [activeScreen.kind, autoLedBlinkActive, hardware.greenLedMode, frame, activeAlarm]);
 
   // Hardware Action Handlers
   const handleChangeGreenLedMode = useCallback(
     (nextMode: GreenLedMode) => {
       setHardware((prev) => ({ ...prev, greenLedMode: nextMode }));
-      sendToEsp32(`/api/led?green=${nextMode}`);
+      const espLedCmd = nextMode === 'auto' ? 'off' : nextMode;
+      sendToEsp32(`/api/led?green=${espLedCmd}`);
+      setCloudEventSeq((s) => s + 1);
       logInteraction('hardware', `Green LED -> ${nextMode.toUpperCase()}`, 'portal');
     },
     [sendToEsp32, logInteraction]
@@ -2482,8 +2585,12 @@ export default function App() {
         } else {
           modeSeqRef.current += 1;
           setMode(action.targetMode);
-          setCloudEventSeq((s) => s + 1);
-          sendToEsp32(`/api/mode?mode=${action.targetMode}`);
+          if (action.targetMode === 'auto') {
+            triggerAutoModeResponse3s();
+          } else {
+            setCloudEventSeq((s) => s + 1);
+            sendToEsp32(`/api/mode?mode=${action.targetMode}`);
+          }
           badges.push(`Mode: ${action.targetMode.toUpperCase()}`);
         }
       }

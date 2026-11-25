@@ -185,7 +185,8 @@ function createDefaultDeviceState(deviceId: string): Record<string, unknown> {
     textLine2: '',
     userName: 'Muhib',
     city: 'Dhaka',
-    greenLed: 'auto',
+    greenLed: 'off',
+    ledBlinkUntilMs: 0,
     buzzerSeq: 0,
     buzzerMode: 'tone',
     bitmapSeq: 0,
@@ -204,12 +205,35 @@ function createDefaultDeviceState(deviceId: string): Record<string, unknown> {
     wifiPriorityUntilMs: 0,
     esp32LastSeenAt: 0,
     esp32PollCount: 0,
-    updatedAt: 0,
+    updatedAt: Date.now(),
   };
 }
 
 function resolveLiveTimerState(state: Record<string, unknown>, nowMs: number): Record<string, unknown> {
-  // WiFi ON / OFF 5-second page has #1 top priority over timer & every other screen
+  const blinkUntil = Number(state.ledBlinkUntilMs) || 0;
+  if (blinkUntil > 0) {
+    if (nowMs < blinkUntil) {
+      if (state.greenLed !== 'blink') {
+        state.greenLed = 'blink';
+        state.updatedAt = Math.max(Number(state.updatedAt) || 0, nowMs);
+      }
+    } else {
+      state.ledBlinkUntilMs = 0;
+      if (state.greenLed === 'blink' || state.greenLed === 'auto') {
+        state.greenLed = 'off';
+      }
+      state.updatedAt = Math.max(Number(state.updatedAt) || 0, blinkUntil, nowMs);
+    }
+  } else if (state.greenLed === 'auto') {
+    state.greenLed = 'off';
+    state.updatedAt = Math.max(Number(state.updatedAt) || 0, nowMs);
+  }
+
+  if (!state.updatedAt || Number(state.updatedAt) <= 0) {
+    state.updatedAt = nowMs;
+  }
+
+  // WiFi ON 3-second priority page has #1 top priority over timer & every other screen
   if (Number(state.wifiPriorityUntilMs) > nowMs) {
     return state;
   }
@@ -261,8 +285,18 @@ app.get('/api/bot-state', (req, res) => {
   }
 
   if (!isPortalStatusCheck) {
+    const prevSeen = Number(existing.esp32LastSeenAt) || 0;
+    const wasOffline = prevSeen === 0 || nowMs - prevSeen >= ESP32_OFFLINE_THRESHOLD_MS;
     existing.esp32LastSeenAt = nowMs;
     existing.esp32PollCount = (Number(existing.esp32PollCount) || 0) + 1;
+    if (wasOffline) {
+      existing.mode = 'auto';
+      existing.screen = 'auto';
+      if (existing.greenLed === 'auto' || existing.greenLed === 'blink') {
+        existing.greenLed = 'off';
+      }
+      existing.updatedAt = nowMs;
+    }
     deviceStore.set(deviceId, existing);
   }
 
@@ -286,10 +320,21 @@ app.post('/api/bot-state', (req, res) => {
   const deviceId = String(req.query.device || 'muhib-bot-1').slice(0, 32);
   const body = (req.body || {}) as Record<string, unknown>;
   const prev = deviceStore.get(deviceId) || createDefaultDeviceState(deviceId);
+  const incomingBlinkUntil = Number(body.ledBlinkUntilMs) || 0;
+  const isBlinkActive = incomingBlinkUntil > nowMs;
+  const rawGreenLed = String(body.greenLed ?? prev.greenLed ?? 'off');
+  const normalizedGreenLed = isBlinkActive
+    ? 'blink'
+    : rawGreenLed === 'auto'
+      ? 'off'
+      : rawGreenLed;
+
   const payload = {
     ...prev,
     ...body,
     deviceId,
+    greenLed: normalizedGreenLed,
+    ledBlinkUntilMs: isBlinkActive ? incomingBlinkUntil : 0,
     esp32LastSeenAt: Math.max(Number(prev.esp32LastSeenAt) || 0, Number(body.esp32LastSeenAt) || 0),
     esp32PollCount: Math.max(Number(prev.esp32PollCount) || 0, Number(body.esp32PollCount) || 0),
     updatedAt: nowMs,

@@ -51,7 +51,8 @@ function createDefaultState(deviceId) {
     textLine2: '',
     userName: 'Muhib',
     city: 'Dhaka',
-    greenLed: 'auto',
+    greenLed: 'off',
+    ledBlinkUntilMs: 0,
     buzzerSeq: 0,
     buzzerMode: 'tone',
     bitmapSeq: 0,
@@ -70,18 +71,51 @@ function createDefaultState(deviceId) {
     wifiPriorityUntilMs: 0,
     esp32LastSeenAt: 0,
     esp32PollCount: 0,
-    updatedAt: 0,
+    updatedAt: Date.now(),
   };
 }
 
 function resolveLiveTimerState(state, nowMs) {
-  // WiFi ON / OFF 5-second page has #1 top priority over timer & every other screen
+  let stateMutated = false;
+
+  // 1. Enforce 3-second Auto Mode LED blink window:
+  //    - While ledBlinkUntilMs > nowMs: send greenLed = 'blink'
+  //    - Once ledBlinkUntilMs expires (or if greenLed was 'auto'): send greenLed = 'off' & bump updatedAt
+  //      so already-flashed ESP32 v4.4.0 immediately sets greenLedMode = "off" and stops endless blinking!
+  const blinkUntil = Number(state.ledBlinkUntilMs) || 0;
+  if (blinkUntil > 0) {
+    if (nowMs < blinkUntil) {
+      if (state.greenLed !== 'blink') {
+        state.greenLed = 'blink';
+        state.updatedAt = Math.max(Number(state.updatedAt) || 0, nowMs);
+        stateMutated = true;
+      }
+    } else {
+      state.ledBlinkUntilMs = 0;
+      if (state.greenLed === 'blink' || state.greenLed === 'auto') {
+        state.greenLed = 'off';
+      }
+      state.updatedAt = Math.max(Number(state.updatedAt) || 0, blinkUntil, nowMs);
+      stateMutated = true;
+    }
+  } else if (state.greenLed === 'auto') {
+    state.greenLed = 'off';
+    state.updatedAt = Math.max(Number(state.updatedAt) || 0, nowMs);
+    stateMutated = true;
+  }
+
+  if (!state.updatedAt || Number(state.updatedAt) <= 0) {
+    state.updatedAt = nowMs;
+    stateMutated = true;
+  }
+
+  // WiFi ON 3-second priority page has #1 top priority over timer & every other screen
   if (Number(state.wifiPriorityUntilMs) > nowMs) {
-    return state;
+    return { resolved: state, stateMutated };
   }
 
   if (!state.timerActive || !state.timerEndAtMs) {
-    return state;
+    return { resolved: state, stateMutated };
   }
 
   const remainingSec = Math.max(0, Math.ceil((state.timerEndAtMs - nowMs) / 1000));
@@ -91,12 +125,15 @@ function resolveLiveTimerState(state, nowMs) {
     const mm = String(Math.floor(remainingSec / 60)).padStart(2, '0');
     const ss = String(remainingSec % 60).padStart(2, '0');
     return {
-      ...state,
-      screen: 'text',
-      textLine1: `${label} TIMER`,
-      textLine2: `${mm}:${ss}`,
-      // Change updatedAt strictly once per remaining second so ESP32 updates cleanly without jitter
-      updatedAt: Math.max(state.updatedAt || 0, Math.floor(nowMs / 1000) * 1000),
+      resolved: {
+        ...state,
+        screen: 'text',
+        textLine1: `${label} TIMER`,
+        textLine2: `${mm}:${ss}`,
+        // Change updatedAt strictly once per remaining second so ESP32 updates cleanly without jitter
+        updatedAt: Math.max(state.updatedAt || 0, Math.floor(nowMs / 1000) * 1000),
+      },
+      stateMutated,
     };
   }
 
@@ -110,7 +147,7 @@ function resolveLiveTimerState(state, nowMs) {
   state.buzzerSeq = (Number(state.buzzerSeq) || 0) + 1;
   state.buzzerMode = 'happy';
   state.updatedAt = nowMs;
-  return state;
+  return { resolved: state, stateMutated: true };
 }
 
 export default async function handler(req, res) {
@@ -140,10 +177,21 @@ export default async function handler(req, res) {
     }
 
     const prev = loadDeviceState(deviceId) || createDefaultState(deviceId);
+    const incomingBlinkUntil = Number(body.ledBlinkUntilMs) || 0;
+    const isBlinkActive = incomingBlinkUntil > nowMs;
+    const rawGreenLed = String(body.greenLed ?? prev.greenLed ?? 'off');
+    const normalizedGreenLed = isBlinkActive
+      ? 'blink'
+      : rawGreenLed === 'auto'
+        ? 'off'
+        : rawGreenLed;
+
     const payload = {
       ...prev,
       ...body,
       deviceId,
+      greenLed: normalizedGreenLed,
+      ledBlinkUntilMs: isBlinkActive ? incomingBlinkUntil : 0,
       // Preserve real ESP32 hardware heartbeat metadata across portal POSTs
       esp32LastSeenAt: Math.max(Number(prev.esp32LastSeenAt) || 0, Number(body.esp32LastSeenAt) || 0),
       esp32PollCount: Math.max(Number(prev.esp32PollCount) || 0, Number(body.esp32PollCount) || 0),
@@ -174,12 +222,26 @@ export default async function handler(req, res) {
 
   // Record REAL ESP32 heartbeat ONLY when the ESP32 hardware polls (not portal status checks)
   if (!isPortalStatusCheck) {
+    const prevSeen = Number(existing.esp32LastSeenAt) || 0;
+    const wasOffline = prevSeen === 0 || nowMs - prevSeen >= ESP32_OFFLINE_THRESHOLD_MS;
     existing.esp32LastSeenAt = nowMs;
     existing.esp32PollCount = (existing.esp32PollCount || 0) + 1;
+    // When ESP32 first connects/reconnects in Auto Mode, ensure updatedAt is bumped & greenLed is 'off' after 3s
+    if (wasOffline) {
+      existing.mode = 'auto';
+      existing.screen = 'auto';
+      if (existing.greenLed === 'auto' || existing.greenLed === 'blink') {
+        existing.greenLed = 'off';
+      }
+      existing.updatedAt = nowMs;
+    }
     saveDeviceState(deviceId, existing);
   }
 
-  const resolved = resolveLiveTimerState(existing, nowMs);
+  const { resolved, stateMutated } = resolveLiveTimerState(existing, nowMs);
+  if (stateMutated) {
+    saveDeviceState(deviceId, existing);
+  }
   const esp32LastSeenAt = existing.esp32LastSeenAt || 0;
   const esp32AgoMs = esp32LastSeenAt > 0 ? Math.max(0, nowMs - esp32LastSeenAt) : -1;
   const esp32Online = esp32LastSeenAt > 0 && esp32AgoMs < ESP32_OFFLINE_THRESHOLD_MS;
