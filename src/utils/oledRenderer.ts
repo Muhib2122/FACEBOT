@@ -1234,6 +1234,55 @@ export function renderScreenToBuffer(
   }
 }
 
+export type BaseOledColorScheme = 'ice-blue' | 'white' | 'dual-yellow-blue';
+
+export function getAmbientTimeOfDayInfo(
+  now: Date = new Date(),
+  frame = 0
+): {
+  periodLabel: 'Morning' | 'Afternoon' | 'Evening' | 'Night';
+  activeScheme: BaseOledColorScheme;
+  activeSchemeLabel: string;
+} {
+  const hour = now.getHours();
+  // Time-of-day weighted rotation sequence (changes every ~6 seconds / 144 frames at 24-FPS)
+  let periodLabel: 'Morning' | 'Afternoon' | 'Evening' | 'Night' = 'Night';
+  let sequence: BaseOledColorScheme[] = ['ice-blue', 'dual-yellow-blue', 'ice-blue', 'white'];
+
+  if (hour >= 5 && hour < 12) {
+    periodLabel = 'Morning';
+    sequence = ['dual-yellow-blue', 'white', 'dual-yellow-blue', 'ice-blue'];
+  } else if (hour >= 12 && hour < 17) {
+    periodLabel = 'Afternoon';
+    sequence = ['white', 'dual-yellow-blue', 'white', 'ice-blue'];
+  } else if (hour >= 17 && hour < 21) {
+    periodLabel = 'Evening';
+    sequence = ['dual-yellow-blue', 'ice-blue', 'dual-yellow-blue', 'white'];
+  }
+
+  const cycleTick = frame > 0 ? Math.floor(frame / 144) : Math.floor(now.getTime() / 6000);
+  const activeScheme = sequence[Math.abs(cycleTick) % sequence.length];
+  const activeSchemeLabel =
+    activeScheme === 'dual-yellow-blue'
+      ? 'Dual Y/B'
+      : activeScheme === 'white'
+        ? 'White'
+        : 'Ice Blue';
+
+  return { periodLabel, activeScheme, activeSchemeLabel };
+}
+
+export function resolveOledScheme(
+  scheme: OledColorScheme,
+  now: Date = new Date(),
+  frame = 0
+): BaseOledColorScheme {
+  if (scheme === 'ambient') {
+    return getAmbientTimeOfDayInfo(now, frame).activeScheme;
+  }
+  return scheme;
+}
+
 /**
  * Paint 128x64 buffer onto an HTMLCanvasElement with realistic SSD1306 OLED phosphor colors
  */
@@ -1242,8 +1291,11 @@ export function paintBufferToCanvas(
   buffer: SSD1306Buffer,
   scheme: OledColorScheme,
   scale = 3,
-  showPixelGrid = true
+  showPixelGrid = true,
+  now?: Date,
+  frame?: number
 ) {
+  const resolvedScheme = resolveOledScheme(scheme, now ?? new Date(), frame ?? 0);
   const width = OLED_WIDTH * scale;
   const height = OLED_HEIGHT * scale;
   if (ctx.canvas.width !== width || ctx.canvas.height !== height) {
@@ -1260,9 +1312,9 @@ export function paintBufferToCanvas(
 
   for (let y = 0; y < OLED_HEIGHT; y++) {
     let onColor = '#E2F5FF'; // ice-blue
-    if (scheme === 'white') {
+    if (resolvedScheme === 'white') {
       onColor = '#F8FAFC';
-    } else if (scheme === 'dual-yellow-blue') {
+    } else if (resolvedScheme === 'dual-yellow-blue') {
       onColor = y < 16 ? '#FACC15' : '#38BDF8';
     } else {
       onColor = '#67E8F9';

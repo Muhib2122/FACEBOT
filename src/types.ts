@@ -24,7 +24,7 @@ export interface InteractionEvent {
 
 export type GreenLedMode = 'auto' | 'on' | 'off' | 'blink';
 
-export type OledColorScheme = 'ice-blue' | 'white' | 'dual-yellow-blue';
+export type OledColorScheme = 'ice-blue' | 'white' | 'dual-yellow-blue' | 'ambient';
 
 export type ScreenKind =
   | 'face'

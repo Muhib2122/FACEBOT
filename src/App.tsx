@@ -135,7 +135,7 @@ const DEFAULT_HARDWARE: HardwareConfig = {
       : '',
   firebaseDbUrl: '',
   deviceId: 'muhib-bot-1',
-  firmwareVersion: '4.3.0',
+  firmwareVersion: '4.4.0',
   otaAutoCheck: true,
 };
 
@@ -399,17 +399,17 @@ export default function App() {
   const esp32HardwareOnlineRef = useRef<boolean>(false);
   const esp32EverSeenRef = useRef<boolean>(false);
   // Effective Bot WiFi Online State:
-  // - If Portal WiFi/Network is OFF -> ALWAYS false (immediate Auto Mode + 5s WiFi OFF alert)
-  // - If physical ESP32 has connected -> strictly tracks live ESP32 hardware heartbeat
-  // - Before physical ESP32 pairs -> tracks live Portal WiFi so User Mode & automatic WiFi ON/OFF alerts always work!
-  const esp32Online = isOnline && (esp32EverSeen ? esp32HardwareOnline : true);
+  // - Shows Online ONLY when both browser network is reachable AND real physical ESP32 heartbeat is active!
+  // - Whenever ESP32 is disconnected or powered off -> strictly Offline (Auto Mode default, User Mode locked)
+  const esp32Online = isOnline && esp32HardwareOnline;
   const esp32OnlineRef = useRef<boolean>(esp32Online);
   esp32OnlineRef.current = esp32Online;
   const lastEffectiveOnlineRef = useRef<boolean>(esp32Online);
   const lastConfirmedEsp32SeenAtRef = useRef<number>(0);
+  const highestEsp32LastSeenAtRef = useRef<number>(0);
   const missedHeartbeatCountRef = useRef<number>(0);
   const lastWifiAlertMetaRef = useRef<{ connected: boolean; atMs: number }>({
-    connected: esp32Online,
+    connected: false,
     atMs: 0,
   });
   const [wifiOverlay, setWifiOverlay] = useState<{ connected: boolean; secondsLeft: number } | null>(null);
@@ -795,7 +795,9 @@ export default function App() {
                   title: String(v.title || 'OLED Screenshot'),
                   screenKind: String(v.screenKind || 'face'),
                   oledScheme:
-                    v.oledScheme === 'white' || v.oledScheme === 'dual-yellow-blue'
+                    v.oledScheme === 'white' ||
+                    v.oledScheme === 'dual-yellow-blue' ||
+                    v.oledScheme === 'ambient'
                       ? v.oledScheme
                       : 'ice-blue',
                   pixelsHex: String(v.pixelsHex || ''),
@@ -1139,6 +1141,34 @@ export default function App() {
     [hardware.deviceId, hardware.cloudPortalUrl]
   );
 
+  // Return all active bot-state endpoints (local origin + configured/production Vercel URL)
+  // so the portal and physical ESP32 always see each other's heartbeats and state updates
+  const getBotStateEndpoints = useCallback(
+    (extraQuery = ''): string[] => {
+      const deviceId = encodeURIComponent((hardware.deviceId || 'muhib-bot-1').trim());
+      const qs = `device=${deviceId}${extraQuery ? `&${extraQuery}` : ''}`;
+      const urls = new Set<string>();
+      urls.add(`/api/bot-state?${qs}`);
+
+      const configuredBase = hardware.cloudPortalUrl.trim().replace(/\/$/, '');
+      if (
+        configuredBase &&
+        configuredBase.startsWith('http') &&
+        (typeof window === 'undefined' || configuredBase !== window.location.origin)
+      ) {
+        urls.add(`${configuredBase}/api/bot-state?${qs}`);
+      }
+
+      const prodVercelBase = 'https://myfacebot.vercel.app';
+      if (typeof window === 'undefined' || window.location.origin !== prodVercelBase) {
+        urls.add(`${prodVercelBase}/api/bot-state?${qs}`);
+      }
+
+      return Array.from(urls);
+    },
+    [hardware.deviceId, hardware.cloudPortalUrl]
+  );
+
   const pushStateToCloud = useCallback(
     async (silent = false) => {
       if (!hardware.cloudSyncEnabled && silent) return;
@@ -1164,21 +1194,36 @@ export default function App() {
             );
           }
         } else {
-          const endpoint = getBotStateEndpoint();
+          const endpoints = getBotStateEndpoints();
+          const results = await Promise.allSettled(
+            endpoints.map(async (ep) => {
+              const res = await fetch(ep, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              if (!res.ok) throw new Error(`Cloud bridge responded ${res.status}`);
+              return res.json();
+            })
+          );
 
-          const res = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-          if (!res.ok) throw new Error(`Cloud bridge responded ${res.status}`);
-          try {
-            const data = await res.json();
-            if (typeof data?.esp32LastSeenAt === 'number' && data.esp32LastSeenAt > 0) {
-              setEsp32LastSeenAt(data.esp32LastSeenAt);
+          let anyOk = false;
+          let bestLastSeen = 0;
+          for (const r of results) {
+            if (r.status === 'fulfilled') {
+              anyOk = true;
+              const seen = Number(r.value?.esp32LastSeenAt) || 0;
+              if (seen > bestLastSeen) bestLastSeen = seen;
             }
-          } catch {
-            // Ignore non-JSON body
+          }
+          if (!anyOk) {
+            throw new Error('Cloud bridge unreachable');
+          }
+          if (bestLastSeen > 0) {
+            if (bestLastSeen > highestEsp32LastSeenAtRef.current) {
+              highestEsp32LastSeenAtRef.current = bestLastSeen;
+            }
+            setEsp32LastSeenAt(bestLastSeen);
           }
           if (!silent) {
             setCloudSyncStatus(
@@ -1198,7 +1243,7 @@ export default function App() {
       hardware.cloudSyncEnabled,
       hardware.cloudBackendType,
       hardware.firebaseDbUrl,
-      getBotStateEndpoint,
+      getBotStateEndpoints,
       buildCloudPayload,
     ]
   );
@@ -1336,8 +1381,10 @@ export default function App() {
       // Default mode on WiFi Connected is ALWAYS Auto Mode (User Mode is unlocked for manual selection)
       setMode('auto');
       sendToEsp32('/api/mode?mode=auto');
+      sendToEsp32('/api/led?green=blink');
+      sendToEsp32('/api/buzzer?mode=happy');
 
-      // 3-Second Piezo Buzzer + OLED Toast on Portal (ESP32 v4.3.0 runs its own native 3s hardware alert without bitmap lock!)
+      // 3-Second Piezo Buzzer + OLED Toast on Portal (ESP32 v4.4.0 runs its own native 3s hardware alert without bitmap lock!)
       playWifiConnectedBuzzer3Sec(hardware.buzzerMuted);
 
       // Refresh live weather immediately on WiFi connect
@@ -1451,7 +1498,8 @@ export default function App() {
   }, [hardware.greenLedMode, sendToEsp32]);
 
   // Centralized Unified Connectivity Transition Engine:
-  // - Default mode on BOTH WiFi ON & WiFi OFF is ALWAYS Auto Mode!
+  // - Default mode on initial boot, WiFi OFF, and WiFi ON is ALWAYS Auto Mode!
+  // - Online is true ONLY when a real ESP32 heartbeat is active (no fake Online when ESP32 is off)
   // - WiFi OFF: silent switch to Auto Mode (NO OLED/Buzzer/LED notification, User Mode locked)
   // - WiFi ON: 3-second WiFi Connected OLED + Buzzer + Green LED Blink, default Auto Mode (User Mode unlocked)
   const applyConnectivityTransition = useCallback(
@@ -1467,17 +1515,23 @@ export default function App() {
 
       let resolvedHwOnline = esp32HardwareOnlineRef.current;
       let resolvedEverSeen = esp32EverSeenRef.current;
-      let justPairedPhysicalEsp32 = false;
+
+      const numericLastSeen = typeof lastSeenAt === 'number' && lastSeenAt > 0 ? lastSeenAt : 0;
+      const sawNewerHeartbeat =
+        numericLastSeen > 0 &&
+        numericLastSeen > highestEsp32LastSeenAtRef.current &&
+        nowMs - numericLastSeen < 22000;
+
+      if (numericLastSeen > highestEsp32LastSeenAtRef.current) {
+        highestEsp32LastSeenAtRef.current = numericLastSeen;
+      }
 
       if (!nextNetOnline) {
         resolvedHwOnline = false;
         esp32HardwareOnlineRef.current = false;
         setEsp32HardwareOnline(false);
       } else if (nextHwOnline !== null) {
-        if (nextHwOnline) {
-          if (!resolvedEverSeen) {
-            justPairedPhysicalEsp32 = true;
-          }
+        if (nextHwOnline || sawNewerHeartbeat) {
           resolvedEverSeen = true;
           resolvedHwOnline = true;
           esp32EverSeenRef.current = true;
@@ -1486,44 +1540,39 @@ export default function App() {
           setEsp32HardwareOnline(true);
           lastConfirmedEsp32SeenAtRef.current = nowMs;
           missedHeartbeatCountRef.current = 0;
-          setEsp32LastSeenAt(typeof lastSeenAt === 'number' && lastSeenAt > 0 ? lastSeenAt : nowMs);
-        } else if (resolvedEverSeen && resolvedHwOnline) {
-          const confirmedStaleByWarmServer = typeof lastSeenAt === 'number' && lastSeenAt > 0;
-          if (forceImmediate || confirmedStaleByWarmServer) {
+          setEsp32LastSeenAt(
+            numericLastSeen > 0
+              ? Math.max(numericLastSeen, highestEsp32LastSeenAtRef.current)
+              : nowMs
+          );
+        } else if (resolvedHwOnline) {
+          // Resilient multi-instance grace window: ignore stale Vercel container reads unless
+          // no fresh heartbeat has been confirmed for 22 continuous seconds (or forced offline).
+          missedHeartbeatCountRef.current += 1;
+          const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
+          if (forceImmediate || (msSinceConfirmed >= 22000 && missedHeartbeatCountRef.current >= 5)) {
             resolvedHwOnline = false;
             esp32HardwareOnlineRef.current = false;
             setEsp32HardwareOnline(false);
-          } else {
-            missedHeartbeatCountRef.current += 1;
-            const msSinceConfirmed = nowMs - lastConfirmedEsp32SeenAtRef.current;
-            if (msSinceConfirmed >= 16000 && missedHeartbeatCountRef.current >= 6) {
-              resolvedHwOnline = false;
-              esp32HardwareOnlineRef.current = false;
-              setEsp32HardwareOnline(false);
-            }
           }
         }
       }
 
-      const nextEffectiveOnline = nextNetOnline && (resolvedEverSeen ? resolvedHwOnline : true);
+      const nextEffectiveOnline = nextNetOnline && resolvedHwOnline;
       const prevEffectiveOnline = lastEffectiveOnlineRef.current;
       lastEffectiveOnlineRef.current = nextEffectiveOnline;
       esp32OnlineRef.current = nextEffectiveOnline;
 
       if (prevEffectiveOnline !== nextEffectiveOnline) {
         if (!nextEffectiveOnline) {
-          // WiFi OFF -> silently switch to Auto Mode & lock User Mode (NO notification!)
+          // ESP32 / WiFi OFF -> silently switch to Auto Mode & lock User Mode (NO notification!)
           dismissWifiOverlay();
           setMode('auto');
         } else {
-          // WiFi ON -> default to Auto Mode, unlock User Mode, & trigger 3-second WiFi Connected OLED + LED Blink + Buzzer!
+          // ESP32 / WiFi ON -> default to Auto Mode, unlock User Mode, & trigger 3-second WiFi Connected OLED + LED Blink + Buzzer!
           setMode('auto');
           triggerWifiStatusScreen(true);
         }
-      } else if (justPairedPhysicalEsp32) {
-        // Physical ESP32 just connected to WiFi for the first time -> 3s WiFi Connected OLED + LED Blink + Buzzer!
-        setMode('auto');
-        triggerWifiStatusScreen(true);
       }
     },
     [triggerWifiStatusScreen, dismissWifiOverlay]
@@ -1536,63 +1585,89 @@ export default function App() {
     }
   }, [esp32Online, mode]);
 
-  // Poll Real ESP32 Bot Heartbeat & Live Network Reachability every 2s (0-2s automatic WiFi OFF/ON detection!)
+  // Poll Real ESP32 Bot Heartbeat & Live Network Reachability every 2s
   const pollEsp32Heartbeat = useCallback(async () => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       applyConnectivityTransition(false, false, 0, true);
       return false;
     }
 
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 3000);
-    try {
-      const endpoint = getBotStateEndpoint('source=portal');
-      const res = await fetch(endpoint, {
-        method: 'GET',
-        cache: 'no-store',
-        signal: controller.signal,
-      });
-      window.clearTimeout(timeoutId);
-      if (res.ok) {
-        const data = await res.json();
-        const hwOnline = Boolean(data?.esp32Online);
-        const lastSeen = typeof data?.esp32LastSeenAt === 'number' ? data.esp32LastSeenAt : 0;
-        applyConnectivityTransition(true, hwOnline, lastSeen);
-        return esp32OnlineRef.current;
-      }
-      // Server responded with HTTP error but network IS reachable
-      applyConnectivityTransition(true, null);
-    } catch {
-      window.clearTimeout(timeoutId);
-      // Fallback: check local ESP32 LAN IP directly if user is on local WiFi without internet
-      const ip = hardware.esp32Ip.trim();
-      if (ip) {
+    const endpoints = getBotStateEndpoints('source=portal');
+    let anyEndpointReachable = false;
+    let bestHwOnline = false;
+    let bestLastSeen = 0;
+
+    await Promise.allSettled(
+      endpoints.map(async (ep) => {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 3200);
         try {
-          const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
-          const lanRes = await fetch(`${base}/api/stats`, { cache: 'no-store' });
-          if (lanRes.ok) {
-            applyConnectivityTransition(true, true, Date.now(), true);
-            return true;
+          const res = await fetch(ep, {
+            method: 'GET',
+            cache: 'no-store',
+            signal: controller.signal,
+          });
+          window.clearTimeout(timeoutId);
+          if (res.ok) {
+            anyEndpointReachable = true;
+            const data = await res.json();
+            const hwOnline = Boolean(data?.esp32Online);
+            const lastSeen = typeof data?.esp32LastSeenAt === 'number' ? data.esp32LastSeenAt : 0;
+            if (hwOnline) {
+              bestHwOnline = true;
+            }
+            if (lastSeen > bestLastSeen) {
+              bestLastSeen = lastSeen;
+            }
           }
         } catch {
-          // LAN also unreachable
+          window.clearTimeout(timeoutId);
         }
+      })
+    );
+
+    // Optional direct LAN check if user entered an ESP32 IP on the same local WiFi
+    const ip = hardware.esp32Ip.trim();
+    if (!bestHwOnline && ip) {
+      try {
+        const base = ip.startsWith('http') ? ip.replace(/\/$/, '') : `http://${ip}`;
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 1800);
+        const lanRes = await fetch(`${base}/api/stats`, {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        window.clearTimeout(timeoutId);
+        if (lanRes.ok) {
+          anyEndpointReachable = true;
+          bestHwOnline = true;
+          bestLastSeen = Math.max(bestLastSeen, Date.now());
+        }
+      } catch {
+        // LAN not reachable
       }
-      // Network/WiFi is genuinely unreachable -> immediately switch to Offline Auto Mode + 5s WiFi OFF Alert!
-      applyConnectivityTransition(false, false, 0, true);
     }
+
+    if (anyEndpointReachable) {
+      applyConnectivityTransition(true, bestHwOnline, bestLastSeen);
+      return esp32OnlineRef.current;
+    }
+
+    // Neither cloud nor LAN reachable -> network offline, silently switch to Auto Mode
+    applyConnectivityTransition(false, false, 0, true);
     return esp32OnlineRef.current;
-  }, [getBotStateEndpoint, hardware.esp32Ip, applyConnectivityTransition]);
+  }, [getBotStateEndpoints, hardware.esp32Ip, applyConnectivityTransition]);
 
   // Automatic Real-Time WiFi Online / Offline Monitor (0ms browser events + 2s active probe + tab-resume check)
   useEffect(() => {
     const handleBrowserOnline = () => {
-      // Immediately reflect WiFi restoration & fire 5s WiFi ON alert + restore mode, then verify ESP32 heartbeat
-      applyConnectivityTransition(true, esp32EverSeenRef.current ? null : null, 0, true);
+      // Browser internet restored — immediately probe real ESP32 heartbeat
+      setIsOnline(true);
+      isOnlineRef.current = true;
       void pollEsp32Heartbeat();
     };
     const handleBrowserOffline = () => {
-      // Immediately fire 5s WiFi OFF OLED + Buzzer + LED + Auto Mode switch (0ms lag!)
+      // Browser WiFi turned OFF — silently switch to Auto Mode immediately
       applyConnectivityTransition(false, false, 0, true);
     };
     const handleVisibilityChange = () => {
@@ -2910,7 +2985,9 @@ export default function App() {
               title: typeof g.title === 'string' ? g.title.slice(0, 48) : 'Restored Capture',
               screenKind: typeof g.screenKind === 'string' ? g.screenKind.slice(0, 24) : 'face',
               oledScheme:
-                g.oledScheme === 'white' || g.oledScheme === 'dual-yellow-blue'
+                g.oledScheme === 'white' ||
+                g.oledScheme === 'dual-yellow-blue' ||
+                g.oledScheme === 'ambient'
                   ? g.oledScheme
                   : 'ice-blue',
               pixelsHex: String(g.pixelsHex || '').padEnd(2048, '0').slice(0, 2048),
@@ -3214,14 +3291,12 @@ export default function App() {
                 )}
                 <span>
                   {esp32Online
-                    ? esp32EverSeen
-                      ? 'ESP32 Online'
-                      : 'WiFi Online'
+                    ? 'ESP32 Online'
                     : !isOnline
                       ? 'WiFi Offline'
                       : 'ESP32 Offline'}
                 </span>
-                {esp32Online && esp32EverSeen && esp32LastSeenAt > 0 && (
+                {esp32Online && esp32LastSeenAt > 0 && (
                   <span className="hidden sm:inline text-[10px] font-normal text-emerald-700/80">
                     · WiFi Live
                   </span>

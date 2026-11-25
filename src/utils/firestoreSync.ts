@@ -105,7 +105,7 @@ function buildSanitizedWorkspaceFields(uid: string, input: WorkspaceInput) {
     greenLedMode: (['auto', 'on', 'blink', 'off'] as const).includes(input.hardware.greenLedMode)
       ? input.hardware.greenLedMode
       : 'auto',
-    oledScheme: (['ice-blue', 'white', 'dual-yellow-blue'] as const).includes(
+    oledScheme: (['ice-blue', 'white', 'dual-yellow-blue', 'ambient'] as const).includes(
       input.hardware.oledScheme
     )
       ? input.hardware.oledScheme
@@ -393,7 +393,7 @@ export async function saveGalleryShotToFirestore(
   const shotId = sanitizeFirestoreId(shot.id, 'shot');
   const path = `users/${uid}/gallery/${shotId}`;
   const safeHex = (shot.pixelsHex || '').padEnd(2048, '0').slice(0, 2048);
-  const safeScheme = (['ice-blue', 'white', 'dual-yellow-blue'] as const).includes(
+  const safeScheme = (['ice-blue', 'white', 'dual-yellow-blue', 'ambient'] as const).includes(
     shot.oledScheme
   )
     ? shot.oledScheme

@@ -25,6 +25,7 @@ import {
   WeatherData,
 } from '../types';
 import {
+  getAmbientTimeOfDayInfo,
   paintBufferToCanvas,
   renderScreenToBuffer,
   SSD1306Buffer,
@@ -105,7 +106,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
       activeAlarm,
       savedGifs
     );
-    paintBufferToCanvas(ctx, bufferRef.current, hardware.oledScheme, 3, true);
+    paintBufferToCanvas(ctx, bufferRef.current, hardware.oledScheme, 3, true, now, frame);
   }, [
     activeScreen,
     frame,
@@ -118,6 +119,8 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
     activeAlarm,
     savedGifs,
   ]);
+
+  const ambientInfo = getAmbientTimeOfDayInfo(now, frame);
 
   const activeFaceDef = FACE_DEFINITIONS.find((f) => f.id === activeScreen.faceId);
   const screenTitle = (() => {
@@ -185,6 +188,14 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
             )}
             <span className="mx-1.5" aria-hidden="true">·</span>
             <span>{screenTitle}</span>
+            {hardware.oledScheme === 'ambient' && (
+              <>
+                <span className="mx-1.5" aria-hidden="true">·</span>
+                <span>
+                  Ambient ({ambientInfo.periodLabel} · {ambientInfo.activeSchemeLabel})
+                </span>
+              </>
+            )}
             {activeScreen.locked && (
               <>
                 <span className="mx-1.5" aria-hidden="true">·</span>
@@ -230,6 +241,7 @@ export const OledHardwareStage: React.FC<OledHardwareStageProps> = ({
                 { id: 'ice-blue', label: 'Ice Blue' },
                 { id: 'white', label: 'White' },
                 { id: 'dual-yellow-blue', label: 'Dual Y/B' },
+                { id: 'ambient', label: 'Ambient' },
               ] as const
             ).map((item) => (
               <button

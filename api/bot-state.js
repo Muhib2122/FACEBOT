@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 
 const deviceStore = new Map();
-const ESP32_OFFLINE_THRESHOLD_MS = 18000; // 18s grace window (~7 polls at 2.5s): zero false timeouts, clean WiFi OFF detection
+const ESP32_OFFLINE_THRESHOLD_MS = 22000; // 22s grace window (~11 polls at 2.0s): zero false timeouts, clean WiFi OFF detection
 
 function getTmpStatePath(deviceId) {
   const safe = String(deviceId || 'muhib-bot-1').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -145,8 +145,8 @@ export default async function handler(req, res) {
       ...body,
       deviceId,
       // Preserve real ESP32 hardware heartbeat metadata across portal POSTs
-      esp32LastSeenAt: prev.esp32LastSeenAt || 0,
-      esp32PollCount: prev.esp32PollCount || 0,
+      esp32LastSeenAt: Math.max(Number(prev.esp32LastSeenAt) || 0, Number(body.esp32LastSeenAt) || 0),
+      esp32PollCount: Math.max(Number(prev.esp32PollCount) || 0, Number(body.esp32PollCount) || 0),
       updatedAt: nowMs,
     };
     saveDeviceState(deviceId, payload);

@@ -62,7 +62,7 @@ export function generateEsp32Firmware(
     ? safeFirebaseUrl
     : `${safeCloudBase}/api/bot-state?device=${safeDeviceId}`;
   const otaVersionUrl = `${safeCloudBase}/ota/version.json`;
-  const fwVersion = (hardware.firmwareVersion || '4.3.0').replace(/"/g, '');
+  const fwVersion = (hardware.firmwareVersion || '4.4.0').replace(/"/g, '');
 
   const alarmInitLines = alarms.slice(0, 8).map((a, idx) => {
     const [hh, mm] = a.time.split(':').map(Number);
@@ -1054,20 +1054,24 @@ void pollVercelCloudOnce() {
     return;
   }
 
-  // Fresh clean TLS client per 2.5s poll -> ZERO stale half-closed Vercel socket hangs, ZERO WiFi drops!
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(5);
+  // Smart persistent TLS session reuse (~120ms keep-alive polls) with automatic socket reset on any error
+  static WiFiClientSecure sharedClient;
+  static bool clientConfigured = false;
+  if (!clientConfigured) {
+    sharedClient.setInsecure();
+    sharedClient.setHandshakeTimeout(5);
+    clientConfigured = true;
+  }
 
   HTTPClient http;
-  http.setReuse(false);
+  http.setReuse(true);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, CLOUD_URL)) {
+  if (!http.begin(sharedClient, CLOUD_URL)) {
     cloudOnline = false;
-    client.stop();
+    sharedClient.stop();
     return;
   }
-  http.setTimeout(4000);
+  http.setTimeout(3500);
   int code = http.GET();
   if (code == 200) {
     cloudOnline = true;
@@ -1246,18 +1250,19 @@ void pollVercelCloudOnce() {
         if (otaSeq > lastOtaTriggerSeq) {
           lastOtaTriggerSeq = otaSeq;
           http.end();
-          client.stop();
+          sharedClient.stop();
           checkVercelOtaUpdate();
           return;
         }
       }
     }
+    http.end();
   } else {
     cloudOnline = false;
     Serial.println("[Cloud Sync] HTTP retry code: " + String(code));
+    http.end();
+    sharedClient.stop();
   }
-  http.end();
-  client.stop();
 }
 
 void cloudSyncTask(void* param) {
@@ -1295,8 +1300,8 @@ void cloudSyncTask(void* param) {
       fetchWeatherCloud();
     }
 
-    // Balanced 2.5s cloud poll -> gives Core 0 WiFi driver plenty of idle time (ZERO WiFi drops!)
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    // Fast 2.0s keep-alive cloud heartbeat (~11 polls inside 22s threshold -> ZERO false timeouts!)
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 

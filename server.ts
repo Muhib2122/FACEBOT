@@ -172,7 +172,7 @@ app.options('/api/bot-state', (_req, res) => {
   res.status(200).end();
 });
 
-const ESP32_OFFLINE_THRESHOLD_MS = 18000;
+const ESP32_OFFLINE_THRESHOLD_MS = 22000;
 
 function createDefaultDeviceState(deviceId: string): Record<string, unknown> {
   return {
@@ -290,8 +290,8 @@ app.post('/api/bot-state', (req, res) => {
     ...prev,
     ...body,
     deviceId,
-    esp32LastSeenAt: Number(prev.esp32LastSeenAt) || 0,
-    esp32PollCount: Number(prev.esp32PollCount) || 0,
+    esp32LastSeenAt: Math.max(Number(prev.esp32LastSeenAt) || 0, Number(body.esp32LastSeenAt) || 0),
+    esp32PollCount: Math.max(Number(prev.esp32PollCount) || 0, Number(body.esp32PollCount) || 0),
     updatedAt: nowMs,
   };
   deviceStore.set(deviceId, payload);

@@ -69,7 +69,7 @@
         },
         "oledScheme": {
           "type": "string",
-          "enum": ["ice-blue", "white", "dual-yellow-blue"]
+          "enum": ["ice-blue", "white", "dual-yellow-blue", "ambient"]
         },
         "animationSpeed": {
           "type": "string",
@@ -382,7 +382,7 @@
         },
         "oledScheme": {
           "type": "string",
-          "enum": ["ice-blue", "white", "dual-yellow-blue"]
+          "enum": ["ice-blue", "white", "dual-yellow-blue", "ambient"]
         },
         "pixelsHex": {
           "type": "string",
