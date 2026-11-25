@@ -59,10 +59,10 @@ export default async function handler(req, res) {
     ];
 
     const attempts = [
-      { model: 'gemini-3.5-transcribe', timeout: 8500 },
-      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 8500 },
-      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 9500 },
-      { model: 'gemini-2.5-flash', timeout: 9500 },
+      { model: 'gemini-3.5-transcribe', timeout: 7500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 7500 },
+      { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, timeout: 7500 },
+      { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, timeout: 5500 },
     ];
 
     let response = null;

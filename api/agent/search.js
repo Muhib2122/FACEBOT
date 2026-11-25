@@ -86,11 +86,10 @@ BANGLISH: Sorry ${userName}, eta khuje pai ni.
 BANGLA: সরি মুহিব, এটা খুঁজে পাইনি।`;
 
     const attempts = [
-      { model: 'gemini-3.1-flash-lite', tools: [{ googleSearch: {} }], thinking: undefined, fallback: false, timeout: 8000 },
-      { model: 'gemini-4-hydrogen', tools: [{ googleSearch: {} }], thinking: ThinkingLevel.LOW, fallback: false, timeout: 9500 },
-      { model: 'gemini-2.5-flash', tools: [{ googleSearch: {} }], thinking: undefined, fallback: false, timeout: 9500 },
-      { model: 'gemini-3.1-flash-lite', tools: undefined, thinking: ThinkingLevel.MINIMAL, fallback: true, timeout: 7500 },
-      { model: 'gemini-2.5-flash', tools: undefined, thinking: undefined, fallback: true, timeout: 7500 },
+      { model: 'gemini-4-hydrogen', tools: [{ googleSearch: {} }], thinking: ThinkingLevel.LOW, fallback: false, timeout: 7500, delayMs: 300 },
+      { model: 'gemini-4-hydrogen', tools: [{ googleSearch: {} }], thinking: ThinkingLevel.LOW, fallback: false, timeout: 7500, delayMs: 400 },
+      { model: 'gemini-4-hydrogen', tools: undefined, thinking: ThinkingLevel.LOW, fallback: true, timeout: 6500, delayMs: 300 },
+      { model: 'gemini-3.1-flash-lite', tools: undefined, thinking: ThinkingLevel.MINIMAL, fallback: true, timeout: 4500, delayMs: 0 },
     ];
 
     let response = null;
@@ -111,8 +110,8 @@ BANGLA: সরি মুহিব, এটা খুঁজে পাইনি।`
         break;
       } catch (err) {
         lastErr = err;
-        console.warn(`Search attempt ${a.model} failed:`, err?.message);
-        if (i < attempts.length - 1) await wait(200);
+        console.warn(`Search attempt #${i + 1} (${a.model}) failed:`, err?.message);
+        if (a.delayMs > 0) await wait(a.delayMs);
       }
     }
 
